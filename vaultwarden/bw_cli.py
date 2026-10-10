@@ -1,0 +1,241 @@
+"""Thin, isolated wrapper around the ``bw`` (Bitwarden CLI) binary.
+
+Every subprocess is executed with a MINIMAL, explicitly constructed env:
+    PATH, HOME, BITWARDENCLI_APPDATA_DIR  (+ BW_SESSION when unlocked,
+    + BW_CLIENTID/BW_CLIENTSECRET during login, + BW_MP during unlock)
+The parent environment is NEVER inherited — this both isolates plugin state
+from the host user's bw profile and prevents .env secrets from leaking.
+
+`create`/`edit` require the `bw encode` pipeline for all JSON string fields;
+this module handles encoding transparently in ``encode_item``.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Mapping
+
+from . import errors
+from .security import audit_subprocess_env, get_logger
+
+log = get_logger("bw_cli")
+
+# Error-message fragments returned by bw that map onto our error taxonomy.
+_SESSION_INVALID_MARKERS = (
+    "not logged in",
+    "you are not currently logged in",
+    "session has timed out",
+    "session timed out",
+    "vault is locked",
+    "mac key dec validation failed",
+)
+_NETWORK_MARKERS = (
+    "econnrefused", "etimedout", "enotfound", "eai_again", "network",
+    "unable to connect", "self signed certificate", "certificate", "socket hang up",
+    "fetch failed",
+)
+_RATE_LIMIT_MARKERS = ("to many requests", "too many requests", "rate limit", "429")
+_NOT_FOUND_MARKERS = ("cannot find", "does not exist", "not found the given")
+
+
+def find_bw_binary(explicit: str = "") -> str | None:
+    """Locate the bw binary: explicit path -> BW_CLI_PATH -> PATH lookup."""
+    for candidate in (explicit, os.environ.get("BW_CLI_PATH", "")):
+        if candidate:
+            p = Path(candidate).expanduser()
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+    return shutil.which("bw")
+
+
+class BwCli:
+    """Stateless command runner; session/auth state lives in AuthManager."""
+
+    def __init__(self, bw_path: str, appdata_dir: str | Path, *, timeout: int = 30):
+        if not bw_path or not find_bw_binary(bw_path):
+            raise errors.BinaryError("Bitwarden CLI ('bw') not found.")
+        self.bw_path = str(bw_path)
+        self.appdata_dir = str(Path(appdata_dir).expanduser())
+        self.timeout = timeout
+
+    # ------------------------------------------------------------------ env
+    def base_env(self, extra: Mapping[str, str] | None = None) -> dict:
+        """Build the minimal isolated subprocess environment."""
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "HOME": os.environ.get("HOME", str(Path.home())),
+            "BITWARDENCLI_APPDATA_DIR": self.appdata_dir,
+        }
+        if extra:
+            env.update({k: v for k, v in extra.items() if v})
+        violations = audit_subprocess_env(env)
+        if violations:  # pragma: no cover - defensive invariant
+            log.error("Subprocess env allowlist violation: %s", violations)
+        return env
+
+    # ------------------------------------------------------------- run core
+    def run(self, args: list[str], *, env: Mapping[str, str] | None = None,
+            raw: bool = False, timeout: int | None = None,
+            _retry_network: bool = True) -> Any:
+        """Execute bw, returning parsed JSON (default) or stripped stdout (raw).
+
+        Retries network errors exactly once with a 2s delay (plan §11).
+        Never includes argv/env contents in raised messages.
+        """
+        full_env = self.base_env(env)
+        cmd = [self.bw_path, *args]
+        try:
+            proc = subprocess.run(
+                cmd, env=full_env, capture_output=True, text=True,
+                timeout=timeout or self.timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise errors.NetworkError(
+                f"bw {' '.join(args[:1])} timed out after {timeout or self.timeout}s.") from exc
+        except OSError as exc:
+            raise errors.BinaryError(
+                f"Failed to execute bw: {type(exc).__name__}") from exc
+
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        combined = (out + "\n" + err).lower()
+
+        if proc.returncode != 0:
+            if any(m in combined for m in _RATE_LIMIT_MARKERS):
+                raise errors.RateLimitError("Vaultwarden rate limit hit (HTTP 429).")
+            if any(m in combined for m in _NETWORK_MARKERS):
+                if _retry_network:
+                    log.warning("Network error talking to server, retrying once in 2s.")
+                    time.sleep(2)
+                    return self.run(args, env=env, raw=raw, timeout=timeout,
+                                    _retry_network=False)
+                raise errors.NetworkError("Vaultwarden server appears unreachable.")
+            if any(m in combined for m in _SESSION_INVALID_MARKERS):
+                raise errors.SessionError(f"bw session invalid or vault locked ({args[0]}).")
+            if any(m in combined for m in _NOT_FOUND_MARKERS):
+                raise errors.NotFoundError(f"No matching item for query '{args[-1]}'.")
+            log.debug("bw %s failed rc=%s stderr(redacted)=%.200s", args[0], proc.returncode, err)
+            raise errors.VaultwardenError(
+                f"bw {args[0]} failed (exit {proc.returncode}).",
+                suggestion="Run 'vaultwarden_status' for details.")
+
+        if raw:
+            return out
+        if not out:
+            return None
+        if out.startswith("{") or out.startswith("["):
+            try:
+                return json.loads(out)
+            except json.JSONDecodeError as exc:
+                raise errors.ParseError(
+                    f"Could not parse bw {args[0]} output as JSON.") from exc
+        return out
+
+    # ------------------------------------------------------------ commands
+    def status(self) -> dict:
+        data = self.run(["status"])
+        if isinstance(data, dict):
+            return data
+        return {"state": "unauthenticated", "message": str(data)}
+
+    def config_server(self, url: str) -> None:
+        self.run(["config", "server", url])
+
+    def config_get(self) -> Any:
+        return self.run(["config", "get", "server"])
+
+    def login_apikey(self, client_id: str, client_secret: str) -> str:
+        env = {"BW_CLIENTID": client_id, "BW_CLIENTSECRET": client_secret}
+        return self.run(["login", "--apikey", "--nointeraction"], env=env, raw=True)
+
+    def unlock_passwordenv(self, master_password: str) -> str:
+        """Returns the raw session key (kept in plugin memory only)."""
+        env = {"BW_MP": master_password}
+        key = self.run(["unlock", "--passwordenv", "BW_MP", "--raw", "--nointeraction"],
+                       env=env, raw=True)
+        if not key:
+            raise errors.AuthError("bw unlock returned an empty session key.")
+        return key
+
+    def lock(self, session_key: str) -> None:
+        try:
+            self.run(["lock"], env={"BW_SESSION": session_key})
+        except errors.VaultwardenError as exc:
+            log.warning("bw lock failed (%s); clearing local session anyway.", exc.code)
+
+    def sync(self, session_key: str, force: bool = False) -> Any:
+        args = ["sync"] + (["--last"] if force else [])
+        return self.run(args, env={"BW_SESSION": session_key}, raw=force)
+
+    def list_items(self, session_key: str, filters: list[str] | None = None) -> list[dict]:
+        args = ["list", "items", "--pretty"]
+        if filters:
+            args += filters
+        data = self.run(args, env={"BW_SESSION": session_key})
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "data" in data:
+            return data["data"]
+        return []
+
+    def item_get(self, session_key: str, query: str) -> dict:
+        data = self.run(["get", "item", query], env={"BW_SESSION": session_key})
+        if not isinstance(data, dict):
+            raise errors.NotFoundError(f"No item matching '{query}'.")
+        return data
+
+    def create_item(self, session_key: str, encoded_json: str) -> dict:
+        data = self.run(["create", "item", encoded_json],
+                        env={"BW_SESSION": session_key})
+        if not isinstance(data, dict):
+            raise errors.ParseError("bw create item returned unexpected payload.")
+        return data
+
+    def edit_item(self, session_key: str, encoded_json: str) -> dict:
+        data = self.run(["edit", "item", encoded_json],
+                        env={"BW_SESSION": session_key})
+        if not isinstance(data, dict):
+            raise errors.ParseError("bw edit item returned unexpected payload.")
+        return data
+
+    def delete_item(self, session_key: str, item_id: str, permanent: bool = False) -> str:
+        args = ["delete", "item", item_id]
+        if permanent:
+            args.append("--permanent")
+        return self.run(args, env={"BW_SESSION": session_key}, raw=True)
+
+    def generate_password(self, session_key: str, args: list[str]) -> str:
+        pw = self.run(["generate", *args], env={"BW_SESSION": session_key}, raw=True)
+        if not pw:
+            raise errors.ParseError("bw generate returned no password.")
+        return pw
+
+    def encode(self, session_key: str, value: str) -> str:
+        """`bw encode <value>` -> base64. Required by create/edit pipelines."""
+        enc = self.run(["encode", value], env={"BW_SESSION": session_key}, raw=True)
+        if not enc:
+            raise errors.ParseError("bw encode returned empty output.")
+        return enc
+
+
+def encode_item(session_key: str, item: dict, bw: BwCli) -> str:
+    """Prepare an item JSON blob for `bw create/edit item`.
+
+    Per plan §2: every string field must pass through the `bw encode`
+    pipeline before being handed to create/edit.
+    """
+    def _enc(value: Any) -> Any:
+        if isinstance(value, str):
+            return bw.encode(session_key, value)
+        if isinstance(value, list):
+            return [_enc(v) for v in value]
+        if isinstance(value, dict):
+            return {k: _enc(v) for k, v in value.items()}
+        return value
+
+    encoded = {k: _enc(v) for k, v in item.items() if v not in (None, "", [], {})}
+    return json.dumps(encoded)
