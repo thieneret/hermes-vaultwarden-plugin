@@ -72,6 +72,12 @@ def _minimal_yaml_mapping(text: str) -> dict:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
+        # Detect nested YAML: raw (unstripped) line has leading whitespace.
+        # Silently flattening indented lines would mis-parse the config.
+        if raw and raw[0] in " \t":
+            raise errors.ConfigError(
+                "Cannot parse nested YAML without PyYAML. "
+                "Install it with: pip install pyyaml")
         if ":" not in line:
             raise errors.ConfigError(
                 "Cannot parse config file without PyYAML (unsupported YAML "

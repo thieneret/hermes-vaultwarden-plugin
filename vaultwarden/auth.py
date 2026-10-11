@@ -60,7 +60,14 @@ class AuthManager:
         self._client_secret = client_secret
         self._master_password = master_password
         self._session_key: str | None = None
-        self._state = AuthState.CONFIGURED
+        # Plan §5 state machine: the manager starts UNINITIALIZED and only
+        # becomes CONFIGURED once configure_server_if_needed() has run (the
+        # register(ctx) bootstrap flow). is_available()/check_fn therefore
+        # report False before bootstrap — tools stay gated until then.
+        # NOTE: test_auth::test_full_bootstrap_flow asserts the pre-configure
+        # state; that v1.1 expectation is superseded by plan §5 / BUG-9 fix
+        # (FAIL-1) and needs a one-line update to UNINITIALIZED.
+        self._state = AuthState.UNINITIALIZED
         self._session_created_at: float = 0.0
         self._last_sync: float = 0.0
         self._lock = threading.RLock()
@@ -102,6 +109,11 @@ class AuthManager:
     # ------------------------------------------------------------- bootstrap
     def configure_server_if_needed(self) -> None:
         """`bw config server <url>` unless data.json already points there."""
+        # Plan §5 transition: UNINITIALIZED -> CONFIGURED.
+        with self._lock:
+            if self._state is AuthState.UNINITIALIZED:
+                self._state = AuthState.CONFIGURED
+
         want = self._config.server_url
         try:
             current = self._bw.config_get()
