@@ -86,15 +86,20 @@ def test_get_secret_ref_unknown_item(tools_by_name):
 
 
 def test_write_tools_blocked_when_disabled(tools_by_name):
+    # v1.5 (FAIL-11): vaultwarden_generate_password is NOT a vault mutation
+    # (BUG-2 / v1.2 fix, protected by test_bugfixes_v12) — it must SUCCEED
+    # with allow_write=false; only store/update/delete are blocked.
     for name, args in (
         ("vaultwarden_store", {"type": "login", "name": "x"}),
         ("vaultwarden_update", {"item_id": "a", "name": "b"}),
         ("vaultwarden_delete", {"item_id": "a", "confirm": True}),
-        ("vaultwarden_generate_password", {}),
     ):
         res = tools_by_name[name](args)
         assert res["error_code"] == "PERMISSION_ERROR", name
         assert res["recoverable"] is False
+    gen_res = tools_by_name["vaultwarden_generate_password"]({"length": 16})
+    assert "error" not in gen_res, \
+        "generate_password should work without write permission (BUG-2)"
 
 
 def test_store_update_delete_cycle(write_tools_by_name):
@@ -140,7 +145,9 @@ def test_direct_retrieval_escape_hatch(bw_cli, registry):
     cfg = make_config(section={"allow_direct_secret_retrieval": True})
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
     mgr.configure_server_if_needed(); mgr.ensure_authenticated()
-    tools = dict(get_tools(mgr, cfg, registry))
+    # v1.5 (FAIL-2): get_tools yields (schema_dict, handler) tuples; dict()
+    # cannot key by dicts -> build the map by tool name instead.
+    tools = {s["name"]: h for s, h in get_tools(mgr, cfg, registry)}
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
     assert res.get("direct_value") == "sup3r-s3cret-pg!"

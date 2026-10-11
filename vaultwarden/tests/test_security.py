@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 
 import pytest
 
@@ -76,8 +77,11 @@ def test_master_password_never_logged(caplog, bw_cli):
     caplog.set_level(logging.DEBUG)
     mgr = AuthManager(bw_cli, make_config(), client_secret="cs-secret",
                       master_password="SUPER-DUPER-MP")
-    with pytest.raises(Exception):
-        pass
+    # v1.5 (FAIL-9): removed the nonsensical `with pytest.raises(Exception):
+    # pass` block (it asserted nothing could raise inside an empty body and
+    # always failed with "DID NOT RAISE"). The real check is below: after a
+    # full bootstrap attempt with wrong credentials, no secret VALUE may
+    # appear in any log record.
     mgr.configure_server_if_needed()
     try:
         mgr.ensure_authenticated()          # wrong client secret -> fails
@@ -160,10 +164,24 @@ def test_session_key_not_persisted_to_disk(bw_cli, tmp_path):
     mgr.configure_server_if_needed()
     mgr.ensure_authenticated()
     key = mgr.get_session()
+    # v1.5 (FAIL-10): skip the fake bw script itself — it is a TEST FIXTURE
+    # whose source literally embeds the session-key string it prints (the
+    # real bw also keeps its own state files); it is not plugin-written
+    # state. We only assert that no file the PLUGIN wrote contains the key.
+    fake_bw_path = Path(bw_cli.bw_path).resolve() if hasattr(bw_cli, "bw_path") else None
     for f in tmp_path.rglob("*"):
-        if f.is_file():
-            content = f.read_bytes()
-            assert key.encode() not in content, f
+        if not f.is_file():
+            continue
+        try:
+            resolved = f.resolve()
+        except OSError:
+            continue
+        if fake_bw_path is not None and resolved == fake_bw_path:
+            continue
+        if f.name == "bw":  # fake bw fixture (script/binary) — not plugin state
+            continue
+        content = f.read_bytes()
+        assert key.encode() not in content, f
     # plugin state dir contains no session key file of ours:
     appdata_files = list((tmp_path / ".bw-data").rglob("*"))
     assert all("session" not in p.name.lower() for p in appdata_files)

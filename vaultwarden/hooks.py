@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import threading
+from collections.abc import MutableMapping
 from typing import Any, Callable
 
 from . import errors
@@ -239,7 +240,17 @@ def make_post_cleanup_hook(auth: AuthManager,
         if n:
             log.debug("post_tool_call cleaned %d used placeholder(s).", n)
         # Leak protection: redact any resolved secret echoed by the command.
-        _redact_in_result(result)
+        # v1.5 (FAIL-6): _redact_in_result returns a NEW dict for dict results
+        # (the old code discarded it, so {"output": ...} was never scrubbed);
+        # merge the scrubbed copy back in place so callers observe redaction.
+        scrubbed = _redact_in_result(result)
+        if isinstance(result, dict) and isinstance(scrubbed, dict) \
+                and scrubbed is not result:
+            result.clear()
+            result.update(scrubbed)
+        # Task-scoped redaction for secrets this plugin just injected
+        # (single-use per task_id; forgotten immediately after).
+        _redact_task_secrets(task_id, result)
         # Surface fail-closed resolution errors to the agent (secret-free).
         if _PENDING_ERRORS and isinstance(result, dict):
             result.setdefault("vaultwarden_placeholder_errors", []).extend(
@@ -255,6 +266,8 @@ def make_session_end_hook(auth: AuthManager,
 
     def vaultwarden_on_session_end(**kwargs: Any) -> None:
         registry.clear()
+        # v1.5 (FAIL-6 wiring): drop every pending per-task injected secret.
+        clear_task_secrets()
         auth.shutdown(keep_appdata=True)
 
     return vaultwarden_on_session_end

@@ -140,41 +140,30 @@ class AuthManager:
     def ensure_authenticated(self) -> None:
         """Startup sequence steps 6-7: status -> login (if needed) -> unlock.
 
-        v1.4 hardening: an invalid client secret is detected here and raised
-        as a clear AuthError BEFORE any unlock attempt, so the master password
-        never travels in the environment of a doomed subprocess (defense in
-        depth for FAIL-9); the secret VALUE is never included anywhere.
+        v1.5: reverted to the original status-driven branching (plan §5).
+        The v1.4 `_api_key_available()` pre-check variant changed the state
+        machine flow and violated v1.4 constraint #6; it is removed.
         """
         with self._lock:
-            if not self._api_key_available():
-                try:
-                    self._do_login()
-                except errors.VaultwardenError as exc:
-                    if exc.code in ("AUTH_ERROR", "SESSION_ERROR", "PLUGIN_ERROR"):
-                        raise errors.AuthError(
-                            "API-key authentication failed.",
-                            suggestion="Check client_id and VW_CLIENT_SECRET in .env.") from exc
-                    raise
             status = self.probe_status()
             raw_state = str(status.get("state", "unauthenticated"))
-            if raw_state == "unlocked":
-                # Existing session file in our isolated profile: re-unlock to
-                # obtain a fresh BW_SESSION we hold in memory.
+            if raw_state == "unauthenticated":
+                self._do_login()
+                self._do_unlock()
+            elif raw_state == "locked":
                 self._state = AuthState.LOGGED_IN
-            self._do_unlock()
+                self._do_unlock()
+            elif raw_state == "unlocked":
+                self._state = AuthState.LOGGED_IN
+                self._do_unlock()
+            else:
+                self._do_login()
+                self._do_unlock()
             if self._config.auto_sync and self._last_sync == 0.0:
                 try:
                     self.sync(force=False)
                 except errors.VaultwardenError as exc:
                     log.warning("Initial sync failed (%s); continuing.", exc.code)
-
-    def _api_key_available(self) -> bool:
-        """True when the isolated profile already holds a valid apikey login."""
-        try:
-            st = self._bw.status()
-        except errors.VaultwardenError:
-            return False
-        return isinstance(st, dict) and st.get("status") == "OK"
 
     # ---------------------------------------------------------------- login
     def _do_login(self) -> None:

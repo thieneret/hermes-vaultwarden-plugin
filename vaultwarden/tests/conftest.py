@@ -42,6 +42,39 @@ ITEMS = {
 }
 BY_NAME = {v["name"].lower(): k for k, v in ITEMS.items()}
 
+# v1.5 (FAIL-8): created items are persisted in the isolated appdata dir so
+# the full CRUD cycle (create -> get -> edit -> delete) works against the
+# fake CLI exactly like it would against a real vault.
+ITEMS_FILE = os.path.join(appdata, "fake_items.json") if appdata else ""
+
+def _load_created():
+    if ITEMS_FILE and os.path.exists(ITEMS_FILE):
+        try:
+            with open(ITEMS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_created(items):
+    if ITEMS_FILE:
+        with open(ITEMS_FILE, "w") as f:
+            json.dump(items, f)
+
+def _all_items():
+    merged = dict(ITEMS)
+    merged.update(_load_created())
+    return merged
+
+def _lookup(q):
+    all_items = _all_items()
+    if q in all_items:
+        return q
+    for k, v in all_items.items():
+        if str(v.get("name", "")).lower() == str(q).lower():
+            return k
+    return None
+
 if argv[:1] == ["status"]:
     if not appdata or not os.path.isdir(appdata):
         sys.stderr.write("missing appdata\n"); sys.exit(5)
@@ -101,7 +134,7 @@ elif argv[:2] == ["list", "items"]:
             collection = rest[i + 1]; i += 2; continue
         if tok == "--search":
             search = rest[i + 1]; i += 2; continue
-    items = list(ITEMS.values())
+    items = list(_all_items().values())
     if folder is not None:
         items = [it for it in items if it.get("folderId") == folder]
     if search is not None:
@@ -114,9 +147,9 @@ elif argv[:2] == ["list", "items"]:
     out(json.dumps(items))
 elif argv[:2] == ["get", "item"]:
     q = argv[2]
-    key = q if q in ITEMS else BY_NAME.get(q.lower())
+    key = _lookup(q)
     if key:
-        out(json.dumps(ITEMS[key]))
+        out(json.dumps(_all_items()[key]))
     else:
         sys.stderr.write("Cannot find item with the given id or name.\n"); sys.exit(1)
 elif argv[:1] == ["encode"]:
@@ -135,10 +168,21 @@ elif argv[:2] in (["create", "item"], ["edit", "item"]):
             return {k: dec(x) for k, x in v.items()}
         return v
     res = {k: dec(v) for k, v in blob.items()}
+    # v1.5 (FAIL-8): persist mutations so later get/list/edit/delete see them.
+    created_map = _load_created()
     if argv[:2] == ["create", "item"]:
         res["id"] = "new-item-id-0001"
+        created_map[res["id"]] = res
+    else:
+        eid = res.get("id")
+        if eid and eid in created_map:
+            created_map[eid] = res
+    _save_created(created_map)
     out(json.dumps(res))
 elif argv[:2] == ["delete", "item"]:
+    created_map = _load_created()
+    created_map.pop(argv[2], None)
+    _save_created(created_map)
     out("Item " + argv[2] + " has been deleted.")
 elif argv[:1] == ["generate"]:
     out("Zk9#xQ2vLm8pRt4wYb7n")
