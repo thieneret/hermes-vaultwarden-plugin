@@ -83,7 +83,35 @@ elif argv[:1] == ["lock"]:
 elif argv[:1] == ["sync"]:
     out("Encoding complete.")
 elif argv[:2] == ["list", "items"]:
-    out(json.dumps(list(ITEMS.values())))
+    rest = argv[2:]
+    # v1.2 (BUG-3/BUG-5): the real bw CLI only understands --folderid /
+    # --collectionid / --search here; reject unknown flags like the real one does.
+    known = {"--folderid", "--collectionid", "--search", "--pretty"}
+    i = 0
+    folder = collection = search = None
+    while i < len(rest):
+        tok = rest[i]
+        if tok not in known:
+            sys.stderr.write("Unknown option: " + tok + "\\n"); sys.exit(1)
+        if tok == "--pretty":
+            i += 1; continue
+        if tok == "--folderid":
+            folder = rest[i + 1]; i += 2; continue
+        if tok == "--collectionid":
+            collection = rest[i + 1]; i += 2; continue
+        if tok == "--search":
+            search = rest[i + 1]; i += 2; continue
+    items = list(ITEMS.values())
+    if folder is not None:
+        items = [it for it in items if it.get("folderId") == folder]
+    if search is not None:
+        s = search.lower()
+        def _hit(it):
+            login = it.get("login") or {}
+            return (s in str(it.get("name", "")).lower()
+                    or s in str(login.get("username", "")).lower())
+        items = [it for it in items if _hit(it)]
+    out(json.dumps(items))
 elif argv[:2] == ["get", "item"]:
     q = argv[2]
     key = q if q in ITEMS else BY_NAME.get(q.lower())

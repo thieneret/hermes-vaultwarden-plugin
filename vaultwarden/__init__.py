@@ -51,6 +51,14 @@ def _resolve_secrets(config: PluginConfig) -> tuple[str, str]:
     return client_secret, master_password
 
 
+def _make_check_fn(auth_ref: AuthManager):
+    """BUG-9 fix: proper closure instead of the confusing ``lambda a=auth``
+    default-argument trick."""
+    def check() -> bool:
+        return auth_ref.is_available()
+    return check
+
+
 def register(ctx: Any) -> bool:
     """Hermes plugin entry point. Returns True when active."""
     # 1-2. read config, resolve env var NAMES -> values in plugin memory
@@ -112,7 +120,7 @@ def register(ctx: Any) -> bool:
                 toolset="vaultwarden",
                 schema=schema,
                 handler=handler,
-                check_fn=lambda a=auth: a.is_available(),
+                check_fn=_make_check_fn(auth),  # BUG-9: proper closure
             )
             registered += 1
         except TypeError:

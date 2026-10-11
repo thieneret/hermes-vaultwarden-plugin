@@ -37,7 +37,9 @@ config:
   secrets.vaultwarden.allow_write:
     type: boolean
     default: false
-    description: Allow store/update/delete/generate_password tools.
+    # BUG-2: generate_password does NOT modify the vault, so it is allowed
+    # even when allow_write is false; only store/update/delete are gated.
+    description: Allow store/update/delete tools (vault mutations).
   secrets.vaultwarden.allow_startup_secret_injection:
     type: boolean
     default: false
@@ -67,4 +69,7 @@ config:
   secrets.vaultwarden.bw_cli_path:
     type: string
     default: ""
-    description: Optional explicit path to the bw binary (BW_CLI_PATH env overrides).
+    # BUG-10: this must be the FULL path to the executable itself.
+    description: >-
+      Optional FULL path to the bw binary (e.g. /usr/local/bin/bw).
+      A directory path alone is NOT sufficient. BW_CLI_PATH env overrides.

@@ -3,11 +3,31 @@
 Handlers receive these as validated ``args`` dicts. None of the schemas
 accept or return raw secret values except vaultwarden_generate_password,
 which returns a freshly generated password explicitly by design.
+
+Schema key convention (BUG-8 verification note):
+The per-tool JSON Schema lives under the "input_schema" key (Anthropic
+tool-definition style). The Hermes Agent register_tool() source
+(tools/registry.py) is NOT vendored into this repository and could not be
+inspected offline, so compatibility was verified structurally instead:
+
+  * every consumer inside this plugin reads only schema["name"] (and the
+    whole dict is passed through verbatim as ``schema=``);
+  * no code path here depends on the inner key being named
+    "input_schema" vs "parameters".
+
+If a deployed Hermes registry expects OpenAI-style "parameters", rename the
+key in ONE place below or normalise it at registration time in __init__.py
+(e.g. ``schema = {**schema, "parameters": schema["input_schema"]}``).
 """
 from __future__ import annotations
 
 ITEM_TYPES = ["login", "note", "card", "identity"]
 SECRET_FIELDS = ["password", "username", "totp", "notes", "uri"]
+
+#: Canonical key holding each tool's JSON Schema. See module docstring
+#: (BUG-8): switch this single constant if the host Hermes build expects
+#: "parameters" instead of the Anthropic-style "input_schema".
+SCHEMA_KEY = "input_schema"
 
 VAULTWARDEN_STATUS = {
     "name": "vaultwarden_status",
@@ -44,6 +64,9 @@ VAULTWARDEN_LIST = {
             "folder_id": {"type": "string", "description": "Filter by folder id."},
             "collection_id": {"type": "string", "description": "Filter by collection id."},
             "limit": {"type": "integer", "minimum": 1, "maximum": 500,
+                      "default": 100,
+                      # BUG-6 fix: explicit default matching the handler's
+                      # `args.get("limit") or 100` behaviour.
                       "description": "Max items to return (default 100)."},
         },
         "required": [],

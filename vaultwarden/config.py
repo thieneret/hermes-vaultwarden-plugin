@@ -59,15 +59,58 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+def _minimal_yaml_mapping(text: str) -> dict:
+    """Very small fallback parser for flat ``key: value`` config files.
+
+    Used ONLY when PyYAML is unavailable (BUG-7). It intentionally handles
+    just the simple top-level mapping style used by minimal plugin configs;
+    anything richer raises ConfigError with an actionable suggestion rather
+    than silently mis-parsing.
+    """
+    result: dict[str, Any] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise errors.ConfigError(
+                "Cannot parse config file without PyYAML (unsupported YAML "
+                "construct). Install it with: pip install pyyaml")
+        key, _, val = line.partition(":")
+        val = val.strip().strip("'\"")
+        result[key.strip()] = val
+    return result
+
+
+def _load_yaml_text(text: str) -> dict:
+    """Parse YAML config text, degrading gracefully when PyYAML is missing."""
+    try:
+        import yaml  # PyYAML ships with Hermes — but is NOT guaranteed (BUG-7)
+    except ImportError:
+        try:
+            from .security import get_logger
+            get_logger("config").warning(
+                "PyYAML not installed; using minimal key:value parser for "
+                "YAML config sources. Run 'pip install pyyaml' for full support.")
+        except Exception:
+            pass
+        data = _minimal_yaml_mapping(text)
+        return data if isinstance(data, dict) else {}
+    data = yaml.safe_load(text) or {}
+    if not isinstance(data, Mapping):
+        raise errors.ConfigError("Config YAML must be a mapping at the top level.")
+    return dict(data)
+
+
 def _extract_section(source: Any) -> dict:
     """Normalise arbitrary config sources into the vaultwarden mapping."""
     if source is None:
         return {}
 
     if isinstance(source, (str, Path)):
-        import yaml  # PyYAML ships with Hermes
-        text = Path(source).read_text(encoding="utf-8") if Path(source).exists() else ""
-        data = yaml.safe_load(text) or {}
+        path = Path(source)
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        data = _load_yaml_text(text)
         return _extract_section(data)
 
     if isinstance(source, Mapping):

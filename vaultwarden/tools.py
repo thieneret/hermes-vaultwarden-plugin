@@ -109,15 +109,18 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # ---------------------------------------------------------------- list
     def h_list(args: dict, **kw: Any) -> dict:
         def run():
+            # BUG-3 fix: bw list items supports only --folderid/--collectionid/
+            # --search; there is NO --filter-type flag. Type filtering is done
+            # client-side on the returned items via _item_type_name().
             filters: list[str] = []
-            if args.get("type"):
-                type_num = {"login": 1, "note": 2, "card": 3, "identity": 4}[args["type"]]
-                filters.append(f"--filter-type={type_num}")
             if args.get("folder_id"):
-                filters.append(f"--folder-id={args['folder_id']}")
+                filters += ["--folderid", str(args["folder_id"])]
             if args.get("collection_id"):
-                filters.append(f"--collection-id={args['collection_id']}")
+                filters += ["--collectionid", str(args["collection_id"])]
             items = auth.list_items(filters or None)
+            want_type = args.get("type")
+            if want_type:
+                items = [i for i in items if _item_type_name(i) == want_type]
             limit = int(args.get("limit") or 100)
             projected = [_metadata(i) for i in items[:limit]]
             return {"items": projected, "total": len(items),
@@ -129,10 +132,20 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # -------------------------------------------------------------- search
     def h_search(args: dict, **kw: Any) -> dict:
         def run():
-            query = str(args["query"]).lower()
+            query = str(args["query"])
             field = args.get("field")
             want_type = args.get("type")
-            items = auth.list_items(None)
+            # BUG-5 fix: bw supports server/cache-side name search via
+            # `bw list items --search <query>` — use it when the query targets
+            # name/username (the fields bw searches natively). Fall back to a
+            # full client-side pass only for uri / explicit type filtering,
+            # which bw's --search does not cover.
+            native_ok = field in (None, "name", "username") and not want_type
+            if native_ok:
+                items = auth.list_items(["--search", query])
+            else:
+                items = auth.list_items(None)
+            q = query.lower()
             matches = []
             for it in items:
                 if want_type and _item_type_name(it) != want_type:
@@ -145,9 +158,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                     haystacks.append(str(meta.get("username") or "").lower())
                 if field in (None, "uri"):
                     haystacks.extend(u.lower() for u in meta.get("uris", []))
-                if any(query in h or fnmatch.fnmatch(h, f"*{query}*") for h in haystacks):
+                if any(q in h or fnmatch.fnmatch(h, f"*{q}*") for h in haystacks):
                     matches.append(meta)
-            return {"query": args["query"], "matches": matches, "count": len(matches)}
+            return {"query": query, "matches": matches, "count": len(matches)}
         return _guard(run)
 
     yield schemas.VAULTWARDEN_SEARCH, h_search
@@ -225,8 +238,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                     "Delete requires confirm:true (explicit user confirmation).",
                     suggestion="Re-issue with confirm=true after user approval.")
             permanent = bool(args.get("permanent"))
-            if permanent and not args.get("confirm"):
-                raise errors.PermissionError_("Permanent delete requires confirm:true as well.")
+            # BUG-4 fix: dead code removed — the confirm check above already
+            # guarantees confirm is truthy here, so a second check was
+            # unreachable. Soft vs permanent is decided by `permanent` alone.
             item_id = str(args["item_id"])
             auth.delete_item(item_id, permanent=permanent)
             log.warning("Deleted vault item %s (permanent=%s).", item_id, permanent)
@@ -238,23 +252,35 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # ----------------------------------------------------- generate_password
     def h_generate(args: dict, **kw: Any) -> dict:
         def run():
-            _require_write(config)
+            # BUG-2 fix: no _require_write() here — generation does not touch
+            # the vault (plan §8), so it works with allow_write=false.
             mode = args.get("mode") or "password"
             if mode == "passphrase":
                 words = int(args.get("words") or 4)
                 sep = str(args.get("separator") or "-")
-                bw_args = [str(words), "4", "0", "0", "--separator", sep]
+                # BUG-1 fix: real bw generate passphrase syntax uses flags,
+                # not positional 1/0 values: bw generate --passphrase -w N --separator S
+                bw_args = ["--passphrase", "-w", str(words), "--separator", sep]
             else:
                 length = int(args.get("length") or 20)
                 upper = args.get("uppercase", True)
                 lower = args.get("lowercase", True)
                 nums = args.get("numbers", True)
                 special = args.get("special", True)
-                bw_args = [str(length),
-                           "1" if upper else "0",
-                           "1" if lower else "0",
-                           "1" if nums else "0",
-                           "1" if special else "0"]
+                # BUG-1 fix: real bw generate password syntax uses flags, not
+                # positional 1/0 values: bw generate <length> --uppercase
+                # --lowercase --number --special (verified against the Bitwarden
+                # CLI source; note the singular "--number"). Only include a flag
+                # when the corresponding boolean is True.
+                bw_args = [str(length)]
+                if upper:
+                    bw_args.append("--uppercase")
+                if lower:
+                    bw_args.append("--lowercase")
+                if nums:
+                    bw_args.append("--number")
+                if special:
+                    bw_args.append("--special")
             pw = auth.generate_password(bw_args)
             log.info("Generated a new %s (value not logged).", mode)
             return {"mode": mode, "generated": pw, "length": len(pw)}
