@@ -87,10 +87,13 @@ def test_encode_item_encodes_all_strings(bw_cli, appdata, monkeypatch):
     assert parsed["type"] == 1            # ints untouched
 
 
-def test_locked_session_marker_maps_to_session_error(bw_cli, appdata):
+def test_locked_session_marker_maps_to_session_error(bw_cli, appdata, monkeypatch):
+    # v1.4 (FAIL-4): inject the stale-session marker through the test-only
+    # BW_TEST_FORCE_STDERR hook instead of smuggling a non-allowlisted env key
+    # (BW_FORCE_LOCKED) into the isolated subprocess environment.
+    monkeypatch.setenv("BW_TEST_FORCE_STDERR", "vault is locked")
     with pytest.raises(errors.SessionError):
-        bw_cli.run(["list", "items"], env={"BW_SESSION": "stale",
-                                           "BW_FORCE_LOCKED": "1"})
+        bw_cli.run(["list", "items"], env={"BW_SESSION": "stale"})
 
 
 def test_network_error_retry_once(fake_bw, appdata, monkeypatch):
@@ -101,21 +104,24 @@ def test_network_error_retry_once(fake_bw, appdata, monkeypatch):
 
     def counting_run(*a, **k):
         calls["n"] += 1
-        r = real_run(*a, **k)
-        if calls["n"] == 1:
-            # first attempt: simulate unreachable server
-            from unittest.mock import MagicMock
-            m = MagicMock(); m.returncode = 1; m.stdout = ""
-            m.stderr = "connect ECONNREFUSED 10.0.0.1:443"
-            return m
-        return r
+        # v1.4 (FAIL-5): BOTH attempts simulate the unreachable server — the
+        # first attempt AND the single retry must fail for the contract
+        # "retry once, then NETWORK_ERROR" to hold. (The old mock let the
+        # retry succeed, so no error was raised.)
+        from unittest.mock import MagicMock
+        m = MagicMock(); m.returncode = 1; m.stdout = ""
+        m.stderr = "connect ECONNREFUSED 10.0.0.1:443"
+        return m
 
     monkeypatch.setattr(sp, "run", counting_run)
-    monkeypatch.setattr("time.sleep", lambda *_: None)
+    sleeps: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s=None, *_: sleeps.append(s))
     cli = BwCli(fake_bw, appdata)
     with pytest.raises(errors.NetworkError):
         cli.status()
     assert calls["n"] == 2  # initial + single retry
+    assert sleeps == [2]    # exactly one backoff delay of 2 seconds
+    del real_run
 
 
 def test_parse_error_on_malformed_json(fake_bw, appdata, monkeypatch):

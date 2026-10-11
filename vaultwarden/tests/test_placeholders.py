@@ -18,6 +18,10 @@ def test_token_format_and_entropy():
     assert TOKEN_RE.match(entry.token)
     body = entry.token[len(TOKEN_PREFIX):-2]
     assert len(body) == 12 and body.islower()
+    # v1.4 (FAIL-3): the registry caps live entries at max_entries (default 50).
+    # The first token above is still live, so creating another 50 would hit the
+    # cap; drop it first so the entropy check starts from a clean slate.
+    reg.remove(entry.token)
     tokens = {reg.create("i", "password").token for _ in range(50)}
     assert len(tokens) == 50  # collision-free in practice
 

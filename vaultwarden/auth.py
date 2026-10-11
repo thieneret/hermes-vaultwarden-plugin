@@ -54,6 +54,12 @@ class AuthManager:
 
     def __init__(self, bw: BwCli, config: PluginConfig, *,
                  client_secret: str, master_password: str):
+        # FAIL-9 ordering fix: register the bootstrap secrets with the shared
+        # RedactingFilter FIRST — before any attribute assignment or log call
+        # can possibly echo them. Everything below is scrubbed from here on.
+        redactor = get_redacting_filter()
+        redactor.register_secret(client_secret)
+        redactor.register_secret(master_password)
         self._bw = bw
         self._config = config
         self._client_id = config.client_id
@@ -64,16 +70,11 @@ class AuthManager:
         # becomes CONFIGURED once configure_server_if_needed() has run (the
         # register(ctx) bootstrap flow). is_available()/check_fn therefore
         # report False before bootstrap — tools stay gated until then.
-        # NOTE: test_auth::test_full_bootstrap_flow asserts the pre-configure
-        # state; that v1.1 expectation is superseded by plan §5 / BUG-9 fix
-        # (FAIL-1) and needs a one-line update to UNINITIALIZED.
+        # (v1.4: test_auth::test_full_bootstrap_flow now matches this.)
         self._state = AuthState.UNINITIALIZED
         self._session_created_at: float = 0.0
         self._last_sync: float = 0.0
         self._lock = threading.RLock()
-        redactor = get_redacting_filter()
-        redactor.register_secret(client_secret)
-        redactor.register_secret(master_password)
 
     # ------------------------------------------------------------ properties
     @property
@@ -137,29 +138,43 @@ class AuthManager:
         return {"state": str(status)}
 
     def ensure_authenticated(self) -> None:
-        """Startup sequence steps 6-7: status -> login (if needed) -> unlock."""
+        """Startup sequence steps 6-7: status -> login (if needed) -> unlock.
+
+        v1.4 hardening: an invalid client secret is detected here and raised
+        as a clear AuthError BEFORE any unlock attempt, so the master password
+        never travels in the environment of a doomed subprocess (defense in
+        depth for FAIL-9); the secret VALUE is never included anywhere.
+        """
         with self._lock:
+            if not self._api_key_available():
+                try:
+                    self._do_login()
+                except errors.VaultwardenError as exc:
+                    if exc.code in ("AUTH_ERROR", "SESSION_ERROR", "PLUGIN_ERROR"):
+                        raise errors.AuthError(
+                            "API-key authentication failed.",
+                            suggestion="Check client_id and VW_CLIENT_SECRET in .env.") from exc
+                    raise
             status = self.probe_status()
             raw_state = str(status.get("state", "unauthenticated"))
-            if raw_state == "unauthenticated":
-                self._do_login()
-                self._do_unlock()
-            elif raw_state == "locked":
-                self._state = AuthState.LOGGED_IN
-                self._do_unlock()
-            elif raw_state == "unlocked":
+            if raw_state == "unlocked":
                 # Existing session file in our isolated profile: re-unlock to
                 # obtain a fresh BW_SESSION we hold in memory.
                 self._state = AuthState.LOGGED_IN
-                self._do_unlock()
-            else:
-                self._do_login()
-                self._do_unlock()
+            self._do_unlock()
             if self._config.auto_sync and self._last_sync == 0.0:
                 try:
                     self.sync(force=False)
                 except errors.VaultwardenError as exc:
                     log.warning("Initial sync failed (%s); continuing.", exc.code)
+
+    def _api_key_available(self) -> bool:
+        """True when the isolated profile already holds a valid apikey login."""
+        try:
+            st = self._bw.status()
+        except errors.VaultwardenError:
+            return False
+        return isinstance(st, dict) and st.get("status") == "OK"
 
     # ---------------------------------------------------------------- login
     def _do_login(self) -> None:

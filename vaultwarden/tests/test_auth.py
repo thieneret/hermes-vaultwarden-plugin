@@ -13,8 +13,11 @@ from vaultwarden.tests.conftest import make_config
 def test_full_bootstrap_flow(bw_cli):
     cfg = make_config()
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    assert mgr.state is AuthState.CONFIGURED
+    # v1.3/v1.4 (plan §5): the manager starts UNINITIALIZED and only becomes
+    # CONFIGURED when configure_server_if_needed() runs (register() bootstrap).
+    assert mgr.state is AuthState.UNINITIALIZED
     mgr.configure_server_if_needed()
+    assert mgr.state is AuthState.CONFIGURED
     mgr.ensure_authenticated()
     assert mgr.state is AuthState.UNLOCKED
     assert mgr.is_unlocked()

@@ -89,7 +89,9 @@ class BwCli:
         full_env = self.base_env(env)
         cmd = [self.bw_path, *args]
         try:
-            proc = subprocess.run(
+            # v1.4 (FAIL-5): look up subprocess.run via the module attribute so
+            # tests can monkeypatch subprocess.run deterministically.
+            proc = subprocess.run(  # noqa: SIM105 - see below
                 cmd, env=full_env, capture_output=True, text=True,
                 timeout=timeout or self.timeout,
             )
@@ -99,6 +101,14 @@ class BwCli:
         except OSError as exc:
             raise errors.BinaryError(
                 f"Failed to execute bw: {type(exc).__name__}") from exc
+
+        # v1.4 (FAIL-4): test-only hook — lets tests inject synthetic stderr
+        # (e.g. a stale-session marker) WITHOUT smuggling non-allowlisted keys
+        # into the isolated subprocess env. Never set in production.
+        injected = os.environ.get("BW_TEST_FORCE_STDERR")
+        if injected:
+            proc = subprocess.CompletedProcess(
+                cmd, returncode=1, stdout=proc.stdout, stderr=injected)
 
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
