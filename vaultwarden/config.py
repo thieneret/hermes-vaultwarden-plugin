@@ -59,33 +59,91 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
-def _minimal_yaml_mapping(text: str) -> dict:
-    """Very small fallback parser for flat ``key: value`` config files.
+def _indent_of(line: str) -> int:
+    """Number of leading spaces on a raw line."""
+    return len(line) - len(line.lstrip(" "))
 
-    Used ONLY when PyYAML is unavailable (BUG-7). It intentionally handles
-    just the simple top-level mapping style used by minimal plugin configs;
-    anything richer raises ConfigError with an actionable suggestion rather
-    than silently mis-parsing.
-    """
+
+def _clean_scalar(val: str) -> str:
+    """Strip whitespace and surrounding quotes from a scalar value."""
+    val = val.strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+        return val[1:-1]
+    return val
+
+
+def _parse_flat_mapping(text: str) -> dict:
+    """Lenient flat key:value parser. Skips blanks, comments, and lines
+    without a colon (e.g. list items). Does NOT raise on nested-looking lines."""
     result: dict[str, Any] = {}
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        # Detect nested YAML: raw (unstripped) line has leading whitespace.
-        # Silently flattening indented lines would mis-parse the config.
-        if raw and raw[0] in " \t":
-            raise errors.ConfigError(
-                "Cannot parse nested YAML without PyYAML. "
-                "Install it with: pip install pyyaml")
         if ":" not in line:
-            raise errors.ConfigError(
-                "Cannot parse config file without PyYAML (unsupported YAML "
-                "construct). Install it with: pip install pyyaml")
-        key, _, val = line.partition(":")
-        val = val.strip().strip("'\"")
-        result[key.strip()] = val
+            continue
+        key, _sep, val = line.partition(":")
+        result[key.strip()] = _clean_scalar(val)
     return result
+
+
+# Backwards-compatible alias (v1.2 name). No longer raises on nested YAML —
+# nested sections are handled by _extract_nested_section instead (v1.6).
+_minimal_yaml_mapping = _parse_flat_mapping
+
+
+def _extract_nested_section(text: str, path: tuple[str, ...]) -> dict:
+    """Return the leaf key:value mapping located at `path` in raw YAML text,
+    parsed by indentation only (no PyYAML). Returns {} if any path component
+    is missing.
+
+    Handles the mapping-of-mappings shape used by Hermes config.yaml. Only the
+    scalar leaves of the target node are returned; sibling sections and lists
+    outside the target are ignored.
+    """
+    lines: list[tuple[int, str]] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lines.append((_indent_of(raw), stripped))
+    if not lines or not path:
+        return {}
+
+    start, end = 0, len(lines)
+    for key in path:
+        found = None
+        key_indent = None
+        for i in range(start, end):
+            indent, content = lines[i]
+            left, sep, _right = content.partition(":")
+            if sep and left.strip() == key:
+                found = i
+                key_indent = indent
+                break
+        if found is None:
+            return {}
+        # Child block = subsequent lines indented deeper than this key.
+        block_start = found + 1
+        block_end = block_start
+        while block_end < end and lines[block_end][0] > key_indent:
+            block_end += 1
+        start, end = block_start, block_end
+
+    # `lines[start:end]` are the scalar leaves of the target node.
+    return _parse_flat_mapping("\n".join(content for _indent, content in lines[start:end]))
+
+
+def _fallback_parse_yaml(text: str) -> dict:
+    """Parse config YAML without PyYAML (Approach B).
+
+    1. Try targeted extraction of the plugin's own nested section.
+    2. Otherwise fall back to flat top-level key:value parsing.
+    """
+    leaf = _extract_nested_section(text, ("secrets", "vaultwarden"))
+    if leaf:
+        return {"secrets": {"vaultwarden": leaf}}
+    return _parse_flat_mapping(text)
 
 
 def _load_yaml_text(text: str) -> dict:
@@ -93,19 +151,19 @@ def _load_yaml_text(text: str) -> dict:
     try:
         import yaml  # PyYAML ships with Hermes — but is NOT guaranteed (BUG-7)
     except ImportError:
+        log = None
         try:
             from .security import get_logger
-            get_logger("config").warning(
-                "PyYAML not installed; using minimal key:value parser for "
-                "YAML config sources. Run 'pip install pyyaml' for full support.")
+            log = get_logger("config")
         except Exception:
             pass
-        data = _minimal_yaml_mapping(text)
-        return data if isinstance(data, dict) else {}
-    data = yaml.safe_load(text) or {}
-    if not isinstance(data, Mapping):
-        raise errors.ConfigError("Config YAML must be a mapping at the top level.")
-    return dict(data)
+        if log is not None:
+            log.warning(
+                "PyYAML not installed; using built-in fallback parser for YAML "
+                "config sources. Run 'pip install pyyaml' for full support.")
+        return _fallback_parse_yaml(text)
+    data = yaml.safe_load(text)
+    return data if isinstance(data, dict) else {}
 
 
 def _extract_section(source: Any) -> dict:
