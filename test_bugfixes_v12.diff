@@ -1,0 +1,32 @@
+diff --git a/vaultwarden/tests/test_bugfixes_v12.py b/vaultwarden/tests/test_bugfixes_v12.py
+index 2f10ac5..8502a04 100644
+--- a/vaultwarden/tests/test_bugfixes_v12.py
++++ b/vaultwarden/tests/test_bugfixes_v12.py
+@@ -181,17 +181,23 @@ def test_config_file_source_degrades_without_yaml(tmp_path, monkeypatch):
+     monkeypatch.setattr(builtins, "__import__", blocked)
+     monkeypatch.delitem(sys.modules, "yaml", raising=False)
+ 
++    # Flat top-level config still works.
+     f = tmp_path / "flat.yaml"
+     f.write_text("enabled: true\nserver_url: https://from-fallback\n")
+     cfg = load_config(str(f), env={})
+     assert cfg.enabled is True
+     assert cfg.server_url == "https://from-fallback"
+ 
++    # v1.6: nested secrets.vaultwarden is now extracted by the fallback parser.
+     nested = tmp_path / "nested.yaml"
+-    nested.write_text("secrets:\n  vaultwarden:\n    server_url: https://x\n")
+-    with pytest.raises(Exception) as ei:
+-        load_config(str(nested), env={})
+-    assert "pyyaml" in str(ei.value).lower()          # clear actionable error
++    nested.write_text(
++        "secrets:\n"
++        "  vaultwarden:\n"
++        "    server_url: https://x\n"
++        "    enabled: true\n")
++    cfg2 = load_config(str(nested), env={})
++    assert cfg2.server_url == "https://x"
++    assert cfg2.enabled is True
+ 
+ 
+ # --------------------------------------------------------------- BUG-8

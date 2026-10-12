@@ -1,0 +1,30 @@
+From 866ac6c0fa6ef84b20a398906f9d8bb6374ffd61 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Mon, 12 Oct 2026 18:48:30 +0000
+Subject: [PATCH 2/2] Fix .gitignore to exclude __pycache__ directory
+
+- Update `.gitignore` to ignore `__pycache__/` instead of `dist/`.
+---
+ .gitignore                                      |   2 +-
+ .../conftest.cpython-312-pytest-9.1.1.pyc       | Bin 661 -> 661 bytes
+ 2 files changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/.gitignore b/.gitignore
+index 849ddff..c18dd8d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1 @@
+-dist/
++__pycache__/
+diff --git a/__pycache__/conftest.cpython-312-pytest-9.1.1.pyc b/__pycache__/conftest.cpython-312-pytest-9.1.1.pyc
+index af2751d787116c66f83035b54c59bff191cb69c0..0ce4c1b9a4687a947c68a2d3d00a45e4f02c40c7 100644
+GIT binary patch
+delta 20
+acmbQrI+d0CG%qg~0}xDod}bqe7ZU(Bt_8aQ
+
+delta 20
+acmbQrI+d0CG%qg~0}!xYIJJ?xiwOWSLIoB8
+
+-- 
+2.39.5
+
