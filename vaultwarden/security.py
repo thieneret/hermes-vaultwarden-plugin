@@ -148,10 +148,21 @@ def get_redacting_filter() -> RedactingFilter:
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Logger wired into the shared redaction filter."""
+    """Logger wired into the shared redaction filter.
+
+    v1.7: ensures at least one handler exists so plugin logs are visible
+    even when Hermes does not configure the hermes.plugins.* hierarchy.
+    """
     logger = logging.getLogger(f"hermes.plugins.vaultwarden.{name}")
     if not any(isinstance(f, RedactingFilter) for f in logger.filters):
         logger.addFilter(_shared_filter)
+    # Ensure visibility: if neither this logger nor the root logger has
+    # handlers, add a StreamHandler so logs appear in container stdout.
+    if not logger.handlers and not logging.getLogger().handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        logger.addHandler(handler)
     return logger
 
 
