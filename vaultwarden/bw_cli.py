@@ -147,10 +147,32 @@ class BwCli:
 
     # ------------------------------------------------------------ commands
     def status(self) -> dict:
-        data = self.run(["status"])
+        """`bw status` -> parsed JSON dict.
+
+        v1.9: an unauthenticated profile answers with rc!=0 + empty stdout;
+        that plain failure degrades to {} ("not logged in") so the auth
+        flow can branch on it without raising. Transport-level errors
+        (network / timeout / binary) still propagate through the normal
+        retry + error taxonomy — otherwise a downed server would masquerade
+        as "unauthenticated" and trigger a pointless login attempt.
+        """
+        try:
+            data = self.run(["status"])
+        except errors.SessionError:
+            return {}  # stale/absent session on the profile -> not logged in
         if isinstance(data, dict):
             return data
-        return {"state": "unauthenticated", "message": str(data)}
+        if data is None:
+            return {}
+        return {"status": "unauthenticated", "message": str(data)}
+
+    def logout(self) -> bool:
+        """`bw logout`. Returns True on success or when already logged out."""
+        try:
+            self.run(["logout"])
+            return True
+        except (errors.SessionError, errors.NotFoundError):
+            return True  # nothing to log out from
 
     def config_server(self, url: str) -> None:
         self.run(["config", "server", url])

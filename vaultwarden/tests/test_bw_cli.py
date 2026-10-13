@@ -33,7 +33,7 @@ def test_base_env_never_inherits_parent(bw_cli, monkeypatch):
 
 def test_status_unauthenticated(bw_cli, appdata):
     st = bw_cli.status()
-    assert st["state"] == "unauthenticated"
+    assert st["status"] == "unauthenticated"
 
 
 def test_login_wrong_secret_raises_auth_mapped_error(bw_cli):
@@ -48,7 +48,7 @@ def test_login_and_unlock_roundtrip(bw_cli, appdata):
     key = bw_cli.unlock_passwordenv("mp-secret")
     assert "sessionkey" in key
     st = bw_cli.status()
-    assert st["state"] == "unlocked"
+    assert st["status"] == "unlocked"
 
 
 def test_list_and_get_json(bw_cli, appdata):

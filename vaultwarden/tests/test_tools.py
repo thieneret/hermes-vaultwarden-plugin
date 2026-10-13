@@ -144,7 +144,7 @@ def test_direct_retrieval_escape_hatch(bw_cli, registry):
     from vaultwarden.auth import AuthManager
     cfg = make_config(section={"allow_direct_secret_retrieval": True})
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    mgr.configure_server_if_needed(); mgr.ensure_authenticated()
+    mgr.ensure_authenticated()
     # v1.5 (FAIL-2): get_tools yields (schema_dict, handler) tuples; dict()
     # cannot key by dicts -> build the map by tool name instead.
     tools = {s["name"]: h for s, h in get_tools(mgr, cfg, registry)}

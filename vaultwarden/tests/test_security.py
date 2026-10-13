@@ -82,7 +82,9 @@ def test_master_password_never_logged(caplog, bw_cli):
     # always failed with "DID NOT RAISE"). The real check is below: after a
     # full bootstrap attempt with wrong credentials, no secret VALUE may
     # appear in any log record.
-    mgr.configure_server_if_needed()
+    # v1.9: ensure_authenticated() checks `bw status` first and then logs
+    # in — a wrong client secret fails during login, BEFORE any log record
+    # could carry a secret value.
     try:
         mgr.ensure_authenticated()          # wrong client secret -> fails
     except Exception:
@@ -161,7 +163,6 @@ def test_session_key_not_persisted_to_disk(bw_cli, tmp_path):
     from vaultwarden.tests.conftest import make_config
     mgr = AuthManager(bw_cli, make_config(), client_secret="cs-secret",
                       master_password="mp-secret")
-    mgr.configure_server_if_needed()
     mgr.ensure_authenticated()
     key = mgr.get_session()
     # v1.5 (FAIL-10): skip the fake bw script itself — it is a TEST FIXTURE

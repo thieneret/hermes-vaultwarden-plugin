@@ -169,6 +169,10 @@ def test_on_session_end_hook_locks_vault(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     auth = vaultwarden.PLUGIN_STATE["auth"]
     appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    # v1.9 lazy auth: authenticate first so there IS a live session to lock.
+    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    assert tools["vaultwarden_list"]({})["total"] == 3
+    assert (appdata / "fake-logged-in").exists()
     end = dict(ctx.hooks)["on_session_end"]
     end()
     assert auth.session_key is None
@@ -192,3 +196,161 @@ def test_logs_never_contain_bootstrap_secrets(monkeypatch, tmp_path, fake_bw, ca
     assert "mp-secret" not in blob
     key = vaultwarden.PLUGIN_STATE["auth"].session_key
     assert key not in blob
+
+
+# ------------------------------------------------------- v1.9 lazy auth flow
+def test_register_defers_auth_and_completes_fast(monkeypatch, tmp_path, fake_bw):
+    """register() must NOT block on authentication (Hermes 10s load timeout).
+
+    The fake bw gets a deliberate 3s delay per invocation; if register()
+    still ran status/login/unlock eagerly the total would blow well past
+    5s. With v1.9 lazy auth it finishes almost instantly instead.
+    """
+    import time
+    slow_bw = tmp_path / "slow-bw"
+    slow_bw.write_text("#!/usr/bin/env python3\n"
+                       "import os, sys, time\n"
+                       "time.sleep(3)\n"
+                       "os.execv(%r, %r + sys.argv[1:])\n" % (fake_bw, [fake_bw]))
+    slow_bw.chmod(0o755)
+    ok, ctx = _register_ok(monkeypatch, tmp_path, str(slow_bw))
+    assert ok is True
+    auth = vaultwarden.PLUGIN_STATE["auth"]
+    # Auth was deferred: nothing has been authenticated yet...
+    assert auth.state.value == "configured"
+    assert auth.session_key is None
+    # ...and registration itself stayed far below the load timeout.
+    start = time.monotonic()
+    ok2, _ = _register_ok(monkeypatch, tmp_path, fake_bw)
+    assert ok2 is True and (time.monotonic() - start) < 5.0
+
+
+def test_first_tool_call_triggers_lazy_auth(monkeypatch, tmp_path, fake_bw):
+    """check_fn()/first tool use drives the full Case A bootstrap."""
+    ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
+    assert ok is True
+    auth = vaultwarden.PLUGIN_STATE["auth"]
+    appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    # Deferred: no server config / login happened during register().
+    assert not (appdata / "server.txt").exists()
+    assert not (appdata / "fake-logged-in").exists()
+
+    check = next(t for t in ctx.tools if t["name"] == "vaultwarden_status")["check_fn"]
+    assert check() is True                      # triggers ensure_authenticated()
+    assert auth.state.value == "unlocked"
+    assert (appdata / "server.txt").read_text() == "https://vault.example.com"
+    assert (appdata / "fake-logged-in").exists()
+
+    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    res = tools["vaultwarden_status"]({})
+    assert res["status"]["auth_state"] == "unlocked"
+
+
+def test_restart_reuses_session_without_reconfig_or_logout(monkeypatch, tmp_path, fake_bw):
+    """Case C across plugin restarts: correct server+account already logged
+    in -> NO 'bw config server', NO logout, NO login — just unlock."""
+    ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
+    assert ok is True
+    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    assert tools["vaultwarden_list"]({})["total"] == 3   # lazy auth completes
+
+    cli = vaultwarden.PLUGIN_STATE["bw"]
+    appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    # Restart realism: the fake bw only persists login/unlock markers; a real
+    # bw keeps its server URL in data.json. Seed it so the fresh manager can
+    # recognise the correct server from `bw status` alone.
+    (appdata / "server.txt").write_text("https://vault.example.com")
+
+    calls = []
+    real_run = cli.run
+
+    def spy(args, **kw):
+        calls.append(list(args))
+        return real_run(args, **kw)
+    cli.run = spy
+
+    # Simulate a fresh process against the SAME isolated profile: new
+    # AuthManager, same config, same appdata dir (session already unlocked).
+    # Drop the in-memory session of the old manager so the profile state —
+    # not remembered memory — drives the decision (true restart semantics).
+    vaultwarden.PLUGIN_STATE["auth"]._session_key = None   # noqa: SLF001
+    from vaultwarden.auth import AuthManager
+    cfg = vaultwarden.PLUGIN_STATE["config"]
+    mgr2 = AuthManager(cli, cfg, client_secret="cs-secret", master_password="mp-secret")
+    mgr2.ensure_authenticated()
+
+    cmds = [" ".join(c) for c in calls]
+    assert not any(c.startswith("config server") for c in cmds), cmds
+    assert "logout" not in cmds, cmds
+    assert not any(c.startswith("login") for c in cmds), cmds
+    assert any(c.startswith("unlock") for c in cmds), cmds   # adopt via unlock
+    assert mgr2.state.value == "unlocked"
+
+
+def test_wrong_account_triggers_logout_then_reauth(monkeypatch, tmp_path, fake_bw):
+    """Case B: profile logged in with a DIFFERENT userId -> logout first,
+    then config + login + unlock (no 'Logout required' failure)."""
+    ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
+    assert ok is True
+    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools["vaultwarden_list"]({})                # session up as user 1111...
+
+    cli = vaultwarden.PLUGIN_STATE["bw"]
+    appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    # Stale foreign account on the same profile (e.g. manual `bw login`).
+    (appdata / "fake-user-id").write_text("deadbeef-0000-0000-0000-000000000000")
+
+    order = []
+    real_run = cli.run
+
+    def spy(args, **kw):
+        order.append(str(args[0]) if args else "")
+        if args[:2] == ["config", "server"]:
+            # regression guard: this only ever runs after a logout now
+            assert not (appdata / "fake-logged-in").exists(), \
+                "Logout required before server config update!"
+        return real_run(args, **kw)
+    cli.run = spy
+
+    from vaultwarden.auth import AuthManager
+    cfg = vaultwarden.PLUGIN_STATE["config"]
+    mgr2 = AuthManager(cli, cfg, client_secret="cs-secret", master_password="mp-secret")
+    mgr2.ensure_authenticated()
+
+    assert "logout" in order, order
+    assert "config" in order, order
+    assert "login" in order, order
+    assert "unlock" in order, order
+    assert order.index("logout") < order.index("config") < order.index("login")
+    assert mgr2.state.value == "unlocked"
+    # re-login restored OUR account id
+    assert (appdata / "fake-user-id").read_text() == "11111111-2222-3333-4444-555555555555"
+
+
+def test_wrong_server_triggers_logout_then_reconfig(monkeypatch, tmp_path, fake_bw):
+    """Case B (server mismatch): stale session on another server URL."""
+    ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
+    assert ok is True
+    vaultwarden.PLUGIN_STATE["auth"].ensure_authenticated()  # idempotent fast path
+
+    appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    (appdata / "server.txt").write_text("https://old.vault.example.net")
+
+    cli = vaultwarden.PLUGIN_STATE["bw"]
+    order = []
+    real_run = cli.run
+
+    def spy(args, **kw):
+        order.append(str(args[0]) if args else "")
+        return real_run(args, **kw)
+    cli.run = spy
+
+    from vaultwarden.auth import AuthManager
+    cfg = vaultwarden.PLUGIN_STATE["config"]
+    mgr2 = AuthManager(cli, cfg, client_secret="cs-secret", master_password="mp-secret")
+    mgr2.ensure_authenticated()
+
+    assert "logout" in order and "config" in order and "login" in order
+    assert order.index("logout") < order.index("config")
+    assert (appdata / "server.txt").read_text() == "https://vault.example.com"
+    assert mgr2.state.value == "unlocked"
