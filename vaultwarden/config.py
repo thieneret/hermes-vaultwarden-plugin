@@ -32,6 +32,8 @@ except ImportError:
     _hermes_get_secret = None
 
 PLUGIN_DIR = Path(__file__).resolve().parent
+# Legacy section key (pre-v1.8). Retained for reference only; the v1.8
+# _extract_section() reads plugin-relative keys via get_config() instead.
 DEFAULT_SECTION_KEY = "secrets.vaultwarden"
 
 _DEFAULTS: dict[str, Any] = {
@@ -177,39 +179,92 @@ def _load_yaml_text(text: str) -> dict:
 
 
 def _extract_section(source: Any) -> dict:
-    """Normalise arbitrary config sources into the vaultwarden mapping."""
+    """Normalise arbitrary config sources into the vaultwarden mapping.
+
+    v1.8 resolution order:
+    1. Hermes-native: PluginContext.get_config() with plugin-relative keys
+       (reads plugins.entries.<plugin_id>.settings.<key>).
+    2. Fallback to $HERMES_HOME/config.yaml when get_config yields nothing
+       (transitional backward compatibility).
+    3. Mapping sources: new plugins.entries.vaultwarden.settings layout,
+       then legacy secrets.vaultwarden layout.
+    4. Object-style contexts (.config / .plugin_config / get_config attr).
+    """
     if source is None:
         return {}
 
+    # 1. Hermes-native PluginContext.get_config() — plugin-relative keys
+    getter = getattr(source, "get_config", None)
+    if callable(getter):
+        result: dict[str, Any] = {}
+        for key in _DEFAULTS:
+            try:
+                value = getter(key, None)
+            except Exception:
+                continue
+            if value is not None:
+                result[key] = value
+        if result:
+            return result
+        # get_config yielded nothing — fall back to reading config.yaml
+        # directly so a legacy layout still loads during transition.
+        hermes_home = str(os.environ.get("HERMES_HOME", "")).strip()
+        if hermes_home:
+            candidate = Path(hermes_home).expanduser() / "config.yaml"
+            if candidate.exists():
+                data = _load_yaml_text(candidate.read_text(encoding="utf-8"))
+                legacy = _extract_mapping_section(data)
+                if legacy:
+                    return legacy
+        return {}
+
+    # 2. File path source
     if isinstance(source, (str, Path)):
         path = Path(source)
         text = path.read_text(encoding="utf-8") if path.exists() else ""
         data = _load_yaml_text(text)
-        return _extract_section(data)
+        return _extract_mapping_section(data)
 
+    # 3. Mapping source — walk known layouts
     if isinstance(source, Mapping):
-        node: Any = source
-        # walk: {"secrets": {"vaultwarden": {...}}} or already the section
-        if "secrets" in node and isinstance(node["secrets"], Mapping):
-            node = node["secrets"]
-        if "vaultwarden" in node and isinstance(node["vaultwarden"], Mapping):
-            node = node["vaultwarden"]
-        return dict(node)
+        return _extract_mapping_section(source)
 
-    # Object-style contexts
+    # 4. Object-style contexts
     for attr in ("config", "plugin_config"):
         inner = getattr(source, attr, None)
         if inner is not None and inner is not source:
             return _extract_section(inner)
-    getter = getattr(source, "get_config", None)
-    if callable(getter):
-        try:
-            got = getter(DEFAULT_SECTION_KEY)
-            if isinstance(got, Mapping):
-                return dict(got)
-        except Exception:
-            pass
     raise errors.ConfigError("Unsupported configuration source.")
+
+
+def _extract_mapping_section(node: Mapping) -> dict:
+    """Extract the vaultwarden section from an already-parsed mapping.
+
+    Handles both the v1.8 layout (plugins.entries.vaultwarden.settings)
+    and the legacy layout (secrets.vaultwarden).
+    """
+    if not isinstance(node, Mapping):
+        return {}
+    # v1.8 layout: plugins.entries.vaultwarden.settings
+    plugins = node.get("plugins")
+    if isinstance(plugins, Mapping):
+        entries = plugins.get("entries")
+        if isinstance(entries, Mapping):
+            entry = entries.get("vaultwarden")
+            if isinstance(entry, Mapping):
+                settings = entry.get("settings")
+                if isinstance(settings, Mapping):
+                    return dict(settings)
+                legacy_config = entry.get("config")
+                if isinstance(legacy_config, Mapping):
+                    return dict(legacy_config)
+    # legacy layout: secrets.vaultwarden
+    current: Any = node
+    if "secrets" in current and isinstance(current["secrets"], Mapping):
+        current = current["secrets"]
+    if "vaultwarden" in current and isinstance(current["vaultwarden"], Mapping):
+        current = current["vaultwarden"]
+    return dict(current) if isinstance(current, Mapping) else {}
 
 
 @dataclass
