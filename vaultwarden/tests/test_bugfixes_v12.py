@@ -82,7 +82,6 @@ def test_list_folder_id_uses_folderid_flag(bw_cli, appdata, monkeypatch):
     monkeypatch.setattr(bw_cli, "list_items", spy)
     cfg = make_config()
     auth = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    auth.configure_server_if_needed()
     auth.ensure_authenticated()
     tools = {s["name"]: h for s, h in
              get_tools(auth, cfg, PlaceholderRegistry())}
@@ -125,7 +124,6 @@ def test_search_uses_native_search_flag(bw_cli, monkeypatch):
     monkeypatch.setattr(bw_cli, "list_items", spy)
     cfg = make_config()
     auth = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    auth.configure_server_if_needed()
     auth.ensure_authenticated()
     tools = {s["name"]: h for s, h in
              get_tools(auth, cfg, PlaceholderRegistry())}
@@ -222,7 +220,6 @@ def test_check_fn_is_named_closure(fake_bw, appdata):
     check = _make_check_fn(auth)
     assert callable(check) and check.__name__ == "check"
     assert check() is False                      # uninitialised state
-    auth.configure_server_if_needed()
     auth.ensure_authenticated()
     assert check() is True
 

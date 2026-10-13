@@ -103,21 +103,24 @@ def register(ctx: Any) -> bool:
         return False
     log.info("Isolated appdata dir ready: %s", appdata_dir)
 
+    # Create objects but DO NOT authenticate yet (v1.9 lazy auth):
+    # authentication is deferred to the first tool use / check_fn call so
+    # register() completes well within Hermes's 10s plugin-load timeout.
     try:
         config.validate()
         bw = BwCli(bw_path, appdata_dir)
         auth = AuthManager(bw, config,
                            client_secret=client_secret,
                            master_password=master_password)
-        log.info("AuthManager created, configuring server...")
-        # 5-7. server config + login + unlock (state machine §5)
+        # UNINITIALIZED -> CONFIGURED transition only; NO bw subprocess here.
         auth.configure_server_if_needed()
-        log.info("Server configured, authenticating...")
-        auth.ensure_authenticated()
-        log.info("Authentication successful (state=%s)", auth.state.value)
+        log.info("AuthManager created (auth deferred to first tool use)")
+        # NOTE: Do NOT call ensure_authenticated() here — server config,
+        # login and unlock all happen inside ensure_authenticated(), which
+        # is triggered lazily by is_available()/check_fn on first tool use.
     except Exception as exc:
         code = getattr(exc, "code", type(exc).__name__)
-        log.warning("Vaultwarden plugin load FAILED: startup auth failed (%s): %s",
+        log.warning("Vaultwarden plugin load FAILED: init error (%s): %s",
                     code, exc)
         return False
 
@@ -167,6 +170,6 @@ def register(ctx: Any) -> bool:
 
     PLUGIN_STATE.update({"auth": auth, "registry": registry,
                          "config": config, "bw": bw})
-    log.info("Vaultwarden plugin ACTIVE (server=%s, write=%s).",
+    log.info("Vaultwarden plugin ACTIVE (server=%s, write=%s, auth=deferred).",
              config.server_url, config.allow_write)
     return True

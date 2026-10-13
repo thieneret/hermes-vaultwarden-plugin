@@ -81,8 +81,8 @@ def test_no_cross_contamination_between_two_profiles(fake_bw, tmp_path):
     a.mkdir(); b.mkdir()
     ca, cb = BwCli(fake_bw, a), BwCli(fake_bw, b)
     ca.login_apikey("user.x", "cs-secret")
-    assert ca.status()["state"] == "locked"
-    assert cb.status()["state"] == "unauthenticated"  # b never saw a's login
+    assert ca.status()["status"] == "locked"
+    assert cb.status()["status"] == "unauthenticated"  # b never saw a's login
 
 
 def test_middleware_chain_safety_other_plugin_last_word(fake_bw, tmp_path, registry):
@@ -94,7 +94,7 @@ def test_middleware_chain_safety_other_plugin_last_word(fake_bw, tmp_path, regis
     from vaultwarden.tests.conftest import make_config
     auth = AuthManager(cli, make_config(), client_secret="cs-secret",
                        master_password="mp-secret")
-    auth.configure_server_if_needed(); auth.ensure_authenticated()
+    auth.ensure_authenticated()
     ours = make_placeholder_resolver(auth, registry)
 
     def other_plugin_mw(tool_name, args):
@@ -130,7 +130,10 @@ def test_register_cleanup_removes_bootstrap_env(monkeypatch, tmp_path, fake_bw):
     assert "VW_CLIENT_SECRET" not in os.environ
     assert "VW_MASTER_PASSWORD" not in os.environ
     # ...but the plugin still works (values captured before cleanup):
+    # v1.9: register() defers authentication; this FIRST tool use triggers
+    # the lazy ensure_authenticated() and the vault comes up unlocked.
     status = next(t for t in ctx.tools if t["name"] == "vaultwarden_status")
+    assert status["check_fn"]() is True          # lazy auth kicks in here
     res = status["handler"]({})
     assert res["status"]["auth_state"] == "unlocked"
     bwdata = tmp_path / "plugins" / "vaultwarden" / ".bw-data"

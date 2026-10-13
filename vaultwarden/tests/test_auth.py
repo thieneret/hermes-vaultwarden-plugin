@@ -15,6 +15,8 @@ def test_full_bootstrap_flow(bw_cli):
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
     # v1.3/v1.4 (plan §5): the manager starts UNINITIALIZED and only becomes
     # CONFIGURED when configure_server_if_needed() runs (register() bootstrap).
+    # v1.9: ensure_authenticated() itself now performs server config + login
+    # + unlock after checking `bw status` — no unconditional config anymore.
     assert mgr.state is AuthState.UNINITIALIZED
     mgr.configure_server_if_needed()
     assert mgr.state is AuthState.CONFIGURED
@@ -54,7 +56,6 @@ def test_invalid_master_password_no_retry(bw_cli):
 def test_session_expiry_forces_reunlock(bw_cli):
     cfg = make_config(section={"session_timeout_seconds": 1})
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    mgr.configure_server_if_needed()
     mgr.ensure_authenticated()
     first = mgr.get_session()
     mgr._session_created_at = time.time() - 5   # simulate expiry
@@ -66,7 +67,6 @@ def test_session_expiry_forces_reunlock(bw_cli):
 def test_recovery_from_mid_operation_session_error(bw_cli):
     cfg = make_config()
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    mgr.configure_server_if_needed()
     mgr.ensure_authenticated()
     seen_sessions = []
 
@@ -84,7 +84,6 @@ def test_recovery_from_mid_operation_session_error(bw_cli):
 def test_lock_clears_session(bw_cli):
     cfg = make_config()
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    mgr.configure_server_if_needed()
     mgr.ensure_authenticated()
     assert mgr.session_key
     mgr.lock()
@@ -95,7 +94,6 @@ def test_lock_clears_session(bw_cli):
 def test_status_snapshot_has_no_secrets(bw_cli):
     cfg = make_config()
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    mgr.configure_server_if_needed()
     mgr.ensure_authenticated()
     snap = mgr.status_snapshot()
     blob = str(snap)

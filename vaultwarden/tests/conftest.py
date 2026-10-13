@@ -82,22 +82,41 @@ if argv[:1] == ["status"]:
     unlocked = os.path.exists(os.path.join(appdata, "fake-unlocked"))
     serverfile = os.path.join(appdata, "server.txt")
     server = open(serverfile).read().strip() if os.path.exists(serverfile) else ""
+    uidfile = os.path.join(appdata, "fake-user-id")
+    uid = open(uidfile).read().strip() if os.path.exists(uidfile) else ""
     state = "unlocked" if (logged and unlocked) else ("locked" if logged else "unauthenticated")
+    # v1.9: mirror the REAL `bw status` contract — the key is "status"
+    # (not "state") and the account is reported via "userId".
     out(json.dumps({"serverUrl": server, "lastSync": None,
-                    "status": "OK" if logged else "unavailable",
+                    "status": state,
                     "userEmail": "agent@example.com" if logged else None,
-                    "vaultVersion": "1", "state": state}))
+                    "userId": uid if logged else None,
+                    "vaultVersion": "1"}))
 elif argv[:2] == ["config", "server"]:
+    if os.path.exists(os.path.join(appdata, "fake-logged-in")):
+        sys.stderr.write("Logout required before server config update.\n")
+        sys.exit(1)
     with open(os.path.join(appdata, "server.txt"), "w") as f:
         f.write(argv[2])
 elif argv[:3] == ["config", "get", "server"]:
     p = os.path.join(appdata, "server.txt")
     out(open(p).read().strip() if os.path.exists(p) else "https://vault.bitwarden.com")
+elif argv[:1] == ["logout"]:
+    try:
+        os.remove(os.path.join(appdata, "fake-logged-in"))
+        os.remove(os.path.join(appdata, "fake-unlocked"))
+    except OSError:
+        pass
+    out("You have been logged out!")
 elif argv[:1] == ["login"]:
     cid = os.environ.get("BW_CLIENTID", "")
     csec = os.environ.get("BW_CLIENTSECRET", "")
     if cid.startswith("user.") and csec == "cs-secret":
         open(os.path.join(appdata, "fake-logged-in"), "w").close()
+        # v1.9: persist the account uuid so `bw status` can report userId
+        # (real bw derives it from the authenticated session).
+        with open(os.path.join(appdata, "fake-user-id"), "w") as f:
+            f.write(cid[len("user."):])
         out("You are logged in as agent@example.com")
     else:
         sys.stderr.write("Username or password is incorrect. Try again.\n"); sys.exit(1)
@@ -243,7 +262,6 @@ def bw_cli(fake_bw, appdata):
 def auth_manager(bw_cli, plugin_config) -> AuthManager:
     mgr = AuthManager(bw_cli, plugin_config,
                       client_secret="cs-secret", master_password="mp-secret")
-    mgr.configure_server_if_needed()
     mgr.ensure_authenticated()
     return mgr
 
@@ -289,7 +307,6 @@ def write_auth_manager(bw_cli):
     """AuthManager wired to a config that allows write operations."""
     cfg = make_config(section={"allow_write": True})
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    mgr.configure_server_if_needed()
     mgr.ensure_authenticated()
     return mgr
 

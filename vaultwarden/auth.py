@@ -93,8 +93,30 @@ class AuthManager:
             return self._last_sync
 
     def is_available(self) -> bool:
-        """check_fn passed to ctx.register_tool — graceful degradation gate."""
-        return self._state is not AuthState.UNINITIALIZED
+        """check_fn passed to ctx.register_tool — graceful degradation gate.
+
+        v1.9 lazy auth: register() no longer authenticates eagerly (it used
+        to block past Hermes' 10s plugin-load timeout). The first tool call
+        (or check_fn evaluation) triggers ``ensure_authenticated()`` here so
+        the vault comes up on demand instead. A manager that was never
+        bootstrapped (state UNINITIALIZED) stays gated off, exactly like
+        before v1.9.
+        """
+        # NOTE: deliberately NOT taking self._lock here — ensure_authenticated
+        # acquires it and RLock is only re-entrant on the owning thread; a
+        # plain read of the enum reference is atomic under CPython.
+        if getattr(self, "_state", AuthState.UNINITIALIZED) is AuthState.UNINITIALIZED:
+            return False
+        with self._lock:
+            if self._state is AuthState.UNLOCKED and self._session_key:
+                return True
+            try:
+                self.ensure_authenticated()
+            except Exception as exc:  # noqa: BLE001 - degrade gracefully
+                log.warning("Lazy authentication failed (%s); vault unavailable.",
+                            getattr(exc, "code", type(exc).__name__))
+                return False
+            return self._state is AuthState.UNLOCKED
 
     def is_unlocked(self) -> bool:
         with self._lock:
@@ -109,61 +131,159 @@ class AuthManager:
 
     # ------------------------------------------------------------- bootstrap
     def configure_server_if_needed(self) -> None:
-        """`bw config server <url>` unless data.json already points there."""
-        # Plan §5 transition: UNINITIALIZED -> CONFIGURED.
+        """UNINITIALIZED -> CONFIGURED transition (kept for the state machine).
+
+        v1.9: server configuration itself is now handled inside
+        ``ensure_authenticated()`` — this method no longer runs
+        `bw config server` unconditionally at startup (that caused the
+        "Logout required before server config update" error when a valid
+        session already existed on the profile). It only flips the state
+        so tools/check_fn can gate on it.
+        """
         with self._lock:
             if self._state is AuthState.UNINITIALIZED:
                 self._state = AuthState.CONFIGURED
-
-        want = self._config.server_url
-        try:
-            current = self._bw.config_get()
-        except errors.VaultwardenError:
-            current = None
-        if isinstance(current, str):
-            current = current.strip().rstrip("/")
-        if current == want.rstrip("/"):
-            log.debug("Server URL already configured in isolated profile.")
-            return
-        self._bw.config_server(want)
-        log.info("Configured bw server URL in isolated appdata profile.")
 
     def probe_status(self) -> dict:
         try:
             status = self._bw.status()
         except errors.VaultwardenError as exc:
-            return {"state": "error", "error_code": exc.code}
+            return {"status": "error", "error_code": exc.code}
         if isinstance(status, dict):
             return status
-        return {"state": str(status)}
+        return {"status": str(status)}
+
+    @staticmethod
+    def _session_state(status: dict) -> str:
+        """Normalise the bw session state from a `bw status` payload.
+
+        Real bw uses the key "status"; older fixtures used "state". When
+        neither is present but the profile reports a userId, infer LOGGED_IN.
+        """
+        st = str(status.get("status") or status.get("state") or "")
+        if st in ("unauthenticated", "locked", "unlocked"):
+            return st
+        if status.get("userId"):
+            return "locked"
+        return "unauthenticated"
 
     def ensure_authenticated(self) -> None:
-        """Startup sequence steps 6-7: status -> login (if needed) -> unlock.
+        """v1.9 auth flow: check `bw status` FIRST, then do the minimum.
 
-        v1.5: reverted to the original status-driven branching (plan §5).
-        The v1.4 `_api_key_available()` pre-check variant changed the state
-        machine flow and violated v1.4 constraint #6; it is removed.
+        Case A: not logged in            -> config server + login + unlock
+        Case B: logged in, wrong server
+                or wrong account         -> logout + config + login + unlock
+        Case C: correct session          -> unlock only if locked;
+                                            nothing if already unlocked
+
+        Account verification: config.yaml carries client_id "user.<uuid>";
+        bw status reports userId "<uuid>" — they must match.
         """
+        log.info("Checking authentication status...")
         with self._lock:
+            # Step 1: current session snapshot.
             status = self.probe_status()
-            raw_state = str(status.get("state", "unauthenticated"))
-            if raw_state == "unauthenticated":
+            current_status = self._session_state(status)
+            current_server = str(status.get("serverUrl") or "").rstrip("/")
+            current_user_id = str(status.get("userId") or "")
+
+            # Expected session per plugin config.
+            expected_server = self._config.server_url.rstrip("/")
+            expected_user_id = self._client_id.removeprefix("user.")
+
+            log.info("Current: status=%s, server=%s, user=%s",
+                     current_status, current_server, current_user_id)
+            log.info("Expected: server=%s, user=%s", expected_server, expected_user_id)
+
+            # Step 2: does the existing session match server AND account?
+            is_correct_server = (current_server == expected_server)
+            # v1.9 account verification: bw status reports userId "<uuid>",
+            # config carries client_id "user.<uuid>". A profile that does not
+            # report any userId at all is treated as "unknown" rather than a
+            # mismatch (defensive against CLI variants); an *explicitly
+            # different* userId always forces the Case B logout + re-auth.
+            is_correct_account = (
+                current_user_id == expected_user_id or not current_user_id)
+            needs_reauth = not (is_correct_server and is_correct_account)
+
+            # Case C: already authenticated with the correct session.
+            if not needs_reauth:
+                if current_status == "unlocked":
+                    log.info("Already authenticated and unlocked; nothing to do.")
+                    self._state = AuthState.LOGGED_IN
+                    if self._session_key:
+                        # v1.9 fast path: our remembered in-memory session is
+                        # still valid (idempotent re-check, e.g. lazy auth via
+                        # check_fn followed by another tool call) — no extra
+                        # subprocess round-trip needed.
+                        self._state = AuthState.UNLOCKED
+                    else:
+                        self._adopt_existing_unlocked_session()
+                    self._maybe_initial_sync()
+                    return
+                if current_status == "locked":
+                    log.info("Already authenticated but locked, unlocking...")
+                    self._state = AuthState.LOGGED_IN
+                    self._do_unlock()
+                    self._maybe_initial_sync()
+                    return
+                # Correct server/account but bw reports unauthenticated
+                # (e.g. inconclusive status payload) — fall through to login.
+
+            # Case B: wrong server or account -> logout before reconfiguring.
+            if current_status in ("locked", "unlocked") and needs_reauth:
+                log.info("Session mismatch (server/account), logging out first...")
+                self._clear_session_locked()
+                self._bw.logout()
+                current_status = "unauthenticated"
+
+            # Case A: not logged in -> config server + login + unlock.
+            if current_status == "unauthenticated":
+                log.info("Not authenticated, configuring server and logging in...")
+                self._configure_server()
                 self._do_login()
                 self._do_unlock()
-            elif raw_state == "locked":
-                self._state = AuthState.LOGGED_IN
-                self._do_unlock()
-            elif raw_state == "unlocked":
-                self._state = AuthState.LOGGED_IN
-                self._do_unlock()
-            else:
-                self._do_login()
-                self._do_unlock()
-            if self._config.auto_sync and self._last_sync == 0.0:
-                try:
-                    self.sync(force=False)
-                except errors.VaultwardenError as exc:
-                    log.warning("Initial sync failed (%s); continuing.", exc.code)
+                self._maybe_initial_sync()
+                return
+
+            # Unreachable in practice; treat as needing full re-auth.
+            self._configure_server()
+            self._do_login()
+            self._do_unlock()
+            self._maybe_initial_sync()
+
+    def _configure_server(self) -> None:
+        """`bw config server <url>` — ONLY when the session needs (re)auth."""
+        server_url = self._config.server_url
+        if not server_url:
+            return
+        log.info("Configuring bw server: %s", server_url)
+        try:
+            self._bw.config_server(server_url)
+        except errors.VaultwardenError as exc:
+            raise errors.PluginError(
+                f"bw config server failed: {exc.message}",
+                suggestion="Run 'bw logout' in the isolated profile, then retry."
+            ) from exc
+        log.info("Server configured successfully")
+
+    def _adopt_existing_unlocked_session(self) -> None:
+        """Case C/unlocked: bw keeps its own session key; we never stored one
+        in memory (e.g. after a plugin restart). Re-unlock locally so tool
+        calls keep flowing — deterministic and safe (auto_unlock path)."""
+        if self._session_key:
+            return  # our remembered key is still valid
+        if self._config.auto_unlock:
+            log.info("Adopting existing unlocked profile via local re-unlock.")
+            self._do_unlock()
+
+    def _maybe_initial_sync(self) -> None:
+        """Best-effort first sync after authentication (auto_sync only)."""
+        if self._config.auto_sync and self._last_sync == 0.0:
+            try:
+                self.sync(force=False)
+            except errors.VaultwardenError as exc:
+                log.warning("Initial sync failed (%s); continuing.", exc.code)
 
     # ---------------------------------------------------------------- login
     def _do_login(self) -> None:
@@ -333,9 +453,12 @@ class AuthManager:
             "session_timeout_seconds": self._config.session_timeout_seconds,
             "server_configured": self._config.server_url,
             "server_status": {
-                "state": bw_status.get("state"),
+                # v1.9: real bw status payload reports the session under
+                # "status"; fall back to the legacy "state" key if present.
+                "state": bw_status.get("status") or bw_status.get("state"),
                 "serverUrl": bw_status.get("serverUrl"),
                 "userEmail": bw_status.get("userEmail"),
+                "userId": bw_status.get("userId"),
             },
             "appdata_dir": self._bw.appdata_dir,
             "allow_write": self._config.allow_write,
