@@ -59,7 +59,7 @@ def _resolve_one(token: str, command: str, auth: AuthManager,
         return INVALID_SENTINEL, exc.to_dict()
     # Register the value so it gets scrubbed from any log line / output echo.
     get_redacting_filter().register_secret(value)
-    # v1.4 (FAIL-6): also record the plaintext per-task so post_tool_call can
+    # v0.1.4 (FAIL-6): also record the plaintext per-task so post_tool_call can
     # redact it from this specific tool call's output even when the global
     # filter state was reset by another component in between.
     record_task_secret(task_id, value)
@@ -125,7 +125,7 @@ def make_placeholder_resolver(auth: AuthManager,
 _PENDING_ERRORS: list[dict] = []
 
 # ---------------------------------------------------------------------------
-# Per-task injected-secret store (v1.4, FAIL-6).
+# Per-task injected-secret store (v0.1.4, FAIL-6).
 #
 # When the middleware resolves a placeholder it knows the plaintext secret
 # value that is about to enter the shell. We keep that value ONLY for the
@@ -160,7 +160,7 @@ def clear_task_secrets() -> None:
 def _redact_in_result(result: Any) -> Any:
     """Scrub registered secret values out of a tool result object.
 
-    v1.4 (FAIL-6): the shared RedactingFilter only knows bootstrap secrets,
+    v0.1.4 (FAIL-6): the shared RedactingFilter only knows bootstrap secrets,
     session keys and explicitly tracked write payloads — vault-stored item
     fields are deliberately NOT registered globally (they could collide with
     unrelated text). For post_tool_call leak protection we therefore also
@@ -240,7 +240,7 @@ def make_post_cleanup_hook(auth: AuthManager,
         if n:
             log.debug("post_tool_call cleaned %d used placeholder(s).", n)
         # Leak protection: redact any resolved secret echoed by the command.
-        # v1.5 (FAIL-6): _redact_in_result returns a NEW dict for dict results
+        # v0.1.5 (FAIL-6): _redact_in_result returns a NEW dict for dict results
         # (the old code discarded it, so {"output": ...} was never scrubbed);
         # merge the scrubbed copy back in place so callers observe redaction.
         scrubbed = _redact_in_result(result)
@@ -266,7 +266,7 @@ def make_session_end_hook(auth: AuthManager,
 
     def vaultwarden_on_session_end(**kwargs: Any) -> None:
         registry.clear()
-        # v1.5 (FAIL-6 wiring): drop every pending per-task injected secret.
+        # v0.1.5 (FAIL-6 wiring): drop every pending per-task injected secret.
         clear_task_secrets()
         auth.shutdown(keep_appdata=True)
 

@@ -23,7 +23,7 @@ def _register_ok(monkeypatch, tmp_path, fake_bw, section_extra=None, env_extra=N
     for k, v in (env_extra or {}).items():
         monkeypatch.setenv(k, v)
     section = {**BASE_SECTION, **(section_extra or {})}
-    ctx = RecordingCtx({"secrets": {"vaultwarden": section}})
+    ctx = RecordingCtx(section)
     ok = vaultwarden.register(ctx)
     return ok, ctx
 
@@ -57,7 +57,7 @@ def test_graceful_degradation_missing_bw(monkeypatch, tmp_path):
     monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
-    ctx = RecordingCtx({"secrets": {"vaultwarden": {**BASE_SECTION, "enabled": True}}})
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
     assert vaultwarden.register(ctx) is False
     assert ctx.tools == []
 
@@ -67,7 +67,7 @@ def test_graceful_degradation_missing_env(monkeypatch, tmp_path, fake_bw):
     monkeypatch.delenv("VW_MASTER_PASSWORD", raising=False)
     monkeypatch.setenv("BW_CLI_PATH", fake_bw)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    ctx = RecordingCtx({"secrets": {"vaultwarden": {**BASE_SECTION, "enabled": True}}})
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
     assert vaultwarden.register(ctx) is False   # logged, not raised
 
 
@@ -169,7 +169,7 @@ def test_on_session_end_hook_locks_vault(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     auth = vaultwarden.PLUGIN_STATE["auth"]
     appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
-    # v1.9 lazy auth: authenticate first so there IS a live session to lock.
+    # v0.1.9 lazy auth: authenticate first so there IS a live session to lock.
     tools = {t["name"]: t["handler"] for t in ctx.tools}
     assert tools["vaultwarden_list"]({})["total"] == 3
     assert (appdata / "fake-logged-in").exists()
@@ -198,13 +198,13 @@ def test_logs_never_contain_bootstrap_secrets(monkeypatch, tmp_path, fake_bw, ca
     assert key not in blob
 
 
-# ------------------------------------------------------- v1.9 lazy auth flow
+# ------------------------------------------------------- v0.1.9 lazy auth flow
 def test_register_defers_auth_and_completes_fast(monkeypatch, tmp_path, fake_bw):
     """register() must NOT block on authentication (Hermes 10s load timeout).
 
     The fake bw gets a deliberate 3s delay per invocation; if register()
     still ran status/login/unlock eagerly the total would blow well past
-    5s. With v1.9 lazy auth it finishes almost instantly instead.
+    5s. With v0.1.9 lazy auth it finishes almost instantly instead.
     """
     import time
     slow_bw = tmp_path / "slow-bw"

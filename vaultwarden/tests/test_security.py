@@ -64,7 +64,7 @@ def test_no_bootstrap_secrets_in_os_environ_after_register(monkeypatch, tmp_path
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import vaultwarden
     from vaultwarden.tests.conftest import RecordingCtx, BASE_SECTION
-    ctx = RecordingCtx({"secrets": {"vaultwarden": {**BASE_SECTION, "enabled": True}}})
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
     vaultwarden.register(ctx)
     assert "VW_CLIENT_SECRET" not in os.environ
     assert "VW_MASTER_PASSWORD" not in os.environ
@@ -77,12 +77,12 @@ def test_master_password_never_logged(caplog, bw_cli):
     caplog.set_level(logging.DEBUG)
     mgr = AuthManager(bw_cli, make_config(), client_secret="cs-secret",
                       master_password="SUPER-DUPER-MP")
-    # v1.5 (FAIL-9): removed the nonsensical `with pytest.raises(Exception):
+    # v0.1.5 (FAIL-9): removed the nonsensical `with pytest.raises(Exception):
     # pass` block (it asserted nothing could raise inside an empty body and
     # always failed with "DID NOT RAISE"). The real check is below: after a
     # full bootstrap attempt with wrong credentials, no secret VALUE may
     # appear in any log record.
-    # v1.9: ensure_authenticated() checks `bw status` first and then logs
+    # v0.1.9: ensure_authenticated() checks `bw status` first and then logs
     # in — a wrong client secret fails during login, BEFORE any log record
     # could carry a secret value.
     try:
@@ -165,7 +165,7 @@ def test_session_key_not_persisted_to_disk(bw_cli, tmp_path):
                       master_password="mp-secret")
     mgr.ensure_authenticated()
     key = mgr.get_session()
-    # v1.5 (FAIL-10): skip the fake bw script itself — it is a TEST FIXTURE
+    # v0.1.5 (FAIL-10): skip the fake bw script itself — it is a TEST FIXTURE
     # whose source literally embeds the session-key string it prints (the
     # real bw also keeps its own state files); it is not plugin-written
     # state. We only assert that no file the PLUGIN wrote contains the key.

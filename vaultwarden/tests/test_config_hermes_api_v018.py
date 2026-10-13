@@ -1,8 +1,13 @@
-"""v1.8 regression tests: Hermes-native plugin config via get_config()."""
+"""v0.1.8 regression tests: Hermes-native plugin config via get_config().
+
+v0.2.0 cleanup: fallback config.yaml reading was removed, so only the
+get_config() API path (and object-style contexts wrapping it) is tested.
+"""
 from __future__ import annotations
 
 import pytest
 from vaultwarden.config import load_config
+from vaultwarden.errors import ConfigError
 
 
 class FakePluginContext:
@@ -40,30 +45,15 @@ def test_get_config_empty_settings_uses_defaults():
     assert cfg.server_url == ""
 
 
-def test_new_settings_layout_dict():
-    source = {
-        "plugins": {"entries": {"vaultwarden": {"settings": {
-            "enabled": True,
-            "server_url": "https://new.example.com",
-            "client_id": "user.xyz",
-        }}}}
-    }
-    cfg = load_config(source, env={})
-    assert cfg.enabled is True
-    assert cfg.server_url == "https://new.example.com"
+def test_object_style_context_wrapping_get_config():
+    class Wrapper:
+        def __init__(self, inner):
+            self.config = inner
 
-
-def test_legacy_secrets_layout_still_works():
-    source = {
-        "secrets": {"vaultwarden": {
-            "enabled": True,
-            "server_url": "https://legacy.example.com",
-            "client_id": "user.legacy",
-        }}
-    }
-    cfg = load_config(source, env={})
+    inner = FakePluginContext({"enabled": True, "server_url": "https://wrapped"})
+    cfg = load_config(Wrapper(inner), env={})
     assert cfg.enabled is True
-    assert cfg.server_url == "https://legacy.example.com"
+    assert cfg.server_url == "https://wrapped"
 
 
 def test_get_config_raising_is_tolerated():
@@ -73,3 +63,16 @@ def test_get_config_raising_is_tolerated():
     # Must not raise; falls back to defaults.
     cfg = load_config(BrokenCtx(), env={})
     assert cfg.enabled is False
+
+
+def test_no_file_or_dict_fallback(monkeypatch, tmp_path):
+    """v0.2.0: raw mappings and file paths are NOT valid sources anymore."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    vaultwarden:\n      settings:\n"
+        "        enabled: true\n        server_url: https://should-not-load\n")
+    with pytest.raises(ConfigError):
+        load_config(str(tmp_path / "config.yaml"), env={})
+    with pytest.raises(ConfigError):
+        load_config({"plugins": {"entries": {"vaultwarden": {"settings": {
+            "server_url": "https://should-not-load"}}}}}, env={})

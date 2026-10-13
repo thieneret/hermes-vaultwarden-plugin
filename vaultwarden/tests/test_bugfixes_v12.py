@@ -1,4 +1,4 @@
-"""v1.2 regression tests for the code-review bug fixes (BUG-1..BUG-10).
+"""v0.1.2 regression tests for the code-review bug fixes (BUG-1..BUG-10).
 
 Each test maps to one identified bug; see the plan review notes.
 """
@@ -168,7 +168,10 @@ def test_config_dict_source_needs_no_yaml(monkeypatch):
     assert cfg.server_url == "https://vw.example"     # no crash, no yaml import
 
 
-def test_config_file_source_degrades_without_yaml(tmp_path, monkeypatch):
+def test_config_file_source_rejected_without_yaml(tmp_path, monkeypatch):
+    """v0.2.0: file-path sources are no longer supported at all — the plugin
+    reads config ONLY via PluginContext.get_config(), so no YAML parsing is
+    required and a path source raises ConfigError even without PyYAML."""
     real_import = builtins.__import__
 
     def blocked(name, *a, **k):
@@ -179,23 +182,12 @@ def test_config_file_source_degrades_without_yaml(tmp_path, monkeypatch):
     monkeypatch.setattr(builtins, "__import__", blocked)
     monkeypatch.delitem(sys.modules, "yaml", raising=False)
 
-    # Flat top-level config still works.
+    from vaultwarden.errors import ConfigError
+
     f = tmp_path / "flat.yaml"
     f.write_text("enabled: true\nserver_url: https://from-fallback\n")
-    cfg = load_config(str(f), env={})
-    assert cfg.enabled is True
-    assert cfg.server_url == "https://from-fallback"
-
-    # v1.6: nested secrets.vaultwarden is now extracted by the fallback parser.
-    nested = tmp_path / "nested.yaml"
-    nested.write_text(
-        "secrets:\n"
-        "  vaultwarden:\n"
-        "    server_url: https://x\n"
-        "    enabled: true\n")
-    cfg2 = load_config(str(nested), env={})
-    assert cfg2.server_url == "https://x"
-    assert cfg2.enabled is True
+    with pytest.raises(ConfigError):
+        load_config(str(f), env={})
 
 
 # --------------------------------------------------------------- BUG-8

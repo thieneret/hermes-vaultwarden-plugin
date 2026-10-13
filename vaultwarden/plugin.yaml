@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 1.1.0
+version: 0.2.0
 description: >-
   Vaultwarden secrets management for Hermes Agent via the `bw` CLI.
   Secrets are never exposed to the LLM context: tools return single-use
@@ -8,7 +8,7 @@ description: >-
   execution, with `post_tool_call` cleanup/redaction afterwards. All
   subprocesses run with an isolated BITWARDENCLI_APPDATA_DIR so the
   plugin's bw state never touches the host user's bw profile.
-author: Hermes Plugin Author
+author: thieneret
 requires_bins:
   - bw
 config:

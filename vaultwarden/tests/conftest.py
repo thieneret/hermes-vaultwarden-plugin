@@ -42,7 +42,7 @@ ITEMS = {
 }
 BY_NAME = {v["name"].lower(): k for k, v in ITEMS.items()}
 
-# v1.5 (FAIL-8): created items are persisted in the isolated appdata dir so
+# v0.1.5 (FAIL-8): created items are persisted in the isolated appdata dir so
 # the full CRUD cycle (create -> get -> edit -> delete) works against the
 # fake CLI exactly like it would against a real vault.
 ITEMS_FILE = os.path.join(appdata, "fake_items.json") if appdata else ""
@@ -85,7 +85,7 @@ if argv[:1] == ["status"]:
     uidfile = os.path.join(appdata, "fake-user-id")
     uid = open(uidfile).read().strip() if os.path.exists(uidfile) else ""
     state = "unlocked" if (logged and unlocked) else ("locked" if logged else "unauthenticated")
-    # v1.9: mirror the REAL `bw status` contract — the key is "status"
+    # v0.1.9: mirror the REAL `bw status` contract — the key is "status"
     # (not "state") and the account is reported via "userId".
     out(json.dumps({"serverUrl": server, "lastSync": None,
                     "status": state,
@@ -113,7 +113,7 @@ elif argv[:1] == ["login"]:
     csec = os.environ.get("BW_CLIENTSECRET", "")
     if cid.startswith("user.") and csec == "cs-secret":
         open(os.path.join(appdata, "fake-logged-in"), "w").close()
-        # v1.9: persist the account uuid so `bw status` can report userId
+        # v0.1.9: persist the account uuid so `bw status` can report userId
         # (real bw derives it from the authenticated session).
         with open(os.path.join(appdata, "fake-user-id"), "w") as f:
             f.write(cid[len("user."):])
@@ -136,7 +136,7 @@ elif argv[:1] == ["sync"]:
     out("Encoding complete.")
 elif argv[:2] == ["list", "items"]:
     rest = argv[2:]
-    # v1.2 (BUG-3/BUG-5): the real bw CLI only understands --folderid /
+    # v0.1.2 (BUG-3/BUG-5): the real bw CLI only understands --folderid /
     # --collectionid / --search here; reject unknown flags like the real one does.
     known = {"--folderid", "--collectionid", "--search", "--pretty"}
     i = 0
@@ -187,7 +187,7 @@ elif argv[:2] in (["create", "item"], ["edit", "item"]):
             return {k: dec(x) for k, x in v.items()}
         return v
     res = {k: dec(v) for k, v in blob.items()}
-    # v1.5 (FAIL-8): persist mutations so later get/list/edit/delete see them.
+    # v0.1.5 (FAIL-8): persist mutations so later get/list/edit/delete see them.
     created_map = _load_created()
     if argv[:2] == ["create", "item"]:
         res["id"] = "new-item-id-0001"
@@ -240,10 +240,24 @@ BASE_ENV = {
 }
 
 
+class SettingsContext:
+    """Simulates the Hermes-native PluginContext.get_config() API (v0.2.0).
+
+    The plugin reads configuration EXCLUSIVELY through get_config(); there
+    is no fallback to config.yaml file reading any more.
+    """
+
+    def __init__(self, settings: dict):
+        self._settings = dict(settings)
+
+    def get_config(self, key: str, default=None):
+        return self._settings.get(key, default)
+
+
 def make_config(**overrides) -> PluginConfig:
     section = {**BASE_SECTION, **overrides.pop("section", {})}
     env = {**BASE_ENV, **overrides.pop("env", {})}
-    cfg = load_config({"secrets": {"vaultwarden": section}}, env=env)
+    cfg = load_config(SettingsContext(section), env=env)
     return cfg
 
 
@@ -279,14 +293,21 @@ def tools_by_name(auth_manager, plugin_config, registry):
 
 
 class RecordingCtx:
-    """Minimal stand-in for the Hermes plugin context."""
+    """Minimal stand-in for the Hermes plugin context.
 
-    def __init__(self, config=None):
-        self.config = config if config is not None else {"secrets": {"vaultwarden": BASE_SECTION}}
+    v0.2.0: exposes the native get_config() API (plugin-relative keys) —
+    the ONLY configuration path the plugin supports now.
+    """
+
+    def __init__(self, settings=None):
+        self._settings = dict(settings if settings is not None else BASE_SECTION)
         self.tools: list[dict] = []
         self.middleware: list[tuple[str, object]] = []
         self.hooks: list[tuple[str, object]] = []
         self.secret_sources: list[object] = []
+
+    def get_config(self, key, default=None):
+        return self._settings.get(key, default)
 
     def register_tool(self, *, name, toolset, schema, handler, check_fn=None):
         self.tools.append({"name": name, "toolset": toolset, "schema": schema,

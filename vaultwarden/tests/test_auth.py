@@ -13,9 +13,9 @@ from vaultwarden.tests.conftest import make_config
 def test_full_bootstrap_flow(bw_cli):
     cfg = make_config()
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
-    # v1.3/v1.4 (plan §5): the manager starts UNINITIALIZED and only becomes
+    # v0.1.3/v0.1.4 (plan §5): the manager starts UNINITIALIZED and only becomes
     # CONFIGURED when configure_server_if_needed() runs (register() bootstrap).
-    # v1.9: ensure_authenticated() itself now performs server config + login
+    # v0.1.9: ensure_authenticated() itself now performs server config + login
     # + unlock after checking `bw status` — no unconditional config anymore.
     assert mgr.state is AuthState.UNINITIALIZED
     mgr.configure_server_if_needed()

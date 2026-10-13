@@ -124,13 +124,13 @@ def test_register_cleanup_removes_bootstrap_env(monkeypatch, tmp_path, fake_bw):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from vaultwarden.tests.conftest import RecordingCtx, BASE_SECTION
-    ctx = RecordingCtx({"secrets": {"vaultwarden": {**BASE_SECTION, "enabled": True}}})
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
     ok = vaultwarden.register(ctx)
     assert ok is True
     assert "VW_CLIENT_SECRET" not in os.environ
     assert "VW_MASTER_PASSWORD" not in os.environ
     # ...but the plugin still works (values captured before cleanup):
-    # v1.9: register() defers authentication; this FIRST tool use triggers
+    # v0.1.9: register() defers authentication; this FIRST tool use triggers
     # the lazy ensure_authenticated() and the vault comes up unlocked.
     status = next(t for t in ctx.tools if t["name"] == "vaultwarden_status")
     assert status["check_fn"]() is True          # lazy auth kicks in here

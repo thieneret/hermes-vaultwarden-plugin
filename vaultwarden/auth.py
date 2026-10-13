@@ -70,7 +70,7 @@ class AuthManager:
         # becomes CONFIGURED once configure_server_if_needed() has run (the
         # register(ctx) bootstrap flow). is_available()/check_fn therefore
         # report False before bootstrap — tools stay gated until then.
-        # (v1.4: test_auth::test_full_bootstrap_flow now matches this.)
+        # (v0.1.4: test_auth::test_full_bootstrap_flow now matches this.)
         self._state = AuthState.UNINITIALIZED
         self._session_created_at: float = 0.0
         self._last_sync: float = 0.0
@@ -95,12 +95,12 @@ class AuthManager:
     def is_available(self) -> bool:
         """check_fn passed to ctx.register_tool — graceful degradation gate.
 
-        v1.9 lazy auth: register() no longer authenticates eagerly (it used
+        v0.1.9 lazy auth: register() no longer authenticates eagerly (it used
         to block past Hermes' 10s plugin-load timeout). The first tool call
         (or check_fn evaluation) triggers ``ensure_authenticated()`` here so
         the vault comes up on demand instead. A manager that was never
         bootstrapped (state UNINITIALIZED) stays gated off, exactly like
-        before v1.9.
+        before v0.1.9.
         """
         # NOTE: deliberately NOT taking self._lock here — ensure_authenticated
         # acquires it and RLock is only re-entrant on the owning thread; a
@@ -133,7 +133,7 @@ class AuthManager:
     def configure_server_if_needed(self) -> None:
         """UNINITIALIZED -> CONFIGURED transition (kept for the state machine).
 
-        v1.9: server configuration itself is now handled inside
+        v0.1.9: server configuration itself is now handled inside
         ``ensure_authenticated()`` — this method no longer runs
         `bw config server` unconditionally at startup (that caused the
         "Logout required before server config update" error when a valid
@@ -168,7 +168,7 @@ class AuthManager:
         return "unauthenticated"
 
     def ensure_authenticated(self) -> None:
-        """v1.9 auth flow: check `bw status` FIRST, then do the minimum.
+        """v0.1.9 auth flow: check `bw status` FIRST, then do the minimum.
 
         Case A: not logged in            -> config server + login + unlock
         Case B: logged in, wrong server
@@ -197,7 +197,7 @@ class AuthManager:
 
             # Step 2: does the existing session match server AND account?
             is_correct_server = (current_server == expected_server)
-            # v1.9 account verification: bw status reports userId "<uuid>",
+            # v0.1.9 account verification: bw status reports userId "<uuid>",
             # config carries client_id "user.<uuid>". A profile that does not
             # report any userId at all is treated as "unknown" rather than a
             # mismatch (defensive against CLI variants); an *explicitly
@@ -212,7 +212,7 @@ class AuthManager:
                     log.info("Already authenticated and unlocked; nothing to do.")
                     self._state = AuthState.LOGGED_IN
                     if self._session_key:
-                        # v1.9 fast path: our remembered in-memory session is
+                        # v0.1.9 fast path: our remembered in-memory session is
                         # still valid (idempotent re-check, e.g. lazy auth via
                         # check_fn followed by another tool call) — no extra
                         # subprocess round-trip needed.
@@ -453,7 +453,7 @@ class AuthManager:
             "session_timeout_seconds": self._config.session_timeout_seconds,
             "server_configured": self._config.server_url,
             "server_status": {
-                # v1.9: real bw status payload reports the session under
+                # v0.1.9: real bw status payload reports the session under
                 # "status"; fall back to the legacy "state" key if present.
                 "state": bw_status.get("status") or bw_status.get("state"),
                 "serverUrl": bw_status.get("serverUrl"),

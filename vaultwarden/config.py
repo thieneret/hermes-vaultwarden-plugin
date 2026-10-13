@@ -1,16 +1,17 @@
 """Configuration loading for the Vaultwarden plugin (plan §4, §9).
 
 Layers:
-- config.yaml       -> non-secret settings (URLs, ids, flags, ENV VAR NAMES)
+- Hermes config (via PluginContext.get_config()) -> non-secret settings
+  (URLs, ids, flags, ENV VAR NAMES)
 - .env              -> secret VALUES (chmod 600; loaded by Hermes secret_scope)
 - plugin memory     -> resolved values, never written back to os.environ
 - .bw-data/         -> isolated bw CLI state (chmod 700)
 
-``load_config`` accepts several shapes so it works with any Hermes context
-version and is easy to unit test:
-  * a plain dict (possibly nested under "secrets"->"vaultwarden")
-  * a path to a YAML file
-  * an object exposing ``get_config(key)`` / ``config`` attributes
+``load_config`` accepts a Hermes ``PluginContext`` exposing
+``get_config(key, default)`` — the ONLY supported configuration path
+(v0.2.0). Object-style contexts with ``.config`` / ``.plugin_config``
+attributes are also accepted and unwrapped until a ``get_config()`` API
+is found. There is NO fallback to reading config.yaml directly.
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from typing import Any, Mapping
 
 from . import errors
 
-# Hermes internal API for multiplex-aware secret resolution (v1.7).
+# Hermes internal API for multiplex-aware secret resolution (v0.1.7).
 # In multiplex gateway mode, .env values are NOT in os.environ; they live
 # in a context-local scope accessible only via get_secret(). This import
 # is optional: older Hermes versions or non-gateway modes fall back to
@@ -32,9 +33,6 @@ except ImportError:
     _hermes_get_secret = None
 
 PLUGIN_DIR = Path(__file__).resolve().parent
-# Legacy section key (pre-v1.8). Retained for reference only; the v1.8
-# _extract_section() reads plugin-relative keys via get_config() instead.
-DEFAULT_SECTION_KEY = "secrets.vaultwarden"
 
 _DEFAULTS: dict[str, Any] = {
     "enabled": False,
@@ -71,129 +69,17 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
-def _indent_of(line: str) -> int:
-    """Number of leading spaces on a raw line."""
-    return len(line) - len(line.lstrip(" "))
-
-
-def _clean_scalar(val: str) -> str:
-    """Strip whitespace and surrounding quotes from a scalar value."""
-    val = val.strip()
-    if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
-        return val[1:-1]
-    return val
-
-
-def _parse_flat_mapping(text: str) -> dict:
-    """Lenient flat key:value parser. Skips blanks, comments, and lines
-    without a colon (e.g. list items). Does NOT raise on nested-looking lines."""
-    result: dict[str, Any] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        key, _sep, val = line.partition(":")
-        result[key.strip()] = _clean_scalar(val)
-    return result
-
-
-# Backwards-compatible alias (v1.2 name). No longer raises on nested YAML —
-# nested sections are handled by _extract_nested_section instead (v1.6).
-_minimal_yaml_mapping = _parse_flat_mapping
-
-
-def _extract_nested_section(text: str, path: tuple[str, ...]) -> dict:
-    """Return the leaf key:value mapping located at `path` in raw YAML text,
-    parsed by indentation only (no PyYAML). Returns {} if any path component
-    is missing.
-
-    Handles the mapping-of-mappings shape used by Hermes config.yaml. Only the
-    scalar leaves of the target node are returned; sibling sections and lists
-    outside the target are ignored.
-    """
-    lines: list[tuple[int, str]] = []
-    for raw in text.splitlines():
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        lines.append((_indent_of(raw), stripped))
-    if not lines or not path:
-        return {}
-
-    start, end = 0, len(lines)
-    for key in path:
-        found = None
-        key_indent = None
-        for i in range(start, end):
-            indent, content = lines[i]
-            left, sep, _right = content.partition(":")
-            if sep and left.strip() == key:
-                found = i
-                key_indent = indent
-                break
-        if found is None:
-            return {}
-        # Child block = subsequent lines indented deeper than this key.
-        block_start = found + 1
-        block_end = block_start
-        while block_end < end and lines[block_end][0] > key_indent:
-            block_end += 1
-        start, end = block_start, block_end
-
-    # `lines[start:end]` are the scalar leaves of the target node.
-    return _parse_flat_mapping("\n".join(content for _indent, content in lines[start:end]))
-
-
-def _fallback_parse_yaml(text: str) -> dict:
-    """Parse config YAML without PyYAML (Approach B).
-
-    1. Try targeted extraction of the plugin's own nested section.
-    2. Otherwise fall back to flat top-level key:value parsing.
-    """
-    leaf = _extract_nested_section(text, ("secrets", "vaultwarden"))
-    if leaf:
-        return {"secrets": {"vaultwarden": leaf}}
-    return _parse_flat_mapping(text)
-
-
-def _load_yaml_text(text: str) -> dict:
-    """Parse YAML config text, degrading gracefully when PyYAML is missing."""
-    try:
-        import yaml  # PyYAML ships with Hermes — but is NOT guaranteed (BUG-7)
-    except ImportError:
-        log = None
-        try:
-            from .security import get_logger
-            log = get_logger("config")
-        except Exception:
-            pass
-        if log is not None:
-            log.warning(
-                "PyYAML not installed; using built-in fallback parser for YAML "
-                "config sources. Run 'pip install pyyaml' for full support.")
-        return _fallback_parse_yaml(text)
-    data = yaml.safe_load(text)
-    return data if isinstance(data, dict) else {}
-
-
 def _extract_section(source: Any) -> dict:
-    """Normalise arbitrary config sources into the vaultwarden mapping.
+    """Extract plugin config using ONLY the Hermes-native get_config() API.
 
-    v1.8 resolution order:
-    1. Hermes-native: PluginContext.get_config() with plugin-relative keys
-       (reads plugins.entries.<plugin_id>.settings.<key>).
-    2. Fallback to $HERMES_HOME/config.yaml when get_config yields nothing
-       (transitional backward compatibility).
-    3. Mapping sources: new plugins.entries.vaultwarden.settings layout,
-       then legacy secrets.vaultwarden layout.
-    4. Object-style contexts (.config / .plugin_config / get_config attr).
+    v0.2.0: No fallback to config.yaml file reading. The plugin relies
+    entirely on PluginContext.get_config() which reads from
+    plugins.entries.<plugin_id>.settings.<key>.
     """
     if source is None:
         return {}
 
-    # 1. Hermes-native PluginContext.get_config() — plugin-relative keys
+    # Hermes-native PluginContext.get_config() — plugin-relative keys
     getter = getattr(source, "get_config", None)
     if callable(getter):
         result: dict[str, Any] = {}
@@ -204,67 +90,17 @@ def _extract_section(source: Any) -> dict:
                 continue
             if value is not None:
                 result[key] = value
-        if result:
-            return result
-        # get_config yielded nothing — fall back to reading config.yaml
-        # directly so a legacy layout still loads during transition.
-        hermes_home = str(os.environ.get("HERMES_HOME", "")).strip()
-        if hermes_home:
-            candidate = Path(hermes_home).expanduser() / "config.yaml"
-            if candidate.exists():
-                data = _load_yaml_text(candidate.read_text(encoding="utf-8"))
-                legacy = _extract_mapping_section(data)
-                if legacy:
-                    return legacy
-        return {}
+        return result
 
-    # 2. File path source
-    if isinstance(source, (str, Path)):
-        path = Path(source)
-        text = path.read_text(encoding="utf-8") if path.exists() else ""
-        data = _load_yaml_text(text)
-        return _extract_mapping_section(data)
-
-    # 3. Mapping source — walk known layouts
-    if isinstance(source, Mapping):
-        return _extract_mapping_section(source)
-
-    # 4. Object-style contexts
+    # Object-style contexts (.config / .plugin_config)
     for attr in ("config", "plugin_config"):
         inner = getattr(source, attr, None)
         if inner is not None and inner is not source:
             return _extract_section(inner)
-    raise errors.ConfigError("Unsupported configuration source.")
 
-
-def _extract_mapping_section(node: Mapping) -> dict:
-    """Extract the vaultwarden section from an already-parsed mapping.
-
-    Handles both the v1.8 layout (plugins.entries.vaultwarden.settings)
-    and the legacy layout (secrets.vaultwarden).
-    """
-    if not isinstance(node, Mapping):
-        return {}
-    # v1.8 layout: plugins.entries.vaultwarden.settings
-    plugins = node.get("plugins")
-    if isinstance(plugins, Mapping):
-        entries = plugins.get("entries")
-        if isinstance(entries, Mapping):
-            entry = entries.get("vaultwarden")
-            if isinstance(entry, Mapping):
-                settings = entry.get("settings")
-                if isinstance(settings, Mapping):
-                    return dict(settings)
-                legacy_config = entry.get("config")
-                if isinstance(legacy_config, Mapping):
-                    return dict(legacy_config)
-    # legacy layout: secrets.vaultwarden
-    current: Any = node
-    if "secrets" in current and isinstance(current["secrets"], Mapping):
-        current = current["secrets"]
-    if "vaultwarden" in current and isinstance(current["vaultwarden"], Mapping):
-        current = current["vaultwarden"]
-    return dict(current) if isinstance(current, Mapping) else {}
+    raise errors.ConfigError(
+        "Unsupported configuration source. "
+        "This plugin requires Hermes PluginContext.get_config() API.")
 
 
 @dataclass
@@ -344,7 +180,7 @@ class PluginConfig:
     def resolve_secret(self, var_name: str, *, required: bool = True) -> str:
         """Resolve a secret value by env-var name.
 
-        Resolution order (v1.7):
+        Resolution order (v0.1.7):
         1. Hermes internal API (agent.secret_scope.get_secret) — multiplex-aware,
            fail-closed, respects profile isolation and external secret sources.
         2. Fallback to env_snapshot (os.environ copy) — for non-multiplex modes
@@ -394,7 +230,7 @@ class PluginConfig:
 
 
 def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> PluginConfig:
-    """Build a PluginConfig from a Hermes ctx/config/dict/path (see module doc)."""
+    """Build a PluginConfig from a Hermes PluginContext (see module doc)."""
     section = _extract_section(source)
     snapshot = dict(os.environ) if env is None else dict(env)
     return PluginConfig(section=section, env_snapshot=snapshot)

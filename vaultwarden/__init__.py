@@ -1,4 +1,4 @@
-"""Hermes Agent — Vaultwarden secrets management plugin (v1.1).
+"""Hermes Agent — Vaultwarden secrets management plugin (v0.2.0).
 
 Entry point: ``register(ctx)`` (see plan §4/§12).
 
@@ -65,7 +65,7 @@ def register(ctx: Any) -> bool:
 
     # 1-2. read config, resolve env var NAMES -> values in plugin memory
     try:
-        config = load_config(getattr(ctx, "config", ctx))
+        config = load_config(ctx)
     except Exception as exc:  # never crash Hermes over bad config
         log.warning("Vaultwarden plugin load FAILED: config error: %s", exc)
         return False
@@ -103,7 +103,7 @@ def register(ctx: Any) -> bool:
         return False
     log.info("Isolated appdata dir ready: %s", appdata_dir)
 
-    # Create objects but DO NOT authenticate yet (v1.9 lazy auth):
+    # Create objects but DO NOT authenticate yet (v0.1.9 lazy auth):
     # authentication is deferred to the first tool use / check_fn call so
     # register() completes well within Hermes's 10s plugin-load timeout.
     try:

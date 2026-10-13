@@ -86,8 +86,8 @@ def test_get_secret_ref_unknown_item(tools_by_name):
 
 
 def test_write_tools_blocked_when_disabled(tools_by_name):
-    # v1.5 (FAIL-11): vaultwarden_generate_password is NOT a vault mutation
-    # (BUG-2 / v1.2 fix, protected by test_bugfixes_v12) — it must SUCCEED
+    # v0.1.5 (FAIL-11): vaultwarden_generate_password is NOT a vault mutation
+    # (BUG-2 / v0.1.2 fix, protected by test_bugfixes_v12) — it must SUCCEED
     # with allow_write=false; only store/update/delete are blocked.
     for name, args in (
         ("vaultwarden_store", {"type": "login", "name": "x"}),
@@ -145,7 +145,7 @@ def test_direct_retrieval_escape_hatch(bw_cli, registry):
     cfg = make_config(section={"allow_direct_secret_retrieval": True})
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
     mgr.ensure_authenticated()
-    # v1.5 (FAIL-2): get_tools yields (schema_dict, handler) tuples; dict()
+    # v0.1.5 (FAIL-2): get_tools yields (schema_dict, handler) tuples; dict()
     # cannot key by dicts -> build the map by tool name instead.
     tools = {s["name"]: h for s, h in get_tools(mgr, cfg, registry)}
     res = tools["vaultwarden_get_secret_ref"](

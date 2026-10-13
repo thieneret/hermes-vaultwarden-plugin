@@ -88,7 +88,7 @@ def test_encode_item_encodes_all_strings(bw_cli, appdata, monkeypatch):
 
 
 def test_locked_session_marker_maps_to_session_error(bw_cli, appdata, monkeypatch):
-    # v1.4 (FAIL-4): inject the stale-session marker through the test-only
+    # v0.1.4 (FAIL-4): inject the stale-session marker through the test-only
     # BW_TEST_FORCE_STDERR hook instead of smuggling a non-allowlisted env key
     # (BW_FORCE_LOCKED) into the isolated subprocess environment.
     monkeypatch.setenv("BW_TEST_FORCE_STDERR", "vault is locked")
@@ -104,7 +104,7 @@ def test_network_error_retry_once(fake_bw, appdata, monkeypatch):
 
     def counting_run(*a, **k):
         calls["n"] += 1
-        # v1.4 (FAIL-5): BOTH attempts simulate the unreachable server — the
+        # v0.1.4 (FAIL-5): BOTH attempts simulate the unreachable server — the
         # first attempt AND the single retry must fail for the contract
         # "retry once, then NETWORK_ERROR" to hold. (The old mock let the
         # retry succeed, so no error was raised.)
