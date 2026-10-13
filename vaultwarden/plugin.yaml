@@ -12,64 +12,61 @@ author: Hermes Plugin Author
 requires_bins:
   - bw
 config:
-  secrets.vaultwarden.enabled:
+  enabled:
     type: boolean
     default: false
     description: Enable the Vaultwarden plugin.
-  secrets.vaultwarden.server_url:
+  server_url:
     type: string
     description: Vaultwarden server URL (e.g. https://vault.example.com).
-  secrets.vaultwarden.client_id:
+  client_id:
     type: string
     description: API-key client id ("user.<uuid>").
-  secrets.vaultwarden.client_secret_env:
+  client_secret_env:
     type: string
     default: VW_CLIENT_SECRET
     description: NAME of the env var holding the client secret (value lives in .env).
-  secrets.vaultwarden.master_password_env:
+  master_password_env:
     type: string
     default: VW_MASTER_PASSWORD
     description: NAME of the env var holding the master password (value lives in .env).
-  secrets.vaultwarden.appdata_dir_env:
+  appdata_dir_env:
     type: string
     default: VW_APPDATA_DIR
     description: NAME of optional env var overriding the isolated bw appdata dir.
-  secrets.vaultwarden.allow_write:
+  allow_write:
     type: boolean
     default: false
-    # BUG-2: generate_password does NOT modify the vault, so it is allowed
-    # even when allow_write is false; only store/update/delete are gated.
     description: Allow store/update/delete tools (vault mutations).
-  secrets.vaultwarden.allow_startup_secret_injection:
+  allow_startup_secret_injection:
     type: boolean
     default: false
     description: Register the optional SecretSource adapter (disabled by default).
-  secrets.vaultwarden.allow_direct_secret_retrieval:
+  allow_direct_secret_retrieval:
     type: boolean
     default: false
     description: Allow returning raw secret values from get_secret_ref (NOT recommended).
-  secrets.vaultwarden.auto_sync:
+  auto_sync:
     type: boolean
     default: true
-  secrets.vaultwarden.sync_interval_seconds:
+  sync_interval_seconds:
     type: integer
     default: 300
-  secrets.vaultwarden.session_timeout_seconds:
+  session_timeout_seconds:
     type: integer
     default: 14400
-  secrets.vaultwarden.auto_unlock:
+  auto_unlock:
     type: boolean
     default: true
-  secrets.vaultwarden.placeholder_ttl_seconds:
+  placeholder_ttl_seconds:
     type: integer
     default: 300
-  secrets.vaultwarden.max_placeholders:
+  max_placeholders:
     type: integer
     default: 50
-  secrets.vaultwarden.bw_cli_path:
+  bw_cli_path:
     type: string
     default: ""
-    # BUG-10: this must be the FULL path to the executable itself.
     description: >-
       Optional FULL path to the bw binary (e.g. /usr/local/bin/bw).
       A directory path alone is NOT sufficient. BW_CLI_PATH env overrides.
