@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 0.2.0
+version: 0.2.1
 description: >-
   Vaultwarden secrets management for Hermes Agent via the `bw` CLI.
   Secrets are never exposed to the LLM context: tools return single-use

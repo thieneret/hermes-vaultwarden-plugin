@@ -1,4 +1,5 @@
-"""Hermes Agent — Vaultwarden secrets management plugin (v0.2.0).
+# vaultwarden/__init__.py — v0.2.1
+"""Hermes Agent — Vaultwarden secrets management plugin (v0.2.1).
 
 Entry point: ``register(ctx)`` (see plan §4/§12).
 

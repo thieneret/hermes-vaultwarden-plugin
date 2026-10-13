@@ -1,3 +1,4 @@
+# vaultwarden/config.py — v0.2.1
 """Configuration loading for the Vaultwarden plugin (plan §4, §9).
 
 Layers:
@@ -9,18 +10,22 @@ Layers:
 
 ``load_config`` accepts a Hermes ``PluginContext`` exposing
 ``get_config(key, default)`` — the ONLY supported configuration path
-(v0.2.0). Object-style contexts with ``.config`` / ``.plugin_config``
-attributes are also accepted and unwrapped until a ``get_config()`` API
-is found. There is NO fallback to reading config.yaml directly.
+(since v0.2.0; current version v0.2.1). Object-style contexts with
+``.config`` / ``.plugin_config`` attributes are also accepted and
+unwrapped until a ``get_config()`` API is found. There is NO fallback
+to reading config.yaml directly.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 from . import errors
+
+log = logging.getLogger("hermes.plugins.vaultwarden.config")
 
 # Hermes internal API for multiplex-aware secret resolution (v0.1.7).
 # In multiplex gateway mode, .env values are NOT in os.environ; they live
@@ -72,8 +77,8 @@ def _as_int(value: Any, default: int) -> int:
 def _extract_section(source: Any) -> dict:
     """Extract plugin config using ONLY the Hermes-native get_config() API.
 
-    v0.2.0: No fallback to config.yaml file reading. The plugin relies
-    entirely on PluginContext.get_config() which reads from
+    Since v0.2.0: No fallback to config.yaml file reading. The plugin
+    relies entirely on PluginContext.get_config() which reads from
     plugins.entries.<plugin_id>.settings.<key>.
     """
     if source is None:
@@ -232,5 +237,17 @@ class PluginConfig:
 def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> PluginConfig:
     """Build a PluginConfig from a Hermes PluginContext (see module doc)."""
     section = _extract_section(source)
+    if not section:
+        # Backward-compat guard (v0.2.1): an empty section usually means the
+        # host is still using the legacy config layout (e.g. a top-level
+        # `secrets.vaultwarden` block) instead of the Hermes-native
+        # plugins.entries.vaultwarden.settings.<key> structure read by
+        # PluginContext.get_config(). Defaults will be used for every key.
+        log.warning(
+            "Vaultwarden plugin config is EMPTY: no settings found via "
+            "PluginContext.get_config(). If you upgraded from a legacy "
+            "config layout, move your settings to "
+            "plugins.entries.vaultwarden.settings in config.yaml; "
+            "otherwise all values fall back to defaults (enabled=false).")
     snapshot = dict(os.environ) if env is None else dict(env)
     return PluginConfig(section=section, env_snapshot=snapshot)
