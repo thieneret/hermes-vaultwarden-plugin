@@ -61,38 +61,47 @@ def _make_check_fn(auth_ref: AuthManager):
 
 def register(ctx: Any) -> bool:
     """Hermes plugin entry point. Returns True when active."""
+    log.info("Loading vaultwarden plugin...")
+
     # 1-2. read config, resolve env var NAMES -> values in plugin memory
     try:
         config = load_config(getattr(ctx, "config", ctx))
     except Exception as exc:  # never crash Hermes over bad config
-        log.error("Vaultwarden config error: %s", exc)
+        log.warning("Vaultwarden plugin load FAILED: config error: %s", exc)
         return False
     if not config.enabled:
-        log.info("Vaultwarden plugin disabled (enabled=false); skipping registration.")
+        log.warning("Vaultwarden plugin load FAILED: plugin disabled (enabled=false)")
         return False
+
+    log.info("Vaultwarden plugin enabled, checking prerequisites...")
 
     # graceful degradation: missing bw -> tools disabled, agent continues
     bw_path = find_bw_binary(config.bw_cli_path)
     if not bw_path:
-        log.warning("Bitwarden CLI ('bw') not found — Vaultwarden tools disabled. "
-                    "Install it or set BW_CLI_PATH.")
+        log.warning("Vaultwarden plugin load FAILED: Bitwarden CLI ('bw') not found "
+                    "(bw_cli_path=%r, BW_CLI_PATH=%r)",
+                    config.bw_cli_path, os.environ.get("BW_CLI_PATH", ""))
         return False
+    log.info("Bitwarden CLI found: %s", bw_path)
 
     try:
         client_secret, master_password = _resolve_secrets(config)
     except Exception as exc:
-        log.error("Bootstrap secrets missing from .env: %s", exc)
+        log.warning("Vaultwarden plugin load FAILED: bootstrap secrets missing: %s", exc)
         return False
+    log.info("Bootstrap secrets resolved successfully")
 
     # 3. EXPLICIT CLEANUP of bootstrap vars from the process environment
     _cleanup_bootstrap_env(config)
+    log.debug("Bootstrap environment variables cleaned up")
 
     # 4. isolated appdata dir (chmod 700)
     try:
         appdata_dir = ensure_appdata_dir(config.appdata_dir())
     except Exception as exc:
-        log.error("Appdata isolation failed: %s", exc)
+        log.warning("Vaultwarden plugin load FAILED: appdata isolation error: %s", exc)
         return False
+    log.info("Isolated appdata dir ready: %s", appdata_dir)
 
     try:
         config.validate()
@@ -100,12 +109,16 @@ def register(ctx: Any) -> bool:
         auth = AuthManager(bw, config,
                            client_secret=client_secret,
                            master_password=master_password)
+        log.info("AuthManager created, configuring server...")
         # 5-7. server config + login + unlock (state machine §5)
         auth.configure_server_if_needed()
+        log.info("Server configured, authenticating...")
         auth.ensure_authenticated()
+        log.info("Authentication successful (state=%s)", auth.state.value)
     except Exception as exc:
         code = getattr(exc, "code", type(exc).__name__)
-        log.error("Vaultwarden startup auth failed (%s); tools disabled. Agent continues.", code)
+        log.warning("Vaultwarden plugin load FAILED: startup auth failed (%s): %s",
+                    code, exc)
         return False
 
     registry = PlaceholderRegistry(ttl_seconds=config.placeholder_ttl_seconds,
@@ -133,11 +146,13 @@ def register(ctx: Any) -> bool:
     # middleware + hooks (chain-safe resolver is NOT pre_tool_call)
     try:
         ctx.register_middleware("tool_request", make_placeholder_resolver(auth, registry))
+        log.info("Placeholder resolver middleware registered")
     except AttributeError:
         log.warning("Context lacks register_middleware; placeholder injection OFF.")
     try:
         ctx.register_hook("post_tool_call", make_post_cleanup_hook(auth, registry))
         ctx.register_hook("on_session_end", make_session_end_hook(auth, registry))
+        log.info("Cleanup hooks registered")
     except AttributeError:
         log.warning("Context lacks register_hook; cleanup hooks not installed.")
 

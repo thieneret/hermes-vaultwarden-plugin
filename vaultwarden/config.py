@@ -21,6 +21,16 @@ from typing import Any, Mapping
 
 from . import errors
 
+# Hermes internal API for multiplex-aware secret resolution (v1.7).
+# In multiplex gateway mode, .env values are NOT in os.environ; they live
+# in a context-local scope accessible only via get_secret(). This import
+# is optional: older Hermes versions or non-gateway modes fall back to
+# os.environ.
+try:
+    from agent.secret_scope import get_secret as _hermes_get_secret
+except ImportError:
+    _hermes_get_secret = None
+
 PLUGIN_DIR = Path(__file__).resolve().parent
 DEFAULT_SECTION_KEY = "secrets.vaultwarden"
 
@@ -277,6 +287,25 @@ class PluginConfig:
 
     # --- resolved secret values (memory only!) --------------------------
     def resolve_secret(self, var_name: str, *, required: bool = True) -> str:
+        """Resolve a secret value by env-var name.
+
+        Resolution order (v1.7):
+        1. Hermes internal API (agent.secret_scope.get_secret) — multiplex-aware,
+           fail-closed, respects profile isolation and external secret sources.
+        2. Fallback to env_snapshot (os.environ copy) — for non-multiplex modes
+           or older Hermes versions without secret_scope.
+        """
+        # 1. Hermes internal API (primary)
+        if _hermes_get_secret is not None:
+            try:
+                value = _hermes_get_secret(var_name)
+                if value is not None:
+                    return str(value).strip()
+            except Exception:
+                # UnscopedSecretError or other scope issues — fall through
+                pass
+
+        # 2. Fallback to env_snapshot
         value = str(self.env_snapshot.get(var_name, "")).strip()
         if not value and required:
             raise errors.ConfigError(
