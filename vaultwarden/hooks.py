@@ -1,4 +1,4 @@
-# vaultwarden/hooks.py — v0.2.2
+# vaultwarden/hooks.py — v0.2.3
 """Terminal hook handlers (plan §7): chain-safe `tool_request` middleware +
 `post_tool_call` cleanup/redaction.
 

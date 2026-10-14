@@ -41,7 +41,8 @@ def test_defaults_when_no_settings():
     assert cfg.auto_sync is True
     assert cfg.sync_interval_seconds == 300
     assert cfg.session_timeout_seconds == 14400
-    assert cfg.auto_unlock is True
+    # v0.2.3 (BREAKING): auto_unlock removed — vault is ALWAYS auto-unlocked.
+    assert not hasattr(cfg, "auto_unlock")
     assert cfg.placeholder_ttl_seconds == 300
     assert cfg.max_placeholders == 50
     assert cfg.client_secret_env_name == "VW_CLIENT_SECRET"
@@ -99,6 +100,17 @@ def test_validate_catches_missing_fields():
     cfg3 = load_config(FakePluginContext({
         "enabled": True, "server_url": "https://v", "client_id": "user.abc"}), env={})
     cfg3.validate()  # ok
+
+
+def test_validate_accepts_empty_master_password_env():
+    # v0.2.3: master_password_env keeps a sensible default (VW_MASTER_PASSWORD);
+    # an explicit empty value falls back to the default and must NOT fail
+    # validation. The master password VALUE is enforced at resolve_secret() time.
+    cfg = load_config(FakePluginContext({
+        "enabled": True, "server_url": "https://v", "client_id": "user.abc",
+        "master_password_env": ""}), env={})
+    cfg.validate()  # ok
+    assert cfg.master_password_env_name == "VW_MASTER_PASSWORD"
 
 
 def test_bool_string_coercion():

@@ -172,7 +172,12 @@ elif argv[:2] == ["get", "item"]:
     else:
         sys.stderr.write("Cannot find item with the given id or name.\n"); sys.exit(1)
 elif argv[:1] == ["encode"]:
-    out(base64.b64encode(argv[1].encode()).decode())
+    # v0.2.3: bw reads from stdin when no positional argument is given
+    # (ARG_MAX fix) — the fake mirrors that behaviour.
+    if len(argv) > 1:
+        out(base64.b64encode(argv[1].encode()).decode())
+    else:
+        out(base64.b64encode(sys.stdin.read().encode()).decode())
 elif argv[:2] in (["create", "item"], ["edit", "item"]):
     blob = json.loads(argv[2])
     def dec(v):

@@ -1,4 +1,4 @@
-# vaultwarden/auth.py — v0.2.2
+# vaultwarden/auth.py — v0.2.3
 """Auth Manager + Session Store (plan §4, §5).
 
 State machine:
@@ -269,12 +269,12 @@ class AuthManager:
     def _adopt_existing_unlocked_session(self) -> None:
         """Case C/unlocked: bw keeps its own session key; we never stored one
         in memory (e.g. after a plugin restart). Re-unlock locally so tool
-        calls keep flowing — deterministic and safe (auto_unlock path)."""
+        calls keep flowing — deterministic and safe."""
         if self._session_key:
             return  # our remembered key is still valid
-        if self._config.auto_unlock:
-            log.info("Adopting existing unlocked profile via local re-unlock.")
-            self._do_unlock()
+        # v0.2.3: always re-unlock — auto_unlock toggle removed.
+        log.info("Adopting existing unlocked profile via local re-unlock.")
+        self._do_unlock()
 
     def _maybe_initial_sync(self) -> None:
         """Best-effort first sync after authentication (auto_sync only)."""
@@ -302,8 +302,8 @@ class AuthManager:
         log.info("bw apikey login succeeded (client id %s).", self._client_id)
 
     def _do_unlock(self) -> None:
-        if not self._config.auto_unlock:
-            return
+        # v0.2.3 (BREAKING): auto_unlock toggle removed — the vault is ALWAYS
+        # auto-unlocked with the master password. No early-return guard.
         try:
             key = self._bw.unlock_passwordenv(self._master_password)
         except errors.VaultwardenError as exc:

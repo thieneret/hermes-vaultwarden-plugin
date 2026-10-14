@@ -46,7 +46,12 @@ def test_terminal_tools_configurable():
 
 
 def test_version_headers():
-    """Verify all modified files have v0.2.2 version header."""
+    """Verify all modified files carry the CURRENT release version header.
+
+    v0.2.3: headers moved to `— v0.2.3`; kept as a regression guard that the
+    five core modules (incl. hooks.py) all declare the same current version.
+    """
+    import re
     import vaultwarden.config
     import vaultwarden
     from pathlib import Path
@@ -57,7 +62,9 @@ def test_version_headers():
         path = pkg_dir / name
         with open(path, 'r') as f:
             first_line = f.readline().strip()
-        assert 'v0.2.2' in first_line, f"{name} missing version header: {first_line}"
+        m = re.search(r"v\d+\.\d+\.\d+", first_line)
+        assert m, f"{name} missing version header: {first_line}"
+        assert m.group(0) == "v0.2.3", f"{name} stale version header: {first_line}"
 
 
 # ---------------------------------------------------------------------------

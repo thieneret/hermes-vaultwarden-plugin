@@ -1,3 +1,4 @@
+# vaultwarden/tools.py — v0.2.3
 """Tool handlers for the 9 vaultwarden_* tools (plan §8).
 
 ``get_tools(auth, config, registry)`` yields (schema, handler) pairs.
@@ -75,6 +76,27 @@ def _require_write(config: PluginConfig) -> None:
     if not config.allow_write:
         raise errors.PermissionError_(
             "Write operations are disabled for the Vaultwarden plugin.")
+
+
+def _collect_secret_strings(obj: Any) -> list[str]:
+    """Recursively extract all non-empty string values from a nested structure.
+
+    v0.2.3 (SECURITY FIX): h_store previously only registered `password` with
+    the RedactingFilter and h_update registered nothing at all — secrets in
+    username/uri/notes/custom_fields leaked into logs. This helper collects
+    EVERY string value so write handlers can redact them all during the
+    operation.
+    """
+    results: list[str] = []
+    if isinstance(obj, str) and obj.strip():
+        results.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            results.extend(_collect_secret_strings(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            results.extend(_collect_secret_strings(v))
+    return results
 
 
 def _guard(fn: Callable[[], dict]) -> dict:
@@ -198,7 +220,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
         def run():
             _require_write(config)
             redactor = get_redacting_filter()
-            tracked = [str(args[k]) for k in ("password",) if args.get(k)]
+            tracked = _collect_secret_strings(args)
             for t in tracked:
                 redactor.register_secret(t)
             try:
@@ -218,13 +240,21 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     def h_update(args: dict, **kw: Any) -> dict:
         def run():
             _require_write(config)
-            item_id = str(args["item_id"])
-            current = auth.get_item(item_id)
-            merged = _apply_updates(current, args)
-            updated = auth.edit_item(merged)
-            log.info("Updated vault item %s.", item_id)
-            return {"updated": True, "id": updated.get("id") or item_id,
-                    "item": _metadata(updated)}
+            redactor = get_redacting_filter()
+            tracked = _collect_secret_strings(args)
+            for t in tracked:
+                redactor.register_secret(t)
+            try:
+                item_id = str(args["item_id"])
+                current = auth.get_item(item_id)
+                merged = _apply_updates(current, args)
+                updated = auth.edit_item(merged)
+                log.info("Updated vault item %s.", item_id)
+                return {"updated": True, "id": updated.get("id") or item_id,
+                        "item": _metadata(updated)}
+            finally:
+                for t in tracked:
+                    redactor.forget_secret(t)
         return _guard(run)
 
     yield schemas.VAULTWARDEN_UPDATE, h_update
