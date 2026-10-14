@@ -254,5 +254,11 @@ class PluginConfig:
 def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> PluginConfig:
     """Build a PluginConfig from a Hermes PluginContext (see module doc)."""
     section = _extract_section(source)
+    if not section:
+        log.warning(
+            "Vaultwarden plugin config is EMPTY: no settings found via "
+            "PluginContext.get_config(). Add your configuration to "
+            "plugins.entries.vaultwarden.settings in config.yaml. "
+            "Plugin will use defaults (enabled=false) and will not load.")
     snapshot = dict(os.environ) if env is None else dict(env)
     return PluginConfig(section=section, env_snapshot=snapshot)
