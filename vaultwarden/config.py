@@ -1,4 +1,4 @@
-# vaultwarden/config.py — v0.2.2
+# vaultwarden/config.py — v0.2.3
 """Configuration loading for the Vaultwarden plugin (plan §4, §9).
 
 Layers:
@@ -10,7 +10,7 @@ Layers:
 
 ``load_config`` accepts a Hermes ``PluginContext`` exposing
 ``get_config(key, default)`` — the ONLY supported configuration path
-(since v0.2.0; current version v0.2.2). Object-style contexts with
+(since v0.2.0; current version v0.2.3). Object-style contexts with
 ``.config`` / ``.plugin_config`` attributes are also accepted and
 unwrapped until a ``get_config()`` API is found. There is NO fallback
 to reading config.yaml directly.
@@ -52,7 +52,6 @@ _DEFAULTS: dict[str, Any] = {
     "auto_sync": True,
     "sync_interval_seconds": 300,
     "session_timeout_seconds": 14400,
-    "auto_unlock": True,
     "placeholder_ttl_seconds": 300,
     "max_placeholders": 50,
     "bw_cli_path": "",
@@ -168,10 +167,6 @@ class PluginConfig:
         return _as_int(self._raw("session_timeout_seconds"), 14400)
 
     @property
-    def auto_unlock(self) -> bool:
-        return _as_bool(self._raw("auto_unlock"))
-
-    @property
     def placeholder_ttl_seconds(self) -> int:
         return _as_int(self._raw("placeholder_ttl_seconds"), 300)
 
@@ -246,6 +241,10 @@ class PluginConfig:
         if not self.client_id.startswith("user."):
             raise errors.ConfigError(
                 "client_id must be an API-key client id of the form 'user.<uuid>'.")
+        # v0.2.3: master_password_env keeps its sensible default
+        # ('VW_MASTER_PASSWORD') and the property fallback — no name check here.
+        # The master password VALUE is enforced at resolve_secret(required=True)
+        # time during unlock, which fails closed if it is missing.
         if self.placeholder_ttl_seconds <= 0:
             raise errors.ConfigError("placeholder_ttl_seconds must be > 0.")
         if self.max_placeholders <= 0:

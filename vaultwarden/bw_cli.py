@@ -1,3 +1,4 @@
+# vaultwarden/bw_cli.py — v0.2.3
 """Thin, isolated wrapper around the ``bw`` (Bitwarden CLI) binary.
 
 Every subprocess is executed with a MINIMAL, explicitly constructed env:
@@ -247,11 +248,35 @@ class BwCli:
         return pw
 
     def encode(self, session_key: str, value: str) -> str:
-        """`bw encode <value>` -> base64. Required by create/edit pipelines."""
-        enc = self.run(["encode", value], env={"BW_SESSION": session_key}, raw=True)
-        if not enc:
+        """`bw encode` via stdin -> base64. Avoids ARG_MAX for large values.
+
+        v0.2.3 (BUGFIX): the value used to be passed as a CLI positional
+        argument; SSH keys / certificates / long notes could exceed the OS
+        ARG_MAX limit and crash with OSError. The Bitwarden CLI reads from
+        stdin when `encode` gets no positional argument, so we pipe it.
+        This method intentionally bypasses the generic run() helper because
+        run() only supports argv-based invocation; `encode` is the ONLY
+        command that needs stdin input.
+        """
+        full_env = self.base_env({"BW_SESSION": session_key})
+        cmd = [self.bw_path, "encode"]
+        try:
+            proc = subprocess.run(
+                cmd, env=full_env, input=value, capture_output=True, text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise errors.NetworkError("bw encode timed out.") from exc
+        except OSError as exc:
+            raise errors.BinaryError(f"Failed to execute bw encode: {type(exc).__name__}") from exc
+
+        out = (proc.stdout or "").strip()
+        if proc.returncode != 0:
+            # NB: stderr may contain fragments of the encoded payload — never log it.
+            raise errors.ParseError(f"bw encode failed (exit {proc.returncode}).")
+        if not out:
             raise errors.ParseError("bw encode returned empty output.")
-        return enc
+        return out
 
 
 def encode_item(session_key: str, item: dict, bw: BwCli) -> str:
