@@ -1,4 +1,4 @@
-# vaultwarden/config.py — v0.2.1
+# vaultwarden/config.py — v0.2.2
 """Configuration loading for the Vaultwarden plugin (plan §4, §9).
 
 Layers:
@@ -10,7 +10,7 @@ Layers:
 
 ``load_config`` accepts a Hermes ``PluginContext`` exposing
 ``get_config(key, default)`` — the ONLY supported configuration path
-(since v0.2.0; current version v0.2.1). Object-style contexts with
+(since v0.2.0; current version v0.2.2). Object-style contexts with
 ``.config`` / ``.plugin_config`` attributes are also accepted and
 unwrapped until a ``get_config()`` API is found. There is NO fallback
 to reading config.yaml directly.
@@ -56,6 +56,8 @@ _DEFAULTS: dict[str, Any] = {
     "placeholder_ttl_seconds": 300,
     "max_placeholders": 50,
     "bw_cli_path": "",
+    "terminal_tool_names": [],
+    "terminal_command_keys": [],
 }
 
 
@@ -180,6 +182,22 @@ class PluginConfig:
     @property
     def bw_cli_path(self) -> str:
         return str(self.env_snapshot.get("BW_CLI_PATH") or self._raw("bw_cli_path") or "")
+
+    # v0.2.2 (BUGFIX): configurable terminal tool names / command keys.
+    # Empty list => hooks.py falls back to its built-in defaults.
+    @property
+    def terminal_tool_names(self) -> list[str]:
+        raw = self._raw("terminal_tool_names")
+        if isinstance(raw, list):
+            return [str(t) for t in raw]
+        return []
+
+    @property
+    def terminal_command_keys(self) -> list[str]:
+        raw = self._raw("terminal_command_keys")
+        if isinstance(raw, list):
+            return [str(k) for k in raw]
+        return []
 
     # --- resolved secret values (memory only!) --------------------------
     def resolve_secret(self, var_name: str, *, required: bool = True) -> str:

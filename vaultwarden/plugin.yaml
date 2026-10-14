@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 0.2.1
+version: 0.2.2
 description: >-
   Vaultwarden secrets management for Hermes Agent via the `bw` CLI.
   Secrets are never exposed to the LLM context: tools return single-use
@@ -70,3 +70,15 @@ config:
     description: >-
       Optional FULL path to the bw binary (e.g. /usr/local/bin/bw).
       A directory path alone is NOT sufficient. BW_CLI_PATH env overrides.
+  terminal_tool_names:
+    type: array
+    default: []
+    description: >-
+      Tool names treated as terminal/exec for placeholder injection.
+      Defaults to terminal, shell, bash, execute_command, run_command, exec, code_execution.
+  terminal_command_keys:
+    type: array
+    default: []
+    description: >-
+      Argument keys scanned for the command string in terminal tools.
+      Defaults to command, cmd, input, script, code.

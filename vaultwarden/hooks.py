@@ -1,3 +1,4 @@
+# vaultwarden/hooks.py — v0.2.2
 """Terminal hook handlers (plan §7): chain-safe `tool_request` middleware +
 `post_tool_call` cleanup/redaction.
 
@@ -32,8 +33,10 @@ INVALID_SENTINEL = "__VW_PLACEHOLDER_INVALID__"
 
 # terminal-ish arg keys we scan across backends (Local/Docker/SSH/Modal/
 # Daytona/Singularity/Vercel Sandbox all pass the command string here).
-_TERMINAL_TOOLS = {"terminal", "shell", "bash", "execute_command"}
-_COMMAND_KEYS = ("command", "cmd", "input")
+# v0.2.2: names/keys are overridable via config (terminal_tool_names /
+# terminal_command_keys); these are the defaults when config is absent/empty.
+_DEFAULT_TERMINAL_TOOLS = {"terminal", "shell", "bash", "execute_command", "run_command", "exec", "code_execution"}
+_DEFAULT_COMMAND_KEYS = ("command", "cmd", "input", "script", "code")
 
 
 def _resolve_one(token: str, command: str, auth: AuthManager,
@@ -84,18 +87,22 @@ def resolve_all_placeholders(command: str, auth: AuthManager,
 
 
 def make_placeholder_resolver(auth: AuthManager,
-                              registry: PlaceholderRegistry) -> Callable[..., Any]:
+                              registry: PlaceholderRegistry,
+                              config: Any = None) -> Callable[..., Any]:
     """Build the `tool_request` middleware callback for ctx.register_middleware."""
+
+    terminal_tools = set(getattr(config, "terminal_tool_names", None) or _DEFAULT_TERMINAL_TOOLS)
+    command_keys = tuple(getattr(config, "terminal_command_keys", None) or _DEFAULT_COMMAND_KEYS)
 
     def vaultwarden_resolve_placeholders(tool_name: str = "", args: dict | None = None,
                                          task_id: str = "",
                                          **kwargs: Any) -> dict | None:
         # --- chain safety gates -------------------------------------------
-        if tool_name not in _TERMINAL_TOOLS:
+        if tool_name not in terminal_tools:
             return None
         if not isinstance(args, dict):
             return None
-        key = next((k for k in _COMMAND_KEYS
+        key = next((k for k in command_keys
                     if isinstance(args.get(k), str) and "__VW_SECRET_" in args[k]), None)
         if key is None:
             return None  # nothing to do — DO NOT touch other plugins' args
@@ -103,15 +110,19 @@ def make_placeholder_resolver(auth: AuthManager,
         modified, errs = resolve_all_placeholders(command, auth, registry, task_id)
         if errs:
             # stash for post_tool_call surfacing; fail-closed sentinel already applied
-            _PENDING_ERRORS.extend(errs)
+            # v0.2.2 (BUGFIX): task-scoped + lock-protected store so parallel
+            # tool calls cannot clear each other's pending errors.
+            with _PENDING_LOCK:
+                _PENDING_ERRORS.setdefault(task_id or "", []).extend(errs)
         if modified != command:
             new_args = {**args, key: modified}
-            for extra_key in _COMMAND_KEYS:
+            for extra_key in command_keys:
                 if extra_key != key and isinstance(args.get(extra_key), str) \
                         and "__VW_SECRET_" in args[extra_key]:
                     new_val, more = resolve_all_placeholders(
                         args[extra_key], auth, registry, task_id)
-                    _PENDING_ERRORS.extend(more)
+                    with _PENDING_LOCK:
+                        _PENDING_ERRORS.setdefault(task_id or "", []).extend(more)
                     new_args[extra_key] = new_val
             log.debug("Rewrote terminal args (%d placeholder(s)).",
                       len(placeholder_tokens(command)))
@@ -121,8 +132,11 @@ def make_placeholder_resolver(auth: AuthManager,
     return vaultwarden_resolve_placeholders
 
 
-#: transient error store surfaced by post_tool_call then cleared
-_PENDING_ERRORS: list[dict] = []
+#: transient error store surfaced by post_tool_call then cleared.
+#: v0.2.2 (BUGFIX): task-scoped dict + lock — parallel tool calls can no
+#: longer lose (or steal) each other's pending errors via a shared list.
+_PENDING_ERRORS: dict[str, list[dict]] = {}
+_PENDING_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Per-task injected-secret store (v0.1.4, FAIL-6).
@@ -228,13 +242,16 @@ def _redact_task_secrets(task_id: str, result: Any) -> None:
 
 
 def make_post_cleanup_hook(auth: AuthManager,
-                           registry: PlaceholderRegistry) -> Callable[..., None]:
+                           registry: PlaceholderRegistry,
+                           config: Any = None) -> Callable[..., None]:
     """Build the `post_tool_call` observer for ctx.register_hook."""
+
+    terminal_tools = set(getattr(config, "terminal_tool_names", None) or _DEFAULT_TERMINAL_TOOLS)
 
     def vaultwarden_post_cleanup(tool_name: str = "", args: dict | None = None,
                                  result: Any = None, task_id: str = "",
                                  **kwargs: Any) -> None:
-        if tool_name not in _TERMINAL_TOOLS:
+        if tool_name not in terminal_tools:
             return
         n = registry.cleanup_used()
         if n:
@@ -252,10 +269,12 @@ def make_post_cleanup_hook(auth: AuthManager,
         # (single-use per task_id; forgotten immediately after).
         _redact_task_secrets(task_id, result)
         # Surface fail-closed resolution errors to the agent (secret-free).
-        if _PENDING_ERRORS and isinstance(result, dict):
-            result.setdefault("vaultwarden_placeholder_errors", []).extend(
-                _PENDING_ERRORS[:])
-            _PENDING_ERRORS.clear()
+        # v0.2.2 (BUGFIX): pop only THIS task's errors — other in-flight
+        # tasks keep their pending errors until their own post_tool_call.
+        with _PENDING_LOCK:
+            task_errors = _PENDING_ERRORS.pop(task_id or "", [])
+        if task_errors and isinstance(result, dict):
+            result.setdefault("vaultwarden_placeholder_errors", []).extend(task_errors)
 
     return vaultwarden_post_cleanup
 
@@ -268,6 +287,9 @@ def make_session_end_hook(auth: AuthManager,
         registry.clear()
         # v0.1.5 (FAIL-6 wiring): drop every pending per-task injected secret.
         clear_task_secrets()
+        # v0.2.2 (BUGFIX): drop any leftover task-scoped pending errors.
+        with _PENDING_LOCK:
+            _PENDING_ERRORS.clear()
         auth.shutdown(keep_appdata=True)
 
     return vaultwarden_on_session_end

@@ -1,3 +1,4 @@
+# vaultwarden/auth.py — v0.2.2
 """Auth Manager + Session Store (plan §4, §5).
 
 State machine:
@@ -197,13 +198,11 @@ class AuthManager:
 
             # Step 2: does the existing session match server AND account?
             is_correct_server = (current_server == expected_server)
-            # v0.1.9 account verification: bw status reports userId "<uuid>",
-            # config carries client_id "user.<uuid>". A profile that does not
-            # report any userId at all is treated as "unknown" rather than a
-            # mismatch (defensive against CLI variants); an *explicitly
-            # different* userId always forces the Case B logout + re-auth.
+            # v0.2.2 (SECURITY FIX): strict fail-closed account verification.
+            # A missing or empty userId is now treated as a MISMATCH, forcing
+            # logout + re-auth instead of blindly adopting an unknown session.
             is_correct_account = (
-                current_user_id == expected_user_id or not current_user_id)
+                bool(current_user_id) and current_user_id == expected_user_id)
             needs_reauth = not (is_correct_server and is_correct_account)
 
             # Case C: already authenticated with the correct session.

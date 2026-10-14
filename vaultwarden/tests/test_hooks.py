@@ -75,7 +75,8 @@ def test_single_use_second_pass_fails_closed(mw, post, registry):
     assert second is not None
     assert INVALID_SENTINEL in second["args"]["command"]   # fail closed
     assert "sup3r-s3cret-pg!" not in second["args"]["command"]
-    assert len(_PENDING_ERRORS) >= 1                       # error surfaced later
+    # v0.2.2: task-scoped dict store — errors live under the (empty) task key
+    assert sum(len(v) for v in _PENDING_ERRORS.values()) >= 1   # surfaced later
 
 
 def test_unknown_placeholder_passes_through_with_warning(mw):
@@ -84,7 +85,8 @@ def test_unknown_placeholder_passes_through_with_warning(mw):
     out = mw("terminal", {"command": f"echo {bogus}"})
     assert out is not None
     assert INVALID_SENTINEL in out["args"]["command"]
-    assert any(e["error_code"] == "PLACEHOLDER_ERROR" for e in _PENDING_ERRORS)
+    pending = [e for errs in _PENDING_ERRORS.values() for e in errs]
+    assert any(e["error_code"] == "PLACEHOLDER_ERROR" for e in pending)
     _PENDING_ERRORS.clear()
 
 
@@ -134,12 +136,15 @@ def test_post_hook_redacts_secret_from_output(mw, post, registry):
 
 def test_post_hook_surfaces_placeholder_errors(mw, post, registry):
     _PENDING_ERRORS.clear()
-    out = mw("terminal", {"command": "echo __VW_SECRET_000000000000__"})
+    # v0.2.2: errors are stored per task_id — middleware and post hook must
+    # use the SAME task id for the errors to be surfaced to this call's result.
+    out = mw("terminal", {"command": "echo __VW_SECRET_000000000000__"},
+             task_id="y")
     assert out is not None
     res = {"output": "done"}
     post("terminal", {"command": out["args"]["command"]}, res, task_id="y")
     assert res["vaultwarden_placeholder_errors"][0]["error_code"] == "PLACEHOLDER_ERROR"
-    assert _PENDING_ERRORS == []
+    assert _PENDING_ERRORS == {}
 
 
 def test_post_hook_noop_for_other_tools(post, registry):
