@@ -292,9 +292,27 @@ def registry() -> PlaceholderRegistry:
 
 @pytest.fixture()
 def tools_by_name(auth_manager, plugin_config, registry):
+    return _dict_tools(auth_manager, plugin_config, registry)
+
+
+def _dict_tools(auth, cfg, registry):
+    """v0.2.4: handlers now return JSON strings (Hermes tool_call contract).
+
+    Wrap them so existing dict-style test assertions keep working while the
+    production handlers serialize via _guard().
+    """
     from vaultwarden.tools import get_tools
-    return {schema["name"]: handler for schema, handler in
-            get_tools(auth_manager, plugin_config, registry)}
+
+    def wrap(handler):
+        def inner(args, **kw):
+            result = handler(args, **kw)
+            if isinstance(result, str):
+                return json.loads(result)
+            return result
+        return inner
+
+    return {schema["name"]: wrap(handler) for schema, handler in
+            get_tools(auth, cfg, registry)}
 
 
 class RecordingCtx:
@@ -339,7 +357,5 @@ def write_auth_manager(bw_cli):
 
 @pytest.fixture()
 def write_tools_by_name(write_auth_manager, registry):
-    from vaultwarden.tools import get_tools
     cfg = write_auth_manager._config
-    return {schema["name"]: handler for schema, handler in
-            get_tools(write_auth_manager, cfg, registry)}
+    return _dict_tools(write_auth_manager, cfg, registry)

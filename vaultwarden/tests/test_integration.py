@@ -15,6 +15,17 @@ from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
 TOKEN_RE = re.compile(r"__VW_SECRET_[0-9a-f]{12}__")
 
 
+def _dict_tools(raw):
+    """v0.2.4: handlers return JSON strings; parse back to dicts for tests."""
+    import json as _json
+    def wrap(handler):
+        def inner(args, **kw):
+            r = handler(args, **kw)
+            return _json.loads(r) if isinstance(r, str) else r
+        return inner
+    return {k: wrap(h) for k, h in raw.items()}
+
+
 def _register_ok(monkeypatch, tmp_path, fake_bw, section_extra=None, env_extra=None):
     monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
     monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
@@ -84,7 +95,7 @@ def test_startup_secret_injection_registers_source(monkeypatch, tmp_path, fake_b
 # ------------------------------------------------- placeholder e2e via hooks
 def test_placeholder_e2e_llm_style_flow(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
-    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     mw = dict(ctx.middleware)["tool_request"]
     post = dict(ctx.hooks)["post_tool_call"]
 
@@ -115,7 +126,7 @@ def test_placeholder_e2e_llm_style_flow(monkeypatch, tmp_path, fake_bw):
 
 def test_crud_cycle_integration(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw, {"allow_write": True})
-    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     created = tools["vaultwarden_store"]({
         "type": "login", "name": "Integration svc", "username": "svc",
         "password": "pw-with-@and$chars", "uri": "https://svc.local",
@@ -134,7 +145,7 @@ def test_session_expiry_recovery_integration(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw,
                            {"session_timeout_seconds": 1})
     auth = vaultwarden.PLUGIN_STATE["auth"]
-    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     first = tools["vaultwarden_list"]({})
     assert "error" not in first
     auth._session_created_at -= 10            # simulate expiry
@@ -144,7 +155,7 @@ def test_session_expiry_recovery_integration(monkeypatch, tmp_path, fake_bw):
 
 def test_concurrent_tool_calls(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
-    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     errors_seen: list[str] = []
 
     def worker(i):
@@ -170,7 +181,7 @@ def test_on_session_end_hook_locks_vault(monkeypatch, tmp_path, fake_bw):
     auth = vaultwarden.PLUGIN_STATE["auth"]
     appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
     # v0.1.9 lazy auth: authenticate first so there IS a live session to lock.
-    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     assert tools["vaultwarden_list"]({})["total"] == 3
     assert (appdata / "fake-logged-in").exists()
     end = dict(ctx.hooks)["on_session_end"]
@@ -183,7 +194,7 @@ def test_on_session_end_hook_locks_vault(monkeypatch, tmp_path, fake_bw):
 def test_logs_never_contain_bootstrap_secrets(monkeypatch, tmp_path, fake_bw, caplog):
     caplog.set_level(logging.DEBUG)
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
-    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     tools["vaultwarden_list"]({})
     tools["vaultwarden_get_secret_ref"]({"item_id": "Postgres prod", "field": "password"})
     mw = dict(ctx.middleware)["tool_request"]
@@ -241,7 +252,7 @@ def test_first_tool_call_triggers_lazy_auth(monkeypatch, tmp_path, fake_bw):
     assert (appdata / "server.txt").read_text() == "https://vault.example.com"
     assert (appdata / "fake-logged-in").exists()
 
-    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     res = tools["vaultwarden_status"]({})
     assert res["status"]["auth_state"] == "unlocked"
 
@@ -251,7 +262,7 @@ def test_restart_reuses_session_without_reconfig_or_logout(monkeypatch, tmp_path
     in -> NO 'bw config server', NO logout, NO login — just unlock."""
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     assert ok is True
-    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     assert tools["vaultwarden_list"]({})["total"] == 3   # lazy auth completes
 
     cli = vaultwarden.PLUGIN_STATE["bw"]
@@ -292,7 +303,7 @@ def test_wrong_account_triggers_logout_then_reauth(monkeypatch, tmp_path, fake_b
     then config + login + unlock (no 'Logout required' failure)."""
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     assert ok is True
-    tools = {t["name"]: t["handler"] for t in ctx.tools}
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     tools["vaultwarden_list"]({})                # session up as user 1111...
 
     cli = vaultwarden.PLUGIN_STATE["bw"]
