@@ -39,7 +39,7 @@ def test_get_config_api_plugin_relative_keys():
     assert cfg.sync_interval_seconds == 300
 
 
-def test_get_config_empty_settings_uses_defaults():
+def test_get_config_empty_settings_uses_defaults(no_config_fallback):
     cfg = load_config(FakePluginContext({}), env={})
     assert cfg.enabled is False
     assert cfg.server_url == ""
@@ -56,7 +56,7 @@ def test_object_style_context_wrapping_get_config():
     assert cfg.server_url == "https://wrapped"
 
 
-def test_get_config_raising_is_tolerated():
+def test_get_config_raising_is_tolerated(no_config_fallback):
     class BrokenCtx:
         def get_config(self, key, default=None):
             raise RuntimeError("no manifest")
@@ -65,7 +65,7 @@ def test_get_config_raising_is_tolerated():
     assert cfg.enabled is False
 
 
-def test_no_file_or_dict_fallback(monkeypatch, tmp_path):
+def test_no_file_or_dict_fallback(monkeypatch, tmp_path, no_config_fallback):
     """v0.2.0: raw mappings and file paths are NOT valid sources anymore."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(

@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -288,6 +289,89 @@ def auth_manager(bw_cli, plugin_config) -> AuthManager:
 @pytest.fixture()
 def registry() -> PlaceholderRegistry:
     return PlaceholderRegistry(ttl_seconds=300, max_entries=50)
+
+
+@pytest.fixture
+def no_config_fallback(monkeypatch):
+    """Disable the v0.2.3 direct-config.yaml fallback for tests that
+    expect pure get_config()/defaults behavior.
+
+    The production fallback in config.py::_extract_section() reads the real
+    config.yaml when ctx.get_config() returns empty. Unit tests run in
+    isolation (no real ~/.hermes/config.yaml, possibly no hermes_cli module),
+    so the fallback would leak environment-dependent values into tests that
+    assert on pure defaults. This fixture neutralizes BOTH fallback arms:
+
+      1. hermes_cli.config.read_user_config_raw()  -> returns {}
+         (patched at the SOURCE module so both `import X` and
+          `from X import Y` import styles see the patched object)
+      2. direct HERMES_HOME/config.yaml file read  -> open() raises
+         FileNotFoundError; additionally HERMES_HOME / Path.home() are pointed
+         at an empty isolated dir because production checks
+         ``config_path.exists()`` BEFORE calling open().
+
+    On top of that, vaultwarden.config._extract_section is replaced with a
+    faithful copy of the production logic WITHOUT the two fallback arms
+    (get_config() extraction and object-style unwrapping behave identically),
+    so an empty settings context yields pure defaults exactly like it did
+    before the v0.2.3 fallback mechanism was introduced. Production code is
+    NOT modified — the patch lives entirely in the test layer and is undone
+    automatically by monkeypatch.
+    """
+    # Arm 1: neutralize the hermes_cli raw-YAML reader (source-module patch).
+    try:
+        import hermes_cli.config as _hermes_cfg
+        monkeypatch.setattr(
+            _hermes_cfg, "read_user_config_raw", lambda *a, **kw: {})
+    except ImportError:
+        pass  # hermes_cli absent in the test env — arm 1 is already inert
+
+    # Arm 2: block the direct config.yaml file read so the code takes its
+    # FileNotFoundError branch instead of reading a real file.
+    import builtins
+    _real_open = builtins.open
+
+    def _guarded_open(file, *args, **kwargs):
+        if str(file).endswith("config.yaml"):
+            raise FileNotFoundError(f"blocked in test: {file}")
+        return _real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", _guarded_open)
+
+    iso_home = Path(tempfile.mkdtemp(prefix="vw-no-config-fallback-"))
+    monkeypatch.setenv("HERMES_HOME", str(iso_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: iso_home))
+
+    # Belt & braces: wrap vaultwarden.config._extract_section so that the
+    # empty-settings case (get_config() present but returning no values)
+    # yields pure defaults instead of falling through to the v0.2.3 arms —
+    # exactly the pre-v0.2.3 behaviour these tests were written against.
+    # Every other input is delegated UNCHANGED to the real production
+    # function, so no functional assertion is weakened.
+    from vaultwarden import config as _vw_config
+
+    _real_extract = _vw_config._extract_section
+
+    def _extract_section_no_fallback(source):
+        getter = getattr(source, "get_config", None)
+        if callable(getter):
+            result = {}
+            for key in _vw_config._DEFAULTS:
+                try:
+                    value = getter(key, None)
+                except Exception:
+                    continue
+                if value is not None:
+                    result[key] = value
+            if not result:
+                # Empty settings => pure defaults (fallbacks neutralized).
+                return {}
+        return _real_extract(source)
+
+    monkeypatch.setattr(_vw_config, "_extract_section",
+                        _extract_section_no_fallback)
+
+    yield
 
 
 @pytest.fixture()
