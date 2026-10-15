@@ -54,17 +54,26 @@ def test_encode_uses_stdin():
 
 
 def test_version_headers_v023():
-    """Verify all modified files have v0.2.3 version header."""
+    """Verify each core module carries its OWN release version header."""
     import vaultwarden
     from pathlib import Path
 
     pkg_dir = Path(vaultwarden.__file__).resolve().parent
-    modified = ["__init__.py", "config.py", "auth.py", "tools.py", "bw_cli.py"]
-    for name in modified:
+    expected_versions = {
+        "__init__.py": "v0.2.3",
+        "config.py":   "v0.2.3",
+        "auth.py":     "v0.2.3",
+        "hooks.py":    "v0.2.3",
+        "bw_cli.py":   "v0.2.3",
+        "tools.py":    "v0.2.4",   # bumped in v0.2.4 (_guard JSON-string fix)
+    }
+    for name, expected in expected_versions.items():
         path = pkg_dir / name
-        with open(path, 'r') as f:
+        assert path.exists(), f"Missing module file: {name}"
+        with open(path, "r", encoding="utf-8") as f:
             first_line = f.readline().strip()
-        assert 'v0.2.3' in first_line, f"{name} missing version header: {first_line}"
+        assert expected in first_line, (
+            f"{name} should have {expected} header, got: {first_line}")
 
 
 # ---------------------------------------------------------------------------
