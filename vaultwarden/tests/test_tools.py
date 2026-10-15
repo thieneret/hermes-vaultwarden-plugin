@@ -6,6 +6,17 @@ import re
 TOKEN_RE = re.compile(r"^__VW_SECRET_[0-9a-f]{12}__$")
 
 
+def _dict_tools(raw):
+    """v0.2.4: handlers return JSON strings; parse back to dicts for tests."""
+    import json as _json
+    def wrap(handler):
+        def inner(args, **kw):
+            r = handler(args, **kw)
+            return _json.loads(r) if isinstance(r, str) else r
+        return inner
+    return {k: wrap(h) for k, h in raw.items()}
+
+
 def test_status_tool(auth_manager, plugin_config, registry, tools_by_name):
     res = tools_by_name["vaultwarden_status"]({})
     assert "error" not in res
@@ -147,7 +158,7 @@ def test_direct_retrieval_escape_hatch(bw_cli, registry):
     mgr.ensure_authenticated()
     # v0.1.5 (FAIL-2): get_tools yields (schema_dict, handler) tuples; dict()
     # cannot key by dicts -> build the map by tool name instead.
-    tools = {s["name"]: h for s, h in get_tools(mgr, cfg, registry)}
+    tools = _dict_tools({s["name"]: h for s, h in get_tools(mgr, cfg, registry)})
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
     assert res.get("direct_value") == "sup3r-s3cret-pg!"

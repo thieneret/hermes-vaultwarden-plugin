@@ -14,6 +14,17 @@ from vaultwarden.tests.conftest import make_config
 
 
 # --------------------------------------------------------------- BUG-1/2
+def _dict_tools(raw):
+    """v0.2.4: handlers return JSON strings; parse back to dicts for tests."""
+    import json as _json
+    def wrap(handler):
+        def inner(args, **kw):
+            r = handler(args, **kw)
+            return _json.loads(r) if isinstance(r, str) else r
+        return inner
+    return {k: wrap(h) for k, h in raw.items()}
+
+
 def test_generate_password_uses_flag_syntax(monkeypatch):
     """bw generate <len> --uppercase --lowercase --number --special (no 1/0)."""
     from vaultwarden.auth import AuthManager
@@ -31,7 +42,7 @@ def test_generate_password_uses_flag_syntax(monkeypatch):
     auth = AuthManager.__new__(AuthManager)          # skip real init
     auth._bw = FakeBw()                              # noqa: SLF001
     auth.run_with_recovery = lambda fn: fn("sess")   # type: ignore[attr-defined]
-    tools = {s["name"]: h for s, h in get_tools(auth, cfg, PlaceholderRegistry())}
+    tools = _dict_tools({s["name"]: h for s, h in get_tools(auth, cfg, PlaceholderRegistry())})
 
     res = tools["vaultwarden_generate_password"]({"mode": "password", "length": 20})
     assert res["generated"] == "genpw"
@@ -83,8 +94,8 @@ def test_list_folder_id_uses_folderid_flag(bw_cli, appdata, monkeypatch):
     cfg = make_config()
     auth = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
     auth.ensure_authenticated()
-    tools = {s["name"]: h for s, h in
-             get_tools(auth, cfg, PlaceholderRegistry())}
+    tools = _dict_tools({s["name"]: h for s, h in
+             get_tools(auth, cfg, PlaceholderRegistry())})
 
     res = tools["vaultwarden_list"]({"folder_id": "f1"})
     assert seen[-1] == ["--folderid", "f1"]           # exact flag form
@@ -125,8 +136,8 @@ def test_search_uses_native_search_flag(bw_cli, monkeypatch):
     cfg = make_config()
     auth = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
     auth.ensure_authenticated()
-    tools = {s["name"]: h for s, h in
-             get_tools(auth, cfg, PlaceholderRegistry())}
+    tools = _dict_tools({s["name"]: h for s, h in
+             get_tools(auth, cfg, PlaceholderRegistry())})
 
     res = tools["vaultwarden_search"]({"query": "github"})
     assert seen[-1] == ["--search", "github"]         # native path used
