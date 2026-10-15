@@ -76,12 +76,7 @@ def _as_int(value: Any, default: int) -> int:
 
 
 def _extract_section(source: Any) -> dict:
-    """Extract plugin config using ONLY the Hermes-native get_config() API.
-
-    Since v0.2.0: No fallback to config.yaml file reading. The plugin
-    relies entirely on PluginContext.get_config() which reads from
-    plugins.entries.<plugin_id>.settings.<key>.
-    """
+    """Extract plugin config — tries Hermes API first, falls back to direct YAML read."""
     if source is None:
         return {}
 
@@ -96,7 +91,51 @@ def _extract_section(source: Any) -> dict:
                 continue
             if value is not None:
                 result[key] = value
-        return result
+        if result:
+            return result
+
+    # FALLBACK 1: read_user_config_raw() — Hermes native raw YAML reader
+    try:
+        from hermes_cli.config import read_user_config_raw
+        data = read_user_config_raw()
+        if data:
+            entry = data.get("plugins", {}).get("entries", {}).get("vaultwarden", {})
+            section = entry.get("settings") or entry.get("config") or {}
+            if section:
+                log.warning(
+                    "Fallback 1: read %d keys from plugins.entries.vaultwarden.settings "
+                    "via read_user_config_raw().", len(section))
+                return section
+            log.warning("Fallback 1: read_user_config_raw() loaded but "
+                        "plugins.entries.vaultwarden is empty. "
+                        "plugins keys: %s", list(data.get("plugins", {}).keys()))
+        else:
+            log.warning("Fallback 1: read_user_config_raw() returned empty dict.")
+    except Exception as exc:
+        log.warning("Fallback 1 failed: %s: %s", type(exc).__name__, exc)
+
+    # FALLBACK 2: Direct YAML file read using HERMES_HOME
+    try:
+        import os
+        from pathlib import Path
+        hermes_home = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        config_path = Path(hermes_home) / "config.yaml"
+        log.warning("Fallback 2: trying direct read from %s (exists=%s)",
+                    config_path, config_path.exists())
+        if config_path.exists():
+            import yaml
+            with open(config_path, encoding="utf-8-sig") as f:
+                data = yaml.safe_load(f) or {}
+            entry = data.get("plugins", {}).get("entries", {}).get("vaultwarden", {})
+            section = entry.get("settings") or entry.get("config") or {}
+            if section:
+                log.warning("Fallback 2: read %d keys directly from %s.",
+                            len(section), config_path)
+                return section
+            log.warning("Fallback 2: file loaded but vaultwarden entry empty. "
+                        "Top keys: %s", list(data.keys())[:15])
+    except Exception as exc:
+        log.warning("Fallback 2 failed: %s: %s", type(exc).__name__, exc)
 
     # Object-style contexts (.config / .plugin_config)
     for attr in ("config", "plugin_config"):
