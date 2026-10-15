@@ -32,7 +32,7 @@ def test_get_config_api_path():
     assert cfg.enabled is True and cfg.server_url == "https://x"
 
 
-def test_defaults_when_no_settings():
+def test_defaults_when_no_settings(no_config_fallback):
     cfg = load_config(FakePluginContext({}), env={})
     assert cfg.enabled is False
     assert cfg.allow_write is False
@@ -70,7 +70,7 @@ def test_unsupported_object_raises_config_error():
         load_config(NoConfigApi(), env={})
 
 
-def test_resolve_secret_uses_snapshot_not_os_environ(monkeypatch):
+def test_resolve_secret_uses_snapshot_not_os_environ(monkeypatch, no_config_fallback):
     monkeypatch.delenv("VW_CLIENT_SECRET", raising=False)
     cfg = load_config(FakePluginContext({}),
                       env={"VW_CLIENT_SECRET": "from-dot-env"})
@@ -79,7 +79,7 @@ def test_resolve_secret_uses_snapshot_not_os_environ(monkeypatch):
         cfg.resolve_secret("MISSING_VAR")
 
 
-def test_appdata_dir_default_and_override(tmp_path):
+def test_appdata_dir_default_and_override(tmp_path, no_config_fallback):
     cfg = load_config(FakePluginContext({}), env={"HERMES_HOME": str(tmp_path)})
     assert cfg.appdata_dir() == tmp_path / "plugins" / "vaultwarden" / ".bw-data"
 
