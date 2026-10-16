@@ -1,48 +1,60 @@
-# vaultwarden/tests/test_version_headers.py — v0.2.1
-"""v0.2.1 cleanup tests: version headers + direct ctx passing."""
+# vaultwarden/tests/test_version_headers.py — v0.2.7
+"""Cleanup tests: version headers + direct ctx passing (updated for v0.2.7)."""
 from __future__ import annotations
 
 
 def test_version_headers():
-    """Verify all plugin modules have version header on first line."""
+    """Verify all modified files have their current release version header."""
     import vaultwarden.config
-    import vaultwarden
-
-    config_path = vaultwarden.config.__file__
-    init_path = vaultwarden.__file__
-
-    with open(config_path, 'r') as f:
-        first_line = f.readline().strip()
-        assert 'v0.2.1' in first_line, f"config.py missing version header: {first_line}"
-
-    with open(init_path, 'r') as f:
-        first_line = f.readline().strip()
-        assert 'v0.2.1' in first_line, f"__init__.py missing version header: {first_line}"
-
-
-def test_modified_files_have_version_header_comment():
-    """Every modified .py file must start with a `# <path> — v0.2.1` comment."""
     import vaultwarden
     from pathlib import Path
 
     pkg_dir = Path(vaultwarden.__file__).resolve().parent
-    modified = ["__init__.py", "config.py"]
-    for name in modified:
+    expected_versions = {
+        "__init__.py": "v0.2.3",
+        "config.py": "v0.2.3",
+        "hooks.py": "v0.2.3",
+        "auth.py": "v0.2.7",
+        "tools.py": "v0.2.7",
+        "schemas.py": "v0.2.6",
+    }
+    for name, expected in expected_versions.items():
+        path = pkg_dir / name
+        with open(path, 'r') as f:
+            first_line = f.readline().strip()
+        assert expected in first_line, f"{name} missing version header: {first_line}"
+
+
+def test_modified_files_have_version_header_comment():
+    """Every modified .py file must start with a `# <path> — vX.Y.Z` comment."""
+    import vaultwarden
+    from pathlib import Path
+
+    pkg_dir = Path(vaultwarden.__file__).resolve().parent
+    expected_versions = {
+        "__init__.py": "v0.2.3",
+        "config.py": "v0.2.3",
+        "hooks.py": "v0.2.3",
+        "auth.py": "v0.2.7",
+        "tools.py": "v0.2.7",
+        "schemas.py": "v0.2.6",
+    }
+    for name, expected in expected_versions.items():
         path = pkg_dir / name
         with open(path, 'r') as f:
             first_line = f.readline().rstrip("\n")
         assert first_line.startswith("#"), f"{name}: first line is not a comment: {first_line!r}"
-        assert "v0.2.1" in first_line, f"{name}: missing v0.2.1 header: {first_line!r}"
+        assert expected in first_line, f"{name}: missing {expected} header: {first_line!r}"
 
 
 def test_plugin_yaml_version():
-    """plugin.yaml must declare version 0.2.1 with author thieneret."""
+    """plugin.yaml must declare version 0.2.7 with author thieneret."""
     import vaultwarden
     from pathlib import Path
 
     yaml_path = Path(vaultwarden.__file__).resolve().parent / "plugin.yaml"
     text = yaml_path.read_text()
-    assert "version: 0.2.1" in text
+    assert "version: 0.2.7" in text
     assert "author: thieneret" in text
 
 

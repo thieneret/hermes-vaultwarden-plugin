@@ -1,8 +1,10 @@
+# vaultwarden/tools.py — v0.2.7
 """Tool handlers for the 9 vaultwarden_* tools (plan §8).
 
 ``get_tools(auth, config, registry)`` yields (schema, handler) pairs.
-Handlers return JSON-serialisable dicts; on failure they return the standard
-error envelope {"error", "error_code", "recoverable", "suggestion"}.
+v0.2.4: Handlers return JSON strings (Hermes tool_call requires str);
+on failure they return the standard error envelope serialized to JSON:
+{"error", "error_code", "recoverable", "suggestion"}.
 
 Hard rule: no handler ever returns a stored secret value. The single
 exception is vaultwarden_generate_password (explicitly by design) and
@@ -12,6 +14,7 @@ vaultwarden_get_secret_ref when allow_direct_secret_retrieval=true
 from __future__ import annotations
 
 import fnmatch
+import json
 from typing import Any, Callable
 
 from . import errors, schemas
@@ -22,7 +25,7 @@ from .security import get_logger, get_redacting_filter
 
 log = get_logger("tools")
 
-Handler = Callable[..., dict]
+Handler = Callable[..., str]
 
 
 # --------------------------------------------------------------- helpers
@@ -77,15 +80,43 @@ def _require_write(config: PluginConfig) -> None:
             "Write operations are disabled for the Vaultwarden plugin.")
 
 
-def _guard(fn: Callable[[], dict]) -> dict:
+def _collect_secret_strings(obj: Any) -> list[str]:
+    """Recursively extract all non-empty string values from a nested structure.
+
+    v0.2.3 (SECURITY FIX): h_store previously only registered `password` with
+    the RedactingFilter and h_update registered nothing at all — secrets in
+    username/uri/notes/custom_fields leaked into logs. This helper collects
+    EVERY string value so write handlers can redact them all during the
+    operation.
+    """
+    results: list[str] = []
+    if isinstance(obj, str) and obj.strip():
+        results.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            results.extend(_collect_secret_strings(v))
+    elif isinstance(obj, list):
+        for v in obj:
+            results.extend(_collect_secret_strings(v))
+    return results
+
+
+def _guard(fn: Callable[[], dict]) -> str:
+    """Execute handler and return JSON string.
+
+    v0.2.4 (BUGFIX): Hermes Agent tool_call requires handlers to return str.
+    Returning dict causes 'unsupported result type: dict' for every tool.
+    JSON serialization with default=str handles datetime/Path/enum values safely.
+    """
     try:
-        return fn()
+        result = fn()
+        return json.dumps(result, ensure_ascii=False, default=str)
     except errors.VaultwardenError as exc:
         log.debug("tool error: %s (%s)", exc.message, exc.code)
-        return exc.to_dict()
+        return json.dumps(exc.to_dict(), ensure_ascii=False, default=str)
     except Exception as exc:  # pragma: no cover - defensive
         log.exception("unexpected tool failure")
-        return errors.error_response(exc)
+        return json.dumps(errors.error_response(exc), ensure_ascii=False, default=str)
 
 
 # --------------------------------------------------------------- handlers
@@ -94,20 +125,20 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     """Yield (schema, handler) for every enabled tool."""
 
     # ------------------------------------------------------------ status
-    def h_status(args: dict, **kw: Any) -> dict:
+    def h_status(args: dict, **kw: Any) -> str:
         return _guard(lambda: {"status": auth.status_snapshot(),
                                "placeholders_active": len(registry.active_tokens())})
 
     yield schemas.VAULTWARDEN_STATUS, h_status
 
     # ---------------------------------------------------------------- sync
-    def h_sync(args: dict, **kw: Any) -> dict:
+    def h_sync(args: dict, **kw: Any) -> str:
         return _guard(lambda: auth.sync(force=bool(args.get("force"))))
 
     yield schemas.VAULTWARDEN_SYNC, h_sync
 
     # ---------------------------------------------------------------- list
-    def h_list(args: dict, **kw: Any) -> dict:
+    def h_list(args: dict, **kw: Any) -> str:
         def run():
             # BUG-3 fix: bw list items supports only --folderid/--collectionid/
             # --search; there is NO --filter-type flag. Type filtering is done
@@ -130,7 +161,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     yield schemas.VAULTWARDEN_LIST, h_list
 
     # -------------------------------------------------------------- search
-    def h_search(args: dict, **kw: Any) -> dict:
+    def h_search(args: dict, **kw: Any) -> str:
         def run():
             query = str(args["query"])
             field = args.get("field")
@@ -166,7 +197,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     yield schemas.VAULTWARDEN_SEARCH, h_search
 
     # ------------------------------------------------------- get_secret_ref
-    def h_get_secret_ref(args: dict, **kw: Any) -> dict:
+    def h_get_secret_ref(args: dict, **kw: Any) -> str:
         def run():
             item_id = str(args["item_id"])
             field_name = str(args["field"])
@@ -194,11 +225,11 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     yield schemas.VAULTWARDEN_GET_SECRET_REF, h_get_secret_ref
 
     # --------------------------------------------------------------- store
-    def h_store(args: dict, **kw: Any) -> dict:
+    def h_store(args: dict, **kw: Any) -> str:
         def run():
             _require_write(config)
             redactor = get_redacting_filter()
-            tracked = [str(args[k]) for k in ("password",) if args.get(k)]
+            tracked = _collect_secret_strings(args)
             for t in tracked:
                 redactor.register_secret(t)
             try:
@@ -215,22 +246,30 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     yield schemas.VAULTWARDEN_STORE, h_store
 
     # -------------------------------------------------------------- update
-    def h_update(args: dict, **kw: Any) -> dict:
+    def h_update(args: dict, **kw: Any) -> str:
         def run():
             _require_write(config)
-            item_id = str(args["item_id"])
-            current = auth.get_item(item_id)
-            merged = _apply_updates(current, args)
-            updated = auth.edit_item(merged)
-            log.info("Updated vault item %s.", item_id)
-            return {"updated": True, "id": updated.get("id") or item_id,
-                    "item": _metadata(updated)}
+            redactor = get_redacting_filter()
+            tracked = _collect_secret_strings(args)
+            for t in tracked:
+                redactor.register_secret(t)
+            try:
+                item_id = str(args["item_id"])
+                current = auth.get_item(item_id)
+                merged = _apply_updates(current, args)
+                updated = auth.edit_item(merged)
+                log.info("Updated vault item %s.", item_id)
+                return {"updated": True, "id": updated.get("id") or item_id,
+                        "item": _metadata(updated)}
+            finally:
+                for t in tracked:
+                    redactor.forget_secret(t)
         return _guard(run)
 
     yield schemas.VAULTWARDEN_UPDATE, h_update
 
     # -------------------------------------------------------------- delete
-    def h_delete(args: dict, **kw: Any) -> dict:
+    def h_delete(args: dict, **kw: Any) -> str:
         def run():
             _require_write(config)
             if not args.get("confirm"):
@@ -250,7 +289,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     yield schemas.VAULTWARDEN_DELETE, h_delete
 
     # ----------------------------------------------------- generate_password
-    def h_generate(args: dict, **kw: Any) -> dict:
+    def h_generate(args: dict, **kw: Any) -> str:
         def run():
             # BUG-2 fix: no _require_write() here — generation does not touch
             # the vault (plan §8), so it works with allow_write=false.
@@ -307,9 +346,8 @@ def _build_item(args: dict) -> dict:
         login["username"] = args["username"]
     if args.get("password"):
         login["password"] = args["password"]
-        login["passwordRevisionDate"] = None
     if args.get("uri"):
-        login["uris"] = [{"uri": args["uri"], "match": None}]
+        login["uris"] = [{"uri": args["uri"]}]
     if login:
         item["login"] = login
     fields = []
@@ -333,9 +371,8 @@ def _apply_updates(current: dict, args: dict) -> dict:
         login["username"] = args["username"]
     if args.get("password"):
         login["password"] = args["password"]
-        login["passwordRevisionDate"] = None
     if args.get("uri"):
-        login["uris"] = [{"uri": args["uri"], "match": None}]
+        login["uris"] = [{"uri": args["uri"]}]
     if login:
         merged["login"] = login
     if args.get("custom_fields") is not None:

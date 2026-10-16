@@ -1,3 +1,4 @@
+# vaultwarden/auth.py — v0.2.7
 """Auth Manager + Session Store (plan §4, §5).
 
 State machine:
@@ -197,13 +198,11 @@ class AuthManager:
 
             # Step 2: does the existing session match server AND account?
             is_correct_server = (current_server == expected_server)
-            # v0.1.9 account verification: bw status reports userId "<uuid>",
-            # config carries client_id "user.<uuid>". A profile that does not
-            # report any userId at all is treated as "unknown" rather than a
-            # mismatch (defensive against CLI variants); an *explicitly
-            # different* userId always forces the Case B logout + re-auth.
+            # v0.2.2 (SECURITY FIX): strict fail-closed account verification.
+            # A missing or empty userId is now treated as a MISMATCH, forcing
+            # logout + re-auth instead of blindly adopting an unknown session.
             is_correct_account = (
-                current_user_id == expected_user_id or not current_user_id)
+                bool(current_user_id) and current_user_id == expected_user_id)
             needs_reauth = not (is_correct_server and is_correct_account)
 
             # Case C: already authenticated with the correct session.
@@ -270,12 +269,12 @@ class AuthManager:
     def _adopt_existing_unlocked_session(self) -> None:
         """Case C/unlocked: bw keeps its own session key; we never stored one
         in memory (e.g. after a plugin restart). Re-unlock locally so tool
-        calls keep flowing — deterministic and safe (auto_unlock path)."""
+        calls keep flowing — deterministic and safe."""
         if self._session_key:
             return  # our remembered key is still valid
-        if self._config.auto_unlock:
-            log.info("Adopting existing unlocked profile via local re-unlock.")
-            self._do_unlock()
+        # v0.2.3: always re-unlock — auto_unlock toggle removed.
+        log.info("Adopting existing unlocked profile via local re-unlock.")
+        self._do_unlock()
 
     def _maybe_initial_sync(self) -> None:
         """Best-effort first sync after authentication (auto_sync only)."""
@@ -303,8 +302,8 @@ class AuthManager:
         log.info("bw apikey login succeeded (client id %s).", self._client_id)
 
     def _do_unlock(self) -> None:
-        if not self._config.auto_unlock:
-            return
+        # v0.2.3 (BREAKING): auto_unlock toggle removed — the vault is ALWAYS
+        # auto-unlocked with the master password. No early-return guard.
         try:
             key = self._bw.unlock_passwordenv(self._master_password)
         except errors.VaultwardenError as exc:
@@ -393,16 +392,18 @@ class AuthManager:
         from .bw_cli import encode_item
 
         def _do(session: str):
-            blob = encode_item(session, item, self._bw)
+            blob = encode_item(item)
             return self._bw.create_item(session, blob)
         return self.run_with_recovery(_do)
 
     def edit_item(self, item: dict) -> dict:
         from .bw_cli import encode_item
 
+        item_id = str(item.get("id") or "")
+
         def _do(session: str):
-            blob = encode_item(session, item, self._bw)
-            return self._bw.edit_item(session, blob)
+            blob = encode_item(item)
+            return self._bw.edit_item(session, item_id, blob)
         return self.run_with_recovery(_do)
 
     def delete_item(self, item_id: str, permanent: bool = False) -> str:
@@ -453,9 +454,12 @@ class AuthManager:
             "session_timeout_seconds": self._config.session_timeout_seconds,
             "server_configured": self._config.server_url,
             "server_status": {
-                # v0.1.9: real bw status payload reports the session under
-                # "status"; fall back to the legacy "state" key if present.
-                "state": bw_status.get("status") or bw_status.get("state"),
+                # v0.2.6 (BUGFIX): use internal session state for the lock indicator.
+                # bw status is called WITHOUT BW_SESSION (session key lives in plugin
+                # memory only, by design), so it always reports "locked" even when
+                # the plugin holds an active session. The internal state is authoritative.
+                "state": "unlocked" if has_session else (
+                    bw_status.get("status") or bw_status.get("state") or "unknown"),
                 "serverUrl": bw_status.get("serverUrl"),
                 "userEmail": bw_status.get("userEmail"),
                 "userId": bw_status.get("userId"),

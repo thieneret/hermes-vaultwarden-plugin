@@ -1,4 +1,4 @@
-# vaultwarden/config.py — v0.2.1
+# vaultwarden/config.py — v0.2.3
 """Configuration loading for the Vaultwarden plugin (plan §4, §9).
 
 Layers:
@@ -10,7 +10,7 @@ Layers:
 
 ``load_config`` accepts a Hermes ``PluginContext`` exposing
 ``get_config(key, default)`` — the ONLY supported configuration path
-(since v0.2.0; current version v0.2.1). Object-style contexts with
+(since v0.2.0; current version v0.2.3). Object-style contexts with
 ``.config`` / ``.plugin_config`` attributes are also accepted and
 unwrapped until a ``get_config()`` API is found. There is NO fallback
 to reading config.yaml directly.
@@ -52,10 +52,11 @@ _DEFAULTS: dict[str, Any] = {
     "auto_sync": True,
     "sync_interval_seconds": 300,
     "session_timeout_seconds": 14400,
-    "auto_unlock": True,
     "placeholder_ttl_seconds": 300,
     "max_placeholders": 50,
     "bw_cli_path": "",
+    "terminal_tool_names": [],
+    "terminal_command_keys": [],
 }
 
 
@@ -75,12 +76,7 @@ def _as_int(value: Any, default: int) -> int:
 
 
 def _extract_section(source: Any) -> dict:
-    """Extract plugin config using ONLY the Hermes-native get_config() API.
-
-    Since v0.2.0: No fallback to config.yaml file reading. The plugin
-    relies entirely on PluginContext.get_config() which reads from
-    plugins.entries.<plugin_id>.settings.<key>.
-    """
+    """Extract plugin config — tries Hermes API first, falls back to direct YAML read."""
     if source is None:
         return {}
 
@@ -95,7 +91,51 @@ def _extract_section(source: Any) -> dict:
                 continue
             if value is not None:
                 result[key] = value
-        return result
+        if result:
+            return result
+
+    # FALLBACK 1: read_user_config_raw() — Hermes native raw YAML reader
+    try:
+        from hermes_cli.config import read_user_config_raw
+        data = read_user_config_raw()
+        if data:
+            entry = data.get("plugins", {}).get("entries", {}).get("vaultwarden", {})
+            section = entry.get("settings") or entry.get("config") or {}
+            if section:
+                log.warning(
+                    "Fallback 1: read %d keys from plugins.entries.vaultwarden.settings "
+                    "via read_user_config_raw().", len(section))
+                return section
+            log.warning("Fallback 1: read_user_config_raw() loaded but "
+                        "plugins.entries.vaultwarden is empty. "
+                        "plugins keys: %s", list(data.get("plugins", {}).keys()))
+        else:
+            log.warning("Fallback 1: read_user_config_raw() returned empty dict.")
+    except Exception as exc:
+        log.warning("Fallback 1 failed: %s: %s", type(exc).__name__, exc)
+
+    # FALLBACK 2: Direct YAML file read using HERMES_HOME
+    try:
+        import os
+        from pathlib import Path
+        hermes_home = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        config_path = Path(hermes_home) / "config.yaml"
+        log.warning("Fallback 2: trying direct read from %s (exists=%s)",
+                    config_path, config_path.exists())
+        if config_path.exists():
+            import yaml
+            with open(config_path, encoding="utf-8-sig") as f:
+                data = yaml.safe_load(f) or {}
+            entry = data.get("plugins", {}).get("entries", {}).get("vaultwarden", {})
+            section = entry.get("settings") or entry.get("config") or {}
+            if section:
+                log.warning("Fallback 2: read %d keys directly from %s.",
+                            len(section), config_path)
+                return section
+            log.warning("Fallback 2: file loaded but vaultwarden entry empty. "
+                        "Top keys: %s", list(data.keys())[:15])
+    except Exception as exc:
+        log.warning("Fallback 2 failed: %s: %s", type(exc).__name__, exc)
 
     # Object-style contexts (.config / .plugin_config)
     for attr in ("config", "plugin_config"):
@@ -166,10 +206,6 @@ class PluginConfig:
         return _as_int(self._raw("session_timeout_seconds"), 14400)
 
     @property
-    def auto_unlock(self) -> bool:
-        return _as_bool(self._raw("auto_unlock"))
-
-    @property
     def placeholder_ttl_seconds(self) -> int:
         return _as_int(self._raw("placeholder_ttl_seconds"), 300)
 
@@ -180,6 +216,22 @@ class PluginConfig:
     @property
     def bw_cli_path(self) -> str:
         return str(self.env_snapshot.get("BW_CLI_PATH") or self._raw("bw_cli_path") or "")
+
+    # v0.2.2 (BUGFIX): configurable terminal tool names / command keys.
+    # Empty list => hooks.py falls back to its built-in defaults.
+    @property
+    def terminal_tool_names(self) -> list[str]:
+        raw = self._raw("terminal_tool_names")
+        if isinstance(raw, list):
+            return [str(t) for t in raw]
+        return []
+
+    @property
+    def terminal_command_keys(self) -> list[str]:
+        raw = self._raw("terminal_command_keys")
+        if isinstance(raw, list):
+            return [str(k) for k in raw]
+        return []
 
     # --- resolved secret values (memory only!) --------------------------
     def resolve_secret(self, var_name: str, *, required: bool = True) -> str:
@@ -228,6 +280,10 @@ class PluginConfig:
         if not self.client_id.startswith("user."):
             raise errors.ConfigError(
                 "client_id must be an API-key client id of the form 'user.<uuid>'.")
+        # v0.2.3: master_password_env keeps its sensible default
+        # ('VW_MASTER_PASSWORD') and the property fallback — no name check here.
+        # The master password VALUE is enforced at resolve_secret(required=True)
+        # time during unlock, which fails closed if it is missing.
         if self.placeholder_ttl_seconds <= 0:
             raise errors.ConfigError("placeholder_ttl_seconds must be > 0.")
         if self.max_placeholders <= 0:
@@ -237,5 +293,11 @@ class PluginConfig:
 def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> PluginConfig:
     """Build a PluginConfig from a Hermes PluginContext (see module doc)."""
     section = _extract_section(source)
+    if not section:
+        log.warning(
+            "Vaultwarden plugin config is EMPTY: no settings found via "
+            "PluginContext.get_config(). Add your configuration to "
+            "plugins.entries.vaultwarden.settings in config.yaml. "
+            "Plugin will use defaults (enabled=false) and will not load.")
     snapshot = dict(os.environ) if env is None else dict(env)
     return PluginConfig(section=section, env_snapshot=snapshot)

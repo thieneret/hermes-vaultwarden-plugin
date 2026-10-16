@@ -32,7 +32,7 @@ def test_get_config_api_path():
     assert cfg.enabled is True and cfg.server_url == "https://x"
 
 
-def test_defaults_when_no_settings():
+def test_defaults_when_no_settings(no_config_fallback):
     cfg = load_config(FakePluginContext({}), env={})
     assert cfg.enabled is False
     assert cfg.allow_write is False
@@ -41,7 +41,8 @@ def test_defaults_when_no_settings():
     assert cfg.auto_sync is True
     assert cfg.sync_interval_seconds == 300
     assert cfg.session_timeout_seconds == 14400
-    assert cfg.auto_unlock is True
+    # v0.2.3 (BREAKING): auto_unlock removed — vault is ALWAYS auto-unlocked.
+    assert not hasattr(cfg, "auto_unlock")
     assert cfg.placeholder_ttl_seconds == 300
     assert cfg.max_placeholders == 50
     assert cfg.client_secret_env_name == "VW_CLIENT_SECRET"
@@ -69,7 +70,7 @@ def test_unsupported_object_raises_config_error():
         load_config(NoConfigApi(), env={})
 
 
-def test_resolve_secret_uses_snapshot_not_os_environ(monkeypatch):
+def test_resolve_secret_uses_snapshot_not_os_environ(monkeypatch, no_config_fallback):
     monkeypatch.delenv("VW_CLIENT_SECRET", raising=False)
     cfg = load_config(FakePluginContext({}),
                       env={"VW_CLIENT_SECRET": "from-dot-env"})
@@ -78,7 +79,7 @@ def test_resolve_secret_uses_snapshot_not_os_environ(monkeypatch):
         cfg.resolve_secret("MISSING_VAR")
 
 
-def test_appdata_dir_default_and_override(tmp_path):
+def test_appdata_dir_default_and_override(tmp_path, no_config_fallback):
     cfg = load_config(FakePluginContext({}), env={"HERMES_HOME": str(tmp_path)})
     assert cfg.appdata_dir() == tmp_path / "plugins" / "vaultwarden" / ".bw-data"
 
@@ -99,6 +100,17 @@ def test_validate_catches_missing_fields():
     cfg3 = load_config(FakePluginContext({
         "enabled": True, "server_url": "https://v", "client_id": "user.abc"}), env={})
     cfg3.validate()  # ok
+
+
+def test_validate_accepts_empty_master_password_env():
+    # v0.2.3: master_password_env keeps a sensible default (VW_MASTER_PASSWORD);
+    # an explicit empty value falls back to the default and must NOT fail
+    # validation. The master password VALUE is enforced at resolve_secret() time.
+    cfg = load_config(FakePluginContext({
+        "enabled": True, "server_url": "https://v", "client_id": "user.abc",
+        "master_password_env": ""}), env={})
+    cfg.validate()  # ok
+    assert cfg.master_password_env_name == "VW_MASTER_PASSWORD"
 
 
 def test_bool_string_coercion():

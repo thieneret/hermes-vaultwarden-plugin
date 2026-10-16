@@ -73,18 +73,16 @@ def test_encode_pipeline(bw_cli, appdata):
     assert base64.b64decode(enc).decode() == "hello world"
 
 
-def test_encode_item_encodes_all_strings(bw_cli, appdata, monkeypatch):
-    calls = []
-    orig = bw_cli.encode
-    monkeypatch.setattr(bw_cli, "encode",
-                        lambda s, v: calls.append(v) or orig(s, v))
-    blob = encode_item("sess", {"name": "N", "login": {"username": "u", "password": "p"},
-                                "type": 1}, bw_cli)
-    import json
-    parsed = json.loads(blob)
-    assert parsed["name"] != "N"          # it's base64 now
-    assert sorted(calls) == ["N", "p", "u"]
-    assert parsed["type"] == 1            # ints untouched
+def test_encode_item_encodes_entire_json(bw_cli, appdata):
+    # v0.2.7: encode_item now base64-encodes the WHOLE JSON object with the
+    # Python stdlib (no per-field double encoding, no bw subprocess needed).
+    import base64, json
+    item = {"name": "N", "login": {"username": "u", "password": "p"}, "type": 1}
+    blob = encode_item(item)
+    parsed = json.loads(base64.b64decode(blob).decode("utf-8"))
+    assert parsed["name"] == "N"            # raw values, NOT field-wise base64
+    assert parsed["login"]["password"] == "p"
+    assert parsed["type"] == 1              # ints untouched
 
 
 def test_locked_session_marker_maps_to_session_error(bw_cli, appdata, monkeypatch):

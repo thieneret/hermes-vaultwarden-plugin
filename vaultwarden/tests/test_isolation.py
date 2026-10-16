@@ -13,6 +13,17 @@ from vaultwarden.bw_cli import BwCli
 from vaultwarden.hooks import make_placeholder_resolver
 
 
+def _dict_tools(raw):
+    """v0.2.4: handlers return JSON strings; parse back to dicts for tests."""
+    import json as _json
+    def wrap(handler):
+        def inner(args, **kw):
+            r = handler(args, **kw)
+            return _json.loads(r) if isinstance(r, str) else r
+        return inner
+    return {k: wrap(h) for k, h in raw.items()}
+
+
 def test_appdata_dir_in_every_subprocess(fake_bw, tmp_path):
     """Run EVERY supported command and assert the env var reached the child."""
     appdata = tmp_path / "bw-state"
@@ -134,7 +145,7 @@ def test_register_cleanup_removes_bootstrap_env(monkeypatch, tmp_path, fake_bw):
     # the lazy ensure_authenticated() and the vault comes up unlocked.
     status = next(t for t in ctx.tools if t["name"] == "vaultwarden_status")
     assert status["check_fn"]() is True          # lazy auth kicks in here
-    res = status["handler"]({})
+    res = _dict_tools({"status": status["handler"]})["status"]({})
     assert res["status"]["auth_state"] == "unlocked"
     bwdata = tmp_path / "plugins" / "vaultwarden" / ".bw-data"
     assert bwdata.exists() and stat.S_IMODE(os.stat(bwdata).st_mode) == 0o700

@@ -1,5 +1,5 @@
-# vaultwarden/__init__.py — v0.2.1
-"""Hermes Agent — Vaultwarden secrets management plugin (v0.2.1).
+# vaultwarden/__init__.py — v0.2.3
+"""Hermes Agent — Vaultwarden secrets management plugin (v0.2.3).
 
 Entry point: ``register(ctx)`` (see plan §4/§12).
 
@@ -149,12 +149,12 @@ def register(ctx: Any) -> bool:
 
     # middleware + hooks (chain-safe resolver is NOT pre_tool_call)
     try:
-        ctx.register_middleware("tool_request", make_placeholder_resolver(auth, registry))
+        ctx.register_middleware("tool_request", make_placeholder_resolver(auth, registry, config))
         log.info("Placeholder resolver middleware registered")
     except AttributeError:
         log.warning("Context lacks register_middleware; placeholder injection OFF.")
     try:
-        ctx.register_hook("post_tool_call", make_post_cleanup_hook(auth, registry))
+        ctx.register_hook("post_tool_call", make_post_cleanup_hook(auth, registry, config))
         ctx.register_hook("on_session_end", make_session_end_hook(auth, registry))
         log.info("Cleanup hooks registered")
     except AttributeError:

@@ -1,33 +1,26 @@
+# vaultwarden/schemas.py — v0.2.6
 """JSON schemas for the 9 vaultwarden_* tools (plan §8).
 
-Handlers receive these as validated ``args`` dicts. None of the schemas
+Handlers receive these as validated `args` dicts. None of the schemas
 accept or return raw secret values except vaultwarden_generate_password,
 which returns a freshly generated password explicitly by design.
 
-Schema key convention (BUG-8 verification note):
-The per-tool JSON Schema lives under the "input_schema" key (Anthropic
-tool-definition style). The Hermes Agent register_tool() source
-(tools/registry.py) is NOT vendored into this repository and could not be
-inspected offline, so compatibility was verified structurally instead:
-
-  * every consumer inside this plugin reads only schema["name"] (and the
-    whole dict is passed through verbatim as ``schema=``);
-  * no code path here depends on the inner key being named
-    "input_schema" vs "parameters".
-
-If a deployed Hermes registry expects OpenAI-style "parameters", rename the
-key in ONE place below or normalise it at registration time in __init__.py
-(e.g. ``schema = {**schema, "parameters": schema["input_schema"]}``).
+Schema key convention (BUG-8 — RESOLVED in v0.2.6):
+The per-tool JSON Schema lives under the "parameters" key (OpenAI
+tool-definition style). The deployed Hermes Agent registry was confirmed
+to expect this key via live `tool_describe` output: when the schemas
+used the Anthropic-style "input_schema" key, every tool showed empty
+properties and required lists. Switched to "parameters" in v0.2.6.
 """
 from __future__ import annotations
 
 ITEM_TYPES = ["login", "note", "card", "identity"]
 SECRET_FIELDS = ["password", "username", "totp", "notes", "uri"]
 
-#: Canonical key holding each tool's JSON Schema. See module docstring
-#: (BUG-8): switch this single constant if the host Hermes build expects
-#: "parameters" instead of the Anthropic-style "input_schema".
-SCHEMA_KEY = "input_schema"
+#: Canonical key holding each tool's JSON Schema. The deployed Hermes Agent
+#: registry expects the OpenAI-style "parameters" key (confirmed via live
+#: tool_describe output — v0.2.6).
+SCHEMA_KEY = "parameters"
 
 VAULTWARDEN_STATUS = {
     "name": "vaultwarden_status",
@@ -35,13 +28,13 @@ VAULTWARDEN_STATUS = {
         "Report Vaultwarden plugin health: auth state machine status, session "
         "activity/age, configured server, isolated appdata dir and write-mode. "
         "Contains no secrets."),
-    "input_schema": {"type": "object", "properties": {}, "required": []},
+    "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
 VAULTWARDEN_SYNC = {
     "name": "vaultwarden_sync",
     "description": "Force a vault sync against the Vaultwarden server.",
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "force": {"type": "boolean",
@@ -56,7 +49,7 @@ VAULTWARDEN_LIST = {
     "description": (
         "List vault items with METADATA ONLY (id, name, type, username hint, "
         "URIs). Passwords and secret fields are never included."),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "type": {"type": "string", "enum": ITEM_TYPES,
@@ -76,7 +69,7 @@ VAULTWARDEN_LIST = {
 VAULTWARDEN_SEARCH = {
     "name": "vaultwarden_search",
     "description": "Search vault items by name/username/uri; returns metadata only.",
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "Search text."},
@@ -96,7 +89,7 @@ VAULTWARDEN_GET_SECRET_REF = {
         "terminal command instead of the real secret; the tool_request "
         "middleware substitutes it at execution time. The secret value is "
         "NEVER returned here."),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "item_id": {"type": "string",
@@ -116,10 +109,12 @@ VAULTWARDEN_STORE = {
     "description": ("Create a new vault item. Requires allow_write=true. "
                     "Secret values passed here go straight into bw via the "
                     "encode pipeline and are redacted from all logs."),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
-            "type": {"type": "string", "enum": ITEM_TYPES},
+            # v0.2.6: "type" is optional — the handler defaults to "login"
+            # via args.get("type", "login").
+            "type": {"type": "string", "enum": ITEM_TYPES, "default": "login"},
             "name": {"type": "string"},
             "username": {"type": "string"},
             "password": {"type": "string"},
@@ -140,7 +135,7 @@ VAULTWARDEN_STORE = {
                 },
             },
         },
-        "required": ["type", "name"],
+        "required": ["name"],
     },
 }
 
@@ -148,7 +143,7 @@ VAULTWARDEN_UPDATE = {
     "name": "vaultwarden_update",
     "description": ("Update an existing item via fetch-modify-save. Requires "
                     "allow_write=true. Omitted fields stay unchanged."),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "item_id": {"type": "string"},
@@ -157,7 +152,7 @@ VAULTWARDEN_UPDATE = {
             "password": {"type": "string"},
             "uri": {"type": "string"},
             "notes": {"type": "string"},
-            "custom_fields": VAULTWARDEN_STORE["input_schema"]["properties"]["custom_fields"],
+            "custom_fields": VAULTWARDEN_STORE["parameters"]["properties"]["custom_fields"],
         },
         "required": ["item_id"],
     },
@@ -168,7 +163,7 @@ VAULTWARDEN_DELETE = {
     "description": ("Delete a vault item. Soft delete by default; permanent "
                     "deletion requires BOTH permanent=true and confirm=true. "
                     "Requires allow_write=true."),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "item_id": {"type": "string"},
@@ -185,20 +180,23 @@ VAULTWARDEN_GENERATE_PASSWORD = {
     "description": ("Generate a strong password or passphrase with bw. The "
                     "ONLY tool that intentionally returns a secret value "
                     "(freshly generated, not read from the vault)."),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "mode": {"type": "string", "enum": ["password", "passphrase"],
                      "default": "password"},
             "length": {"type": "integer", "minimum": 8, "maximum": 128,
+                       "default": 20,
                        "description": "Password length (mode=password)."},
             "uppercase": {"type": "boolean", "default": True},
             "lowercase": {"type": "boolean", "default": True},
             "numbers": {"type": "boolean", "default": True},
             "special": {"type": "boolean", "default": True},
             "words": {"type": "integer", "minimum": 3, "maximum": 20,
+                      "default": 4,
                       "description": "Word count (mode=passphrase)."},
-            "separator": {"type": "string", "description": "Passphrase separator."},
+            "separator": {"type": "string", "default": "-",
+                          "description": "Passphrase separator."},
         },
         "required": [],
     },
