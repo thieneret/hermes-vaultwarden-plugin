@@ -1,6 +1,6 @@
 # vaultwarden/plugin.yaml — v0.2.3
 name: vaultwarden
-version: 0.2.4
+version: 0.2.6
 description: >-
   Vaultwarden secrets management for Hermes Agent via the `bw` CLI.
   Secrets are never exposed to the LLM context: tools return single-use

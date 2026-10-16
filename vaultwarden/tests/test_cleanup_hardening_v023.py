@@ -62,7 +62,7 @@ def test_version_headers_v023():
     expected_versions = {
         "__init__.py": "v0.2.3",
         "config.py":   "v0.2.3",
-        "auth.py":     "v0.2.3",
+        "auth.py":     "v0.2.6",  # bumped in v0.2.6 (status_snapshot BUGFIX)
         "hooks.py":    "v0.2.3",
         "bw_cli.py":   "v0.2.3",
         "tools.py":    "v0.2.4",   # bumped in v0.2.4 (_guard JSON-string fix)

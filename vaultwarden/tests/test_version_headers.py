@@ -1,21 +1,27 @@
-# vaultwarden/tests/test_version_headers.py — v0.2.4
-"""Cleanup tests: version headers + direct ctx passing (updated for v0.2.4)."""
+# vaultwarden/tests/test_version_headers.py — v0.2.6
+"""Cleanup tests: version headers + direct ctx passing (updated for v0.2.6)."""
 from __future__ import annotations
 
 
 def test_version_headers():
-    """Verify all modified files have v0.2.3 version header."""
+    """Verify all modified files have their current release version header."""
     import vaultwarden.config
     import vaultwarden
     from pathlib import Path
 
     pkg_dir = Path(vaultwarden.__file__).resolve().parent
-    modified = ["__init__.py", "config.py", "hooks.py", "auth.py", "tools.py"]
-    for name in modified:
+    expected_versions = {
+        "__init__.py": "v0.2.3",
+        "config.py": "v0.2.3",
+        "hooks.py": "v0.2.3",
+        "auth.py": "v0.2.6",
+        "tools.py": "v0.2.4",
+        "schemas.py": "v0.2.6",
+    }
+    for name, expected in expected_versions.items():
         path = pkg_dir / name
         with open(path, 'r') as f:
             first_line = f.readline().strip()
-        expected = 'v0.2.4' if name == "tools.py" else 'v0.2.3'
         assert expected in first_line, f"{name} missing version header: {first_line}"
 
 
@@ -25,24 +31,30 @@ def test_modified_files_have_version_header_comment():
     from pathlib import Path
 
     pkg_dir = Path(vaultwarden.__file__).resolve().parent
-    modified = ["__init__.py", "config.py", "hooks.py", "auth.py", "tools.py"]
-    for name in modified:
+    expected_versions = {
+        "__init__.py": "v0.2.3",
+        "config.py": "v0.2.3",
+        "hooks.py": "v0.2.3",
+        "auth.py": "v0.2.6",
+        "tools.py": "v0.2.4",
+        "schemas.py": "v0.2.6",
+    }
+    for name, expected in expected_versions.items():
         path = pkg_dir / name
         with open(path, 'r') as f:
             first_line = f.readline().rstrip("\n")
         assert first_line.startswith("#"), f"{name}: first line is not a comment: {first_line!r}"
-        expected = "v0.2.4" if name == "tools.py" else "v0.2.3"
         assert expected in first_line, f"{name}: missing {expected} header: {first_line!r}"
 
 
 def test_plugin_yaml_version():
-    """plugin.yaml must declare version 0.2.4 with author thieneret."""
+    """plugin.yaml must declare version 0.2.6 with author thieneret."""
     import vaultwarden
     from pathlib import Path
 
     yaml_path = Path(vaultwarden.__file__).resolve().parent / "plugin.yaml"
     text = yaml_path.read_text()
-    assert "version: 0.2.4" in text
+    assert "version: 0.2.6" in text
     assert "author: thieneret" in text
 
 
