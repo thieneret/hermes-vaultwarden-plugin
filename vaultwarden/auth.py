@@ -1,4 +1,4 @@
-# vaultwarden/auth.py — v0.2.3
+# vaultwarden/auth.py — v0.2.6
 """Auth Manager + Session Store (plan §4, §5).
 
 State machine:
@@ -452,9 +452,12 @@ class AuthManager:
             "session_timeout_seconds": self._config.session_timeout_seconds,
             "server_configured": self._config.server_url,
             "server_status": {
-                # v0.1.9: real bw status payload reports the session under
-                # "status"; fall back to the legacy "state" key if present.
-                "state": bw_status.get("status") or bw_status.get("state"),
+                # v0.2.6 (BUGFIX): use internal session state for the lock indicator.
+                # bw status is called WITHOUT BW_SESSION (session key lives in plugin
+                # memory only, by design), so it always reports "locked" even when
+                # the plugin holds an active session. The internal state is authoritative.
+                "state": "unlocked" if has_session else (
+                    bw_status.get("status") or bw_status.get("state") or "unknown"),
                 "serverUrl": bw_status.get("serverUrl"),
                 "userEmail": bw_status.get("userEmail"),
                 "userId": bw_status.get("userId"),

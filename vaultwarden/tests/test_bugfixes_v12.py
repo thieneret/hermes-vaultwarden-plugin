@@ -158,7 +158,7 @@ def test_search_uses_native_search_flag(bw_cli, monkeypatch):
 # --------------------------------------------------------------- BUG-6
 def test_list_limit_schema_default():
     from vaultwarden import schemas
-    limit_prop = (schemas.VAULTWARDEN_LIST["input_schema"]
+    limit_prop = (schemas.VAULTWARDEN_LIST["parameters"]
                   ["properties"]["limit"])
     assert limit_prop.get("default") == 100
 
