@@ -1,4 +1,4 @@
-# vaultwarden/tools.py — v0.2.4
+# vaultwarden/tools.py — v0.2.7
 """Tool handlers for the 9 vaultwarden_* tools (plan §8).
 
 ``get_tools(auth, config, registry)`` yields (schema, handler) pairs.
@@ -346,9 +346,8 @@ def _build_item(args: dict) -> dict:
         login["username"] = args["username"]
     if args.get("password"):
         login["password"] = args["password"]
-        login["passwordRevisionDate"] = None
     if args.get("uri"):
-        login["uris"] = [{"uri": args["uri"], "match": None}]
+        login["uris"] = [{"uri": args["uri"]}]
     if login:
         item["login"] = login
     fields = []
@@ -372,9 +371,8 @@ def _apply_updates(current: dict, args: dict) -> dict:
         login["username"] = args["username"]
     if args.get("password"):
         login["password"] = args["password"]
-        login["passwordRevisionDate"] = None
     if args.get("uri"):
-        login["uris"] = [{"uri": args["uri"], "match": None}]
+        login["uris"] = [{"uri": args["uri"]}]
     if login:
         merged["login"] = login
     if args.get("custom_fields") is not None:

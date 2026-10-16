@@ -49,8 +49,8 @@ def test_version_headers():
     """Verify all modified files carry the CURRENT release version header.
 
     v0.2.3: headers moved to `— v0.2.3`; kept as a regression guard that the
-    core modules declare their per-release version headers (v0.2.6 bumped
-    auth.py for the status_snapshot BUGFIX).
+    core modules declare their per-release version headers (v0.2.7 bumped
+    auth.py for the encode_item/create/edit BUGFIX).
     """
     import re
     import vaultwarden.config
@@ -62,7 +62,7 @@ def test_version_headers():
         "__init__.py": "v0.2.3",
         "config.py": "v0.2.3",
         "hooks.py": "v0.2.3",
-        "auth.py": "v0.2.6",
+        "auth.py": "v0.2.7",
     }
     for name, expected in expected_versions.items():
         path = pkg_dir / name

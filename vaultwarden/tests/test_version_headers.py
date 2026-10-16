@@ -1,5 +1,5 @@
-# vaultwarden/tests/test_version_headers.py — v0.2.6
-"""Cleanup tests: version headers + direct ctx passing (updated for v0.2.6)."""
+# vaultwarden/tests/test_version_headers.py — v0.2.7
+"""Cleanup tests: version headers + direct ctx passing (updated for v0.2.7)."""
 from __future__ import annotations
 
 
@@ -14,8 +14,8 @@ def test_version_headers():
         "__init__.py": "v0.2.3",
         "config.py": "v0.2.3",
         "hooks.py": "v0.2.3",
-        "auth.py": "v0.2.6",
-        "tools.py": "v0.2.4",
+        "auth.py": "v0.2.7",
+        "tools.py": "v0.2.7",
         "schemas.py": "v0.2.6",
     }
     for name, expected in expected_versions.items():
@@ -35,8 +35,8 @@ def test_modified_files_have_version_header_comment():
         "__init__.py": "v0.2.3",
         "config.py": "v0.2.3",
         "hooks.py": "v0.2.3",
-        "auth.py": "v0.2.6",
-        "tools.py": "v0.2.4",
+        "auth.py": "v0.2.7",
+        "tools.py": "v0.2.7",
         "schemas.py": "v0.2.6",
     }
     for name, expected in expected_versions.items():
@@ -48,13 +48,13 @@ def test_modified_files_have_version_header_comment():
 
 
 def test_plugin_yaml_version():
-    """plugin.yaml must declare version 0.2.6 with author thieneret."""
+    """plugin.yaml must declare version 0.2.7 with author thieneret."""
     import vaultwarden
     from pathlib import Path
 
     yaml_path = Path(vaultwarden.__file__).resolve().parent / "plugin.yaml"
     text = yaml_path.read_text()
-    assert "version: 0.2.6" in text
+    assert "version: 0.2.7" in text
     assert "author: thieneret" in text
 
 

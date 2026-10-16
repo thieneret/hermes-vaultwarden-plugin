@@ -1,4 +1,4 @@
-# vaultwarden/bw_cli.py — v0.2.3
+# vaultwarden/bw_cli.py — v0.2.7
 """Thin, isolated wrapper around the ``bw`` (Bitwarden CLI) binary.
 
 Every subprocess is executed with a MINIMAL, explicitly constructed env:
@@ -12,6 +12,7 @@ this module handles encoding transparently in ``encode_item``.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -222,15 +223,75 @@ class BwCli:
         return data
 
     def create_item(self, session_key: str, encoded_json: str) -> dict:
-        data = self.run(["create", "item", encoded_json],
-                        env={"BW_SESSION": session_key})
+        """`bw create item` via stdin -> created item JSON.
+
+        v0.2.7 (BUGFIX): the encoded JSON used to be passed as a CLI
+        positional argument; large items could exceed the OS ARG_MAX limit.
+        The CLI reads the encoded JSON from stdin when no positional arg
+        is given, so we pipe it. Mirrors the stdin-based `encode()` fix
+        from v0.2.3. Bypasses the generic run() helper (run() is argv-only).
+        """
+        full_env = self.base_env({"BW_SESSION": session_key})
+        cmd = [self.bw_path, "create", "item"]
+        try:
+            proc = subprocess.run(
+                cmd, env=full_env, input=encoded_json, capture_output=True,
+                text=True, timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise errors.NetworkError("bw create item timed out.") from exc
+        except OSError as exc:
+            raise errors.BinaryError(
+                f"Failed to execute bw create: {type(exc).__name__}") from exc
+
+        out = (proc.stdout or "").strip()
+        if proc.returncode != 0:
+            # NB: stderr may contain payload fragments — never log it.
+            raise errors.VaultwardenError(
+                f"bw create item failed (exit {proc.returncode}).",
+                suggestion="Run 'vaultwarden_status' for details.")
+        if not out:
+            raise errors.ParseError("bw create item returned empty output.")
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError as exc:
+            raise errors.ParseError(
+                "Could not parse bw create item output as JSON.") from exc
         if not isinstance(data, dict):
             raise errors.ParseError("bw create item returned unexpected payload.")
         return data
 
-    def edit_item(self, session_key: str, encoded_json: str) -> dict:
-        data = self.run(["edit", "item", encoded_json],
-                        env={"BW_SESSION": session_key})
+    def edit_item(self, session_key: str, item_id: str, encoded_json: str) -> dict:
+        """`bw edit item <id>` via stdin -> updated item JSON.
+
+        v0.2.7 (BUGFIX): same ARG_MAX fix as create_item — pipe the encoded
+        JSON via stdin. Also passes the required item id positional argument.
+        """
+        full_env = self.base_env({"BW_SESSION": session_key})
+        cmd = [self.bw_path, "edit", "item", item_id]
+        try:
+            proc = subprocess.run(
+                cmd, env=full_env, input=encoded_json, capture_output=True,
+                text=True, timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise errors.NetworkError("bw edit item timed out.") from exc
+        except OSError as exc:
+            raise errors.BinaryError(
+                f"Failed to execute bw edit: {type(exc).__name__}") from exc
+
+        out = (proc.stdout or "").strip()
+        if proc.returncode != 0:
+            raise errors.VaultwardenError(
+                f"bw edit item failed (exit {proc.returncode}).",
+                suggestion="Run 'vaultwarden_status' for details.")
+        if not out:
+            raise errors.ParseError("bw edit item returned empty output.")
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError as exc:
+            raise errors.ParseError(
+                "Could not parse bw edit item output as JSON.") from exc
         if not isinstance(data, dict):
             raise errors.ParseError("bw edit item returned unexpected payload.")
         return data
@@ -279,20 +340,17 @@ class BwCli:
         return out
 
 
-def encode_item(session_key: str, item: dict, bw: BwCli) -> str:
-    """Prepare an item JSON blob for `bw create/edit item`.
+def encode_item(item: dict) -> str:
+    """Return base64 of the item JSON, ready for `bw create/edit item`.
 
-    Per plan §2: every string field must pass through the `bw encode`
-    pipeline before being handed to create/edit.
+    v0.2.7 (BUGFIX): the Bitwarden CLI expects the ENTIRE JSON object to be
+    base64-encoded (per official docs: "The encode command Base 64 encodes
+    stdin" — standard RFC 4648). Previous implementation double-encoded
+    individual fields, producing a non-base64 string that `bw create`
+    rejected with exit 1. Now we JSON-dump the raw item and base64-encode
+    the whole string with Python's stdlib — no subprocess, no bw binary
+    dependency for this step, explicit UTF-8 handling.
     """
-    def _enc(value: Any) -> Any:
-        if isinstance(value, str):
-            return bw.encode(session_key, value)
-        if isinstance(value, list):
-            return [_enc(v) for v in value]
-        if isinstance(value, dict):
-            return {k: _enc(v) for k, v in value.items()}
-        return value
-
-    encoded = {k: _enc(v) for k, v in item.items() if v not in (None, "", [], {})}
-    return json.dumps(encoded)
+    cleaned = {k: v for k, v in item.items() if v not in (None, "", [], {})}
+    json_bytes = json.dumps(cleaned, ensure_ascii=False).encode("utf-8")
+    return base64.b64encode(json_bytes).decode("ascii")

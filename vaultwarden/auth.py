@@ -1,4 +1,4 @@
-# vaultwarden/auth.py — v0.2.6
+# vaultwarden/auth.py — v0.2.7
 """Auth Manager + Session Store (plan §4, §5).
 
 State machine:
@@ -392,16 +392,18 @@ class AuthManager:
         from .bw_cli import encode_item
 
         def _do(session: str):
-            blob = encode_item(session, item, self._bw)
+            blob = encode_item(item)
             return self._bw.create_item(session, blob)
         return self.run_with_recovery(_do)
 
     def edit_item(self, item: dict) -> dict:
         from .bw_cli import encode_item
 
+        item_id = str(item.get("id") or "")
+
         def _do(session: str):
-            blob = encode_item(session, item, self._bw)
-            return self._bw.edit_item(session, blob)
+            blob = encode_item(item)
+            return self._bw.edit_item(session, item_id, blob)
         return self.run_with_recovery(_do)
 
     def delete_item(self, item_id: str, permanent: bool = False) -> str:

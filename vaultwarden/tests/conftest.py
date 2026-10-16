@@ -179,29 +179,30 @@ elif argv[:1] == ["encode"]:
         out(base64.b64encode(argv[1].encode()).decode())
     else:
         out(base64.b64encode(sys.stdin.read().encode()).decode())
-elif argv[:2] in (["create", "item"], ["edit", "item"]):
-    blob = json.loads(argv[2])
-    def dec(v):
-        if isinstance(v, str):
-            try:
-                return base64.b64decode(v.encode()).decode()
-            except Exception:
-                return v
-        if isinstance(v, list):
-            return [dec(x) for x in v]
-        if isinstance(v, dict):
-            return {k: dec(x) for k, x in v.items()}
-        return v
-    res = {k: dec(v) for k, v in blob.items()}
+elif argv[:2] == ["create", "item"]:
+    # v0.2.7: bw reads the encoded JSON from stdin when no positional arg
+    # is given — the fake mirrors that behaviour (stdlib base64 of the
+    # ENTIRE JSON object, per `bw create item <encodedJson>` semantics).
+    raw = sys.stdin.read() if len(argv) <= 2 else argv[2]
+    blob = json.loads(base64.b64decode(raw).decode("utf-8"))
+    res = dict(blob)
     # v0.1.5 (FAIL-8): persist mutations so later get/list/edit/delete see them.
     created_map = _load_created()
-    if argv[:2] == ["create", "item"]:
-        res["id"] = "new-item-id-0001"
-        created_map[res["id"]] = res
-    else:
-        eid = res.get("id")
-        if eid and eid in created_map:
-            created_map[eid] = res
+    res["id"] = "new-item-id-0001"
+    created_map[res["id"]] = res
+    _save_created(created_map)
+    out(json.dumps(res))
+elif argv[:2] == ["edit", "item"]:
+    # v0.2.7: `bw edit item <id>` — id is positional, encoded JSON on stdin.
+    item_id = argv[2]
+    raw = sys.stdin.read()
+    blob = json.loads(base64.b64decode(raw).decode("utf-8"))
+    res = dict(blob)
+    created_map = _load_created()
+    if not res.get("id"):
+        res["id"] = item_id
+    if item_id in created_map:
+        created_map[item_id] = res
     _save_created(created_map)
     out(json.dumps(res))
 elif argv[:2] == ["delete", "item"]:

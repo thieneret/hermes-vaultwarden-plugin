@@ -78,14 +78,15 @@ def test_all_handlers_return_str():
 
 
 def test_version_headers_v024():
-    """Verify modified files have v0.2.4 version header."""
+    """Verify modified files have their current release version header."""
     import vaultwarden
     from pathlib import Path
 
     pkg_dir = Path(vaultwarden.__file__).resolve().parent
-    modified = ["tools.py"]
-    for name in modified:
+    # v0.2.7: tools.py bumped for the explicit-null cleanup.
+    expected_versions = {"tools.py": "v0.2.7"}
+    for name, expected in expected_versions.items():
         path = pkg_dir / name
         with open(path, 'r') as f:
             first_line = f.readline().strip()
-        assert 'v0.2.4' in first_line, f"{name} missing version header: {first_line}"
+        assert expected in first_line, f"{name} missing version header: {first_line}"
