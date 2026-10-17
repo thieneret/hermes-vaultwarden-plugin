@@ -62,10 +62,10 @@ def test_version_headers_v023():
     expected_versions = {
         "__init__.py": "v0.2.3",
         "config.py":   "v0.2.3",
-        "auth.py":     "v0.2.7",  # bumped in v0.2.7 (encode_item/create/edit BUGFIX)
+        "auth.py":     "v0.2.8",  # bumped in v0.2.8 (SSH key management wrappers)
         "hooks.py":    "v0.2.3",
-        "bw_cli.py":   "v0.2.7",  # bumped in v0.2.7 (stdlib base64 + stdin transport)
-        "tools.py":    "v0.2.7",  # bumped in v0.2.7 (explicit-null cleanup)
+        "bw_cli.py":   "v0.2.8",  # bumped in v0.2.8 (attachment create/get/delete)
+        "tools.py":    "v0.2.8",  # bumped in v0.2.8 (4 SSH tool handlers)
     }
     for name, expected in expected_versions.items():
         path = pkg_dir / name

@@ -1,5 +1,5 @@
-# vaultwarden/schemas.py — v0.2.6
-"""JSON schemas for the 9 vaultwarden_* tools (plan §8).
+# vaultwarden/schemas.py — v0.2.8
+"""JSON schemas for the 13 vaultwarden_* tools (plan §8).
 
 Handlers receive these as validated `args` dicts. None of the schemas
 accept or return raw secret values except vaultwarden_generate_password,
@@ -202,6 +202,96 @@ VAULTWARDEN_GENERATE_PASSWORD = {
     },
 }
 
+VAULTWARDEN_STORE_SSH = {
+    "name": "vaultwarden_store_ssh",
+    "description": (
+        "Store an SSH private key in the vault as a login item with file "
+        "attachment. The username holds the SSH user, the password holds "
+        "the key passphrase, and the key file is stored as an attachment. "
+        "Requires allow_write=true. Name must be unique."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string",
+                     "description": "Unique item name (e.g. 'SSH - Production')."},
+            "user": {"type": "string",
+                     "description": "SSH username (e.g. 'deploy', 'root')."},
+            "pass": {"type": "string",
+                     "description": "SSH key passphrase."},
+            "file": {"type": "string",
+                     "description": "Absolute path to the SSH private key file."},
+            "folder_id": {"type": "string",
+                          "description": "Optional folder UUID."},
+            "notes": {"type": "string",
+                      "description": "Optional description."},
+        },
+        "required": ["name", "user", "pass", "file"],
+    },
+}
+
+VAULTWARDEN_UPDATE_SSH = {
+    "name": "vaultwarden_update_ssh",
+    "description": (
+        "Update an existing SSH key item. Can update user, passphrase, "
+        "and/or the key file attachment. Requires allow_write=true."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string",
+                     "description": "Item name to update."},
+            "user": {"type": "string",
+                     "description": "New SSH username (optional)."},
+            "pass": {"type": "string",
+                     "description": "New passphrase (optional)."},
+            "file": {"type": "string",
+                     "description": "New SSH key file path (optional)."},
+            "notes": {"type": "string",
+                      "description": "New description (optional)."},
+        },
+        "required": ["name"],
+    },
+}
+
+VAULTWARDEN_DELETE_SSH = {
+    "name": "vaultwarden_delete_ssh",
+    "description": (
+        "Delete an SSH key item (including its attachment). Requires "
+        "allow_write=true and confirm=true."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string",
+                     "description": "Item name to delete."},
+            "confirm": {"type": "boolean",
+                        "description": "Must be true — explicit confirmation."},
+            "permanent": {"type": "boolean", "default": False,
+                          "description": "Permanently delete (skip trash)."},
+        },
+        "required": ["name", "confirm"],
+    },
+}
+
+VAULTWARDEN_USE_SSH = {
+    "name": "vaultwarden_use_ssh",
+    "description": (
+        "Load an SSH private key from the vault into ssh-agent. Retrieves "
+        "the key attachment and passphrase, then runs ssh-add. Returns the "
+        "SSH_AUTH_SOCK path for subsequent SSH commands."),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string",
+                     "description": "SSH key item name to load."},
+            "ssh_auth_sock": {"type": "string",
+                              "description": (
+                                  "Socket path OR environment variable name. "
+                                  "If omitted, uses $SSH_AUTH_SOCK. If that is "
+                                  "also empty, starts a new ssh-agent.")},
+        },
+        "required": ["name"],
+    },
+}
+
 TOOL_SCHEMAS = [
     VAULTWARDEN_STATUS,
     VAULTWARDEN_SYNC,
@@ -212,4 +302,9 @@ TOOL_SCHEMAS = [
     VAULTWARDEN_UPDATE,
     VAULTWARDEN_DELETE,
     VAULTWARDEN_GENERATE_PASSWORD,
+    # v0.2.8: SSH key management
+    VAULTWARDEN_STORE_SSH,
+    VAULTWARDEN_UPDATE_SSH,
+    VAULTWARDEN_DELETE_SSH,
+    VAULTWARDEN_USE_SSH,
 ]

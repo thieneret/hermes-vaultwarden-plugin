@@ -1,5 +1,9 @@
-# vaultwarden/auth.py — v0.2.7
+# vaultwarden/auth.py — v0.2.8
 """Auth Manager + Session Store (plan §4, §5).
+
+v0.2.8: this module imports `os` at top level — the SSH key wrappers
+(create_ssh_item) use os.path.basename() for the attachment note. Passphrase
+delivery is stdin-pipe-only by design; no passphrase is ever written to disk.
 
 State machine:
     UNINITIALIZED -> CONFIGURED -> (bw status) -> LOGGED_OUT | LOGGED_IN | UNLOCKED
@@ -413,6 +417,75 @@ class AuthManager:
 
     def generate_password(self, args: list[str]) -> str:
         return self.run_with_recovery(lambda s: self._bw.generate_password(s, args))
+
+    # ----------------------------------------------------- SSH key ops (v0.2.8)
+    def search_items(self, query: str) -> list[dict]:
+        """Search vault items by name. Returns list of matching items."""
+        def _do(session: str):
+            return self._bw.list_items(session, filters=["--search", query])
+        return self.run_with_recovery(_do) or []
+
+    def create_ssh_item(self, name: str, username: str, password: str,
+                        key_file_path: str) -> dict:
+        """Create a login item + SSH key attachment.
+
+        v0.2.8: enforces name uniqueness before creation.
+        """
+        from .bw_cli import encode_item
+
+        # Name uniqueness check
+        existing = self.search_items(name)
+        exact = [i for i in existing if i.get("name") == name]
+        if exact:
+            raise errors.VaultwardenError(
+                f"Item name '{name}' already exists ({len(exact)} match(es)). "
+                "SSH key names must be unique.",
+                code="DUPLICATE_NAME",
+                suggestion="Choose a different name or use vaultwarden_update_ssh.")
+
+        item = {
+            "type": 1,  # login
+            "name": name,
+            "login": {
+                "username": username,
+                "password": password,
+            },
+        }
+        if key_file_path:
+            item["notes"] = f"SSH key: {os.path.basename(key_file_path)}"
+
+        def _do(session: str):
+            blob = encode_item(item)
+            created = self._bw.create_item(session, blob)
+            item_id = created.get("id", "")
+            if key_file_path and item_id:
+                self._bw.create_attachment(session, key_file_path, item_id)
+            return created
+        return self.run_with_recovery(_do)
+
+    def get_ssh_key(self, item_id: str, output_path: str) -> tuple[str, str]:
+        """Download SSH key attachment and return (key_path, passphrase).
+
+        v0.2.8: returns the temp file path (caller sets permissions and
+        cleans up) and the passphrase from the item's password field.
+        """
+        def _do(session: str):
+            item = self._bw.item_get(session, item_id)
+            login = item.get("login") or {}
+            passphrase = login.get("password") or ""
+
+            attachments = item.get("attachments") or []
+            if not attachments:
+                raise errors.VaultwardenError(
+                    "Item has no SSH key attachment.",
+                    code="NOT_FOUND",
+                    suggestion="Use vaultwarden_store_ssh to create the key.")
+            att = attachments[0]
+            att_name = att.get("fileName", "ssh_key")
+
+            self._bw.get_attachment(session, att_name, item_id, output_path)
+            return output_path, passphrase
+        return self.run_with_recovery(_do)
 
     # --------------------------------------------------------------- shutdown
     def _clear_session_locked(self) -> None:
