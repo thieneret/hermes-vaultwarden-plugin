@@ -5,6 +5,22 @@ Author: **thieneret**
 
 ---
 
+## [0.3.0] — Infrastructure & Developer Experience
+
+### Added
+- `pyproject.toml` — package metadata, hatchling build backend, dev
+  dependencies (pytest, pytest-mock, ruff, mypy); zero runtime
+  dependencies (plugin is stdlib-only by design)
+- `.github/workflows/ci.yml` — automated pytest + ruff lint on push/PR
+  across Python 3.10 / 3.11 / 3.12
+- README: Prerequisites section; Installation split into Production
+  and Development subsections
+
+### Changed
+- README: development setup documented (pip/uv editable install)
+- Version bumped to 0.3.0 (infrastructure release, no production
+  code logic changes)
+
 ## [0.2.9] — Test Suite Consolidation
 
 ### Changed

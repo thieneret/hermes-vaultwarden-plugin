@@ -28,13 +28,45 @@ Secure secrets management for Hermes Agent via Vaultwarden. Provides safe access
 
 ## Installation
 
+### Prerequisites
+
+- **Hermes Agent** — host platform
+- **Bitwarden CLI** (`bw`) — installed and accessible
+- **OpenSSH ≥ 7.2** — required for SSH key management tools
+- **Python 3.10+** — required for development and testing
+
+### Production (Hermes Agent)
+
 Copy the plugin directory into your Hermes plugins folder:
 
 ```bash
-cp -r vaultwarden ~/.hermes/plugins/
+cp -r vaultwarden ~/.hermes/plugins/vaultwarden
 ```
 
-Then enable it in the Hermes configuration (see below) and restart Hermes.
+Then configure `~/.hermes/config.yaml` (see Configuration section)
+and restart Hermes.
+
+### Development & Testing
+
+To run the test suite or contribute, install the repository as an
+editable package with development dependencies.
+
+**Using `pip`:**
+```bash
+git clone <repository-url>
+cd hermes-vaultwarden-plugin
+pip install -e ".[dev]"
+```
+
+**Using `uv` (recommended):**
+```bash
+git clone <repository-url>
+cd hermes-vaultwarden-plugin
+uv pip install -e ".[dev]"
+```
+
+This installs `pytest`, `ruff`, and `mypy` without affecting the
+production Hermes runtime.
 
 ## Configuration
 
@@ -188,7 +220,7 @@ vaultwarden/
 ### Running tests
 
 ```bash
-python -m pytest vaultwarden/tests/ -q -p no:libtmux
+pytest vaultwarden/tests/ -q
 ```
 
 Current suite: **178 tests**.

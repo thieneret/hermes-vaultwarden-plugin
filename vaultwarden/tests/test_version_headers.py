@@ -52,13 +52,13 @@ def test_version_headers():
 
 
 def test_plugin_yaml_version():
-    """plugin.yaml must declare the current release version 0.2.9."""
+    """plugin.yaml must declare the current release version 0.3.0."""
     pkg_dir = Path(vaultwarden.__file__).resolve().parent
     plugin_yaml = pkg_dir / "plugin.yaml"
     if not plugin_yaml.exists():
         plugin_yaml = pkg_dir.parent / "plugin.yaml"
     content = plugin_yaml.read_text(encoding="utf-8")
-    assert "version: 0.2.9" in content
+    assert "version: 0.3.0" in content
     assert "author: thieneret" in content
 
 
