@@ -1,4 +1,4 @@
-# vaultwarden/bw_cli.py — v0.2.7
+# vaultwarden/bw_cli.py — v0.2.8
 """Thin, isolated wrapper around the ``bw`` (Bitwarden CLI) binary.
 
 Every subprocess is executed with a MINIMAL, explicitly constructed env:
@@ -301,6 +301,42 @@ class BwCli:
         if permanent:
             args.append("--permanent")
         return self.run(args, env={"BW_SESSION": session_key}, raw=True)
+
+    # ---------------------------------------------------------- attachments
+    def create_attachment(self, session_key: str, file_path: str,
+                          item_id: str) -> dict:
+        """`bw create attachment --file <path> --itemid <id>` -> attachment JSON.
+
+        v0.2.8: uploads a file as an attachment to a vault item.
+        The file content is read by bw directly from file_path.
+        """
+        data = self.run(
+            ["create", "attachment", "--file", file_path, "--itemid", item_id],
+            env={"BW_SESSION": session_key})
+        if not isinstance(data, dict):
+            raise errors.ParseError(
+                "bw create attachment returned unexpected payload.")
+        return data
+
+    def get_attachment(self, session_key: str, filename: str, item_id: str,
+                       output_path: str) -> str:
+        """`bw get attachment <filename> --itemid <id> --output <path>`.
+
+        v0.2.8: downloads an attachment to output_path. Returns the path.
+        Caller is responsible for setting 0600 permissions on output_path.
+        """
+        self.run(
+            ["get", "attachment", filename, "--itemid", item_id,
+             "--output", output_path],
+            env={"BW_SESSION": session_key}, raw=True)
+        return output_path
+
+    def delete_attachment(self, session_key: str, attachment_id: str,
+                          item_id: str) -> None:
+        """`bw delete attachment <id> --itemid <item_id>`."""
+        self.run(
+            ["delete", "attachment", attachment_id, "--itemid", item_id],
+            env={"BW_SESSION": session_key}, raw=True)
 
     def generate_password(self, session_key: str, args: list[str]) -> str:
         pw = self.run(["generate", *args], env={"BW_SESSION": session_key}, raw=True)

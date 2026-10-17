@@ -1,17 +1,28 @@
-# vaultwarden/plugin.yaml — v0.2.3
+# vaultwarden/plugin.yaml — v0.2.8
 name: vaultwarden
-version: 0.2.7
-description: >-
-  Vaultwarden secrets management for Hermes Agent via the `bw` CLI.
-  Secrets are never exposed to the LLM context: tools return single-use
-  placeholders (__VW_SECRET_xxxxxxxxxxxxxx__) which a chain-safe
-  `tool_request` middleware resolves into terminal commands just before
-  execution, with `post_tool_call` cleanup/redaction afterwards. All
-  subprocesses run with an isolated BITWARDENCLI_APPDATA_DIR so the
-  plugin's bw state never touches the host user's bw profile.
+version: 0.2.8
+description: >
+  Vaultwarden secrets management for Hermes Agent. Provides secure
+  access to vault items via placeholder injection, plus SSH key
+  storage and ssh-agent integration.
 author: thieneret
 requires_bins:
   - bw
+provides_tools:
+  - vaultwarden_status
+  - vaultwarden_sync
+  - vaultwarden_list
+  - vaultwarden_search
+  - vaultwarden_get_secret_ref
+  - vaultwarden_store
+  - vaultwarden_update
+  - vaultwarden_delete
+  - vaultwarden_generate_password
+  # v0.2.8: SSH key management
+  - vaultwarden_store_ssh
+  - vaultwarden_update_ssh
+  - vaultwarden_delete_ssh
+  - vaultwarden_use_ssh
 config:
   enabled:
     type: boolean

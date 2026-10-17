@@ -1,3 +1,4 @@
+# vaultwarden/errors.py — v0.2.8
 """Structured error types and LLM-safe error responses for the Vaultwarden plugin.
 
 Error response format (per plan §11):
@@ -5,6 +6,11 @@ Error response format (per plan §11):
 
 CRITICAL: messages must NEVER contain secret values (master password,
 client secret, session key, resolved credentials).
+
+v0.2.8 error taxonomy additions:
+    DUPLICATE_NAME   — store_ssh name uniqueness violation
+    AMBIGUOUS_ERROR  — multiple items match a name
+    AGENT_ERROR      — ssh-agent start/communication failure
 """
 from __future__ import annotations
 
@@ -16,11 +22,17 @@ class VaultwardenError(Exception):
     recoverable = False
     suggestion = ""
 
-    def __init__(self, message: str = "", *, suggestion: str | None = None):
+    def __init__(self, message: str = "", *, suggestion: str | None = None,
+                 code: str | None = None):
         super().__init__(message)
         self.message = message or self.__doc__ or "Unknown plugin error"
         if suggestion is not None:
             self.suggestion = suggestion
+        # v0.2.8: allow per-instance taxonomy codes (DUPLICATE_NAME,
+        # AMBIGUOUS_ERROR, AGENT_ERROR, VALIDATION_ERROR, NOT_FOUND) without
+        # subclassing for every call site.
+        if code is not None:
+            self.code = code
 
     def to_dict(self) -> dict:
         resp = {
@@ -99,6 +111,31 @@ class AppdataError(VaultwardenError):
     code = "APPDATA_ERROR"
     recoverable = False
     suggestion = "Ensure the plugin directory is writable (chmod 700 on .bw-data)."
+
+
+# ---------------------------------------------------- v0.2.8 error taxonomy
+class DuplicateNameError(VaultwardenError):
+    """store_ssh name uniqueness violation."""
+
+    code = "DUPLICATE_NAME"
+    recoverable = False
+    suggestion = "Choose a different name or use vaultwarden_update_ssh."
+
+
+class AmbiguousError(VaultwardenError):
+    """Multiple items match a name."""
+
+    code = "AMBIGUOUS_ERROR"
+    recoverable = False
+    suggestion = "Use vaultwarden_search to find the correct item_id."
+
+
+class AgentError(VaultwardenError):
+    """ssh-agent start/communication failure."""
+
+    code = "AGENT_ERROR"
+    recoverable = True
+    suggestion = "Verify ssh-agent/ssh-add are installed and PATH is set."
 
 
 def error_response(exc: Exception) -> dict:
