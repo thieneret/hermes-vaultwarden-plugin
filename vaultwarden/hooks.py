@@ -1,4 +1,3 @@
-# vaultwarden/hooks.py — v0.2.3
 """Terminal hook handlers (plan §7): chain-safe `tool_request` middleware +
 `post_tool_call` cleanup/redaction.
 
@@ -15,7 +14,6 @@ string silently injected).
 """
 from __future__ import annotations
 
-import re
 import threading
 from collections.abc import MutableMapping
 from typing import Any, Callable
@@ -23,8 +21,14 @@ from typing import Any, Callable
 from . import errors
 from .auth import AuthManager
 from .placeholders import PlaceholderRegistry
-from .security import (escape_for_context, get_logger, get_redacting_filter,
-                       looks_like_url_context, placeholder_tokens, url_escape)
+from .security import (
+    escape_for_context,
+    get_logger,
+    get_redacting_filter,
+    looks_like_url_context,
+    placeholder_tokens,
+    url_escape,
+)
 from .tools import _field_value
 
 log = get_logger("hooks")
@@ -35,7 +39,10 @@ INVALID_SENTINEL = "__VW_PLACEHOLDER_INVALID__"
 # Daytona/Singularity/Vercel Sandbox all pass the command string here).
 # v0.2.2: names/keys are overridable via config (terminal_tool_names /
 # terminal_command_keys); these are the defaults when config is absent/empty.
-_DEFAULT_TERMINAL_TOOLS = {"terminal", "shell", "bash", "execute_command", "run_command", "exec", "code_execution"}
+_DEFAULT_TERMINAL_TOOLS = {
+    "terminal", "shell", "bash", "execute_command",
+    "run_command", "exec", "code_execution",
+}
 _DEFAULT_COMMAND_KEYS = ("command", "cmd", "input", "script", "code")
 
 

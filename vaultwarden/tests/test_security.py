@@ -7,9 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from vaultwarden.security import (BW_ENV_ALLOWLIST, RedactingFilter,
-                                  audit_subprocess_env, escape_for_context,
-                                  placeholder_tokens, shell_escape, url_escape)
+from vaultwarden.security import (
+    BW_ENV_ALLOWLIST,
+    RedactingFilter,
+    audit_subprocess_env,
+    escape_for_context,
+    placeholder_tokens,
+    shell_escape,
+    url_escape,
+)
 
 
 # ---------------------------------------------------------------- redaction
@@ -63,7 +69,7 @@ def test_no_bootstrap_secrets_in_os_environ_after_register(monkeypatch, tmp_path
     monkeypatch.setenv("BW_CLI_PATH", fake_bw)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import vaultwarden
-    from vaultwarden.tests.conftest import RecordingCtx, BASE_SECTION
+    from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
     vaultwarden.register(ctx)
     assert "VW_CLIENT_SECRET" not in os.environ
@@ -189,9 +195,9 @@ def test_session_key_not_persisted_to_disk(bw_cli, tmp_path):
 
 
 def test_error_messages_are_secret_free(bw_cli):
+    from vaultwarden import errors as E
     from vaultwarden.auth import AuthManager
     from vaultwarden.tests.conftest import make_config
-    from vaultwarden import errors as E
     mgr = AuthManager(bw_cli, make_config(), client_secret="cs-secret",
                       master_password="BAD-PW")
     with pytest.raises(E.VaultwardenError) as ei:
@@ -244,6 +250,7 @@ def test_terminal_tools_configurable():
 def test_resolver_uses_default_expanded_terminal_tools():
     """BUGFIX: new default tool names (run_command/exec/...) are recognized."""
     from unittest.mock import MagicMock
+
     from vaultwarden.hooks import make_placeholder_resolver
 
     auth = MagicMock()
@@ -263,6 +270,7 @@ def test_resolver_uses_default_expanded_terminal_tools():
 def test_resolver_honours_custom_terminal_tool_names():
     """BUGFIX: config-provided tool names REPLACE the defaults."""
     from unittest.mock import MagicMock
+
     from vaultwarden.hooks import make_placeholder_resolver
 
     auth = MagicMock()
@@ -284,10 +292,9 @@ def test_resolver_honours_custom_terminal_tool_names():
 
 def test_post_cleanup_surfaces_only_own_task_errors():
     """BUGFIX (integration): one task's post hook must not steal another's errors."""
-    from vaultwarden.hooks import (_PENDING_ERRORS, _PENDING_LOCK,
-                                   make_post_cleanup_hook)
-
     from unittest.mock import MagicMock
+
+    from vaultwarden.hooks import _PENDING_ERRORS, _PENDING_LOCK, make_post_cleanup_hook
     post = make_post_cleanup_hook(MagicMock(), MagicMock())
     with _PENDING_LOCK:
         _PENDING_ERRORS["task_1"] = [{"error_code": "PLACEHOLDER_ERROR", "task": 1}]
@@ -368,6 +375,7 @@ def test_no_hungarian_in_comments():
     """v0.2.6: no Hungarian words in comments or docstrings."""
     import re
     from pathlib import Path
+
     import vaultwarden
 
     pkg_dir = Path(vaultwarden.__file__).resolve().parent
@@ -413,6 +421,7 @@ def _dict_tools(raw):
 def test_appdata_dir_in_every_subprocess(fake_bw, tmp_path):
     """Run EVERY supported command and assert the env var reached the child."""
     import subprocess
+
     from vaultwarden.bw_cli import BwCli
     appdata = tmp_path / "bw-state"
     appdata.mkdir(mode=0o700)
@@ -456,6 +465,7 @@ def test_appdata_dir_in_every_subprocess(fake_bw, tmp_path):
 def test_bw_data_permissions_700(tmp_path):
     import os
     import stat
+
     from vaultwarden.auth import ensure_appdata_dir
     d = ensure_appdata_dir(tmp_path / "nested" / ".bw-data")
     assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
@@ -481,8 +491,10 @@ def test_plugin_state_isolated_from_host_profile(fake_bw, tmp_path):
 
 def test_no_cross_contamination_between_two_profiles(fake_bw, tmp_path):
     from vaultwarden.bw_cli import BwCli
-    a = tmp_path / "a"; b = tmp_path / "b"
-    a.mkdir(); b.mkdir()
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
     ca, cb = BwCli(fake_bw, a), BwCli(fake_bw, b)
     ca.login_apikey("user.x", "cs-secret")
     assert ca.status()["status"] == "locked"
@@ -496,7 +508,8 @@ def test_middleware_chain_safety_other_plugin_last_word(fake_bw, tmp_path, regis
     from vaultwarden.bw_cli import BwCli
     from vaultwarden.hooks import make_placeholder_resolver
     from vaultwarden.tests.conftest import make_config
-    appdata = tmp_path / ".bw-data"; appdata.mkdir(mode=0o700)
+    appdata = tmp_path / ".bw-data"
+    appdata.mkdir(mode=0o700)
     cli = BwCli(fake_bw, appdata)
     auth = AuthManager(cli, make_config(), client_secret="cs-secret",
                        master_password="mp-secret")
@@ -525,13 +538,14 @@ def test_register_cleanup_removes_bootstrap_env(monkeypatch, tmp_path, fake_bw):
     """After register(): VW_* gone from os.environ; values live only in memory."""
     import os
     import stat
+
     import vaultwarden
     monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
     monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
     monkeypatch.setenv("BW_CLI_PATH", fake_bw)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
-    from vaultwarden.tests.conftest import RecordingCtx, BASE_SECTION
+    from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
     ok = vaultwarden.register(ctx)
     assert ok is True

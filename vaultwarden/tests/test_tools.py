@@ -150,9 +150,9 @@ def test_error_envelope_format(tools_by_name):
 
 
 def test_direct_retrieval_escape_hatch(bw_cli, registry):
-    from vaultwarden.tools import get_tools
-    from vaultwarden.tests.conftest import make_config
     from vaultwarden.auth import AuthManager
+    from vaultwarden.tests.conftest import make_config
+    from vaultwarden.tools import get_tools
     cfg = make_config(section={"allow_direct_secret_retrieval": True})
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
     mgr.ensure_authenticated()
@@ -171,6 +171,7 @@ def test_direct_retrieval_escape_hatch(bw_cli, registry):
 def test_guard_returns_json_string():
     """v0.2.4: _guard must return str, not dict."""
     import json
+
     from vaultwarden.tools import _guard
 
     result = _guard(lambda: {"key": "value", "count": 42})
@@ -182,8 +183,9 @@ def test_guard_returns_json_string():
 def test_guard_error_returns_json_string():
     """v0.2.4: _guard error paths must also return str."""
     import json
-    from vaultwarden.tools import _guard
+
     from vaultwarden import errors
+    from vaultwarden.tools import _guard
 
     def failing():
         raise errors.NotFoundError("Item not found.")
@@ -199,8 +201,9 @@ def test_all_handlers_return_str():
     """v0.2.4: every tool handler must return str via _guard."""
     import json
     from unittest.mock import MagicMock
-    from vaultwarden.tools import get_tools
+
     from vaultwarden.placeholders import PlaceholderRegistry
+    from vaultwarden.tools import get_tools
 
     auth = MagicMock()
     auth.status_snapshot.return_value = {"auth_state": "unlocked"}
@@ -244,10 +247,11 @@ def test_all_handlers_return_str():
 def test_generate_password_uses_flag_syntax(monkeypatch):
     """bw generate <len> --uppercase --lowercase --number --special (no 1/0)."""
     import json as _json
+
     from vaultwarden.auth import AuthManager
-    from vaultwarden.tools import get_tools
     from vaultwarden.placeholders import PlaceholderRegistry
     from vaultwarden.tests.conftest import make_config
+    from vaultwarden.tools import get_tools
 
     captured: list[list[str]] = []
 
@@ -304,10 +308,11 @@ def test_generate_password_via_fake_bw_flags(tools_by_name):
 def test_list_folder_id_uses_folderid_flag(bw_cli, appdata, monkeypatch):
     """vaultwarden_list(folder_id=...) must invoke `bw list items --folderid abc`."""
     import json as _json
+
     from vaultwarden.auth import AuthManager
-    from vaultwarden.tools import get_tools
     from vaultwarden.placeholders import PlaceholderRegistry
     from vaultwarden.tests.conftest import make_config
+    from vaultwarden.tools import get_tools
 
     seen: list = []
     orig = bw_cli.list_items
@@ -353,10 +358,11 @@ def test_delete_permanent_with_confirm(write_tools_by_name):
 
 def test_search_uses_native_search_flag(bw_cli, monkeypatch):
     import json as _json
+
     from vaultwarden.auth import AuthManager
-    from vaultwarden.tools import get_tools
     from vaultwarden.placeholders import PlaceholderRegistry
     from vaultwarden.tests.conftest import make_config
+    from vaultwarden.tools import get_tools
 
     seen: list = []
     orig = bw_cli.list_items

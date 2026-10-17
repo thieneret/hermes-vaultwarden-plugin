@@ -1,4 +1,3 @@
-# vaultwarden/tools.py — v0.2.8
 """Tool handlers for the 13 vaultwarden_* tools (plan §8).
 
 ``get_tools(auth, config, registry)`` yields (schema, handler) pairs.

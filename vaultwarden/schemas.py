@@ -1,4 +1,3 @@
-# vaultwarden/schemas.py — v0.2.8
 """JSON schemas for the 13 vaultwarden_* tools (plan §8).
 
 Handlers receive these as validated `args` dicts. None of the schemas

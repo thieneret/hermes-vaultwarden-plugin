@@ -8,7 +8,7 @@ from __future__ import annotations
 
 def test_schemas_use_parameters_key():
     """v0.2.6: all schemas must use the OpenAI-style 'parameters' key."""
-    from vaultwarden.schemas import TOOL_SCHEMAS, SCHEMA_KEY
+    from vaultwarden.schemas import SCHEMA_KEY, TOOL_SCHEMAS
     assert SCHEMA_KEY == "parameters", \
         f"SCHEMA_KEY must be 'parameters', got {SCHEMA_KEY!r}"
     for schema in TOOL_SCHEMAS:
@@ -64,7 +64,7 @@ def test_sync_schema_has_force():
 
 def test_update_schema_cross_reference_uses_parameters():
     """v0.2.6: VAULTWARDEN_UPDATE must cross-reference STORE via 'parameters'."""
-    from vaultwarden.schemas import (VAULTWARDEN_STORE, VAULTWARDEN_UPDATE)
+    from vaultwarden.schemas import VAULTWARDEN_STORE, VAULTWARDEN_UPDATE
     store_cf = VAULTWARDEN_STORE["parameters"]["properties"]["custom_fields"]
     update_cf = VAULTWARDEN_UPDATE["parameters"]["properties"]["custom_fields"]
     assert update_cf == store_cf

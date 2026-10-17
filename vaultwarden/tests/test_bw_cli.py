@@ -76,7 +76,8 @@ def test_encode_pipeline(bw_cli, appdata):
 def test_encode_item_encodes_entire_json(bw_cli, appdata):
     # v0.2.7: encode_item now base64-encodes the WHOLE JSON object with the
     # Python stdlib (no per-field double encoding, no bw subprocess needed).
-    import base64, json
+    import base64
+    import json
     item = {"name": "N", "login": {"username": "u", "password": "p"}, "type": 1}
     blob = encode_item(item)
     parsed = json.loads(base64.b64decode(blob).decode("utf-8"))
@@ -107,7 +108,9 @@ def test_network_error_retry_once(fake_bw, appdata, monkeypatch):
         # "retry once, then NETWORK_ERROR" to hold. (The old mock let the
         # retry succeed, so no error was raised.)
         from unittest.mock import MagicMock
-        m = MagicMock(); m.returncode = 1; m.stdout = ""
+        m = MagicMock()
+        m.returncode = 1
+        m.stdout = ""
         m.stderr = "connect ECONNREFUSED 10.0.0.1:443"
         return m
 
@@ -126,7 +129,9 @@ def test_parse_error_on_malformed_json(fake_bw, appdata, monkeypatch):
     import subprocess as sp
     from unittest.mock import MagicMock
     def bad_run(*a, **k):
-        m = MagicMock(); m.returncode = 0; m.stderr = ""
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
         m.stdout = "{not json at all"
         return m
     monkeypatch.setattr(sp, "run", bad_run)
@@ -142,6 +147,7 @@ def test_parse_error_on_malformed_json(fake_bw, appdata, monkeypatch):
 def test_encode_uses_stdin():
     """Bug #2 fix (v0.2.3): bw encode must use stdin, not CLI argument."""
     import inspect
+
     from vaultwarden.bw_cli import BwCli
     src = inspect.getsource(BwCli.encode)
     assert "input=value" in src or "input=" in src

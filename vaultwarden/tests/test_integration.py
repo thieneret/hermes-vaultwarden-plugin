@@ -7,8 +7,6 @@ import logging
 import re
 import threading
 
-import pytest
-
 import vaultwarden
 from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
 
@@ -173,8 +171,10 @@ def test_concurrent_tool_calls(monkeypatch, tmp_path, fake_bw):
                 errors_seen.append(str(r2))
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     assert errors_seen == []
     registry = vaultwarden.PLUGIN_STATE["registry"]
     assert len(registry.snapshot()) <= registry._max   # cap respected under load
@@ -369,3 +369,33 @@ def test_wrong_server_triggers_logout_then_reconfig(monkeypatch, tmp_path, fake_
     assert order.index("logout") < order.index("config")
     assert (appdata / "server.txt").read_text() == "https://vault.example.com"
     assert mgr2.state.value == "unlocked"
+
+
+def test_plugin_yaml_version_matches_pyproject():
+    """plugin.yaml version must match pyproject.toml version."""
+    import re
+    from pathlib import Path
+
+    import vaultwarden
+
+    pkg_dir = Path(vaultwarden.__file__).resolve().parent
+
+    # Find plugin.yaml (may be in package dir or one level up)
+    plugin_yaml = pkg_dir / "plugin.yaml"
+    if not plugin_yaml.exists():
+        plugin_yaml = pkg_dir.parent / "plugin.yaml"
+    assert plugin_yaml.exists(), "plugin.yaml not found"
+    plugin_content = plugin_yaml.read_text(encoding="utf-8")
+    plugin_version = re.search(r"^version:\s*([^\s]+)", plugin_content, re.M)
+    assert plugin_version, "version: field not found in plugin.yaml"
+
+    # Find pyproject.toml
+    pyproject = pkg_dir.parent / "pyproject.toml"
+    assert pyproject.exists(), f"pyproject.toml not found at {pyproject}"
+    pyproject_content = pyproject.read_text(encoding="utf-8")
+    pyproject_version = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_content, re.M)
+    assert pyproject_version, "version field not found in pyproject.toml"
+
+    assert plugin_version.group(1) == pyproject_version.group(1), (
+        f"Version mismatch: plugin.yaml={plugin_version.group(1)}, "
+        f"pyproject.toml={pyproject_version.group(1)}")

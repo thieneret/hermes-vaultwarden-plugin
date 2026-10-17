@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from vaultwarden.config import load_config, PluginConfig
+from vaultwarden.config import PluginConfig, load_config
 from vaultwarden.errors import ConfigError
 
 
@@ -192,6 +192,7 @@ def test_auto_unlock_removed():
     assert "auto_unlock" not in _DEFAULTS
 
     from pathlib import Path
+
     import vaultwarden
     yaml_path = Path(vaultwarden.__file__).resolve().parent / "plugin.yaml"
     text = yaml_path.read_text()
@@ -200,8 +201,8 @@ def test_auto_unlock_removed():
 
 def test_master_password_mandatory_via_resolve():
     """v0.2.3: missing master password VALUE must fail at resolve_secret()."""
-    from vaultwarden.config import PluginConfig
     from vaultwarden import errors
+    from vaultwarden.config import PluginConfig
 
     cfg = PluginConfig(
         section={"server_url": "https://vault.example.com",

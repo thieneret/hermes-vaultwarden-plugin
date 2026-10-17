@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import pytest
 
-from vaultwarden.hooks import (INVALID_SENTINEL, _PENDING_ERRORS,
-                               make_placeholder_resolver, make_post_cleanup_hook,
-                               make_session_end_hook)
+from vaultwarden.hooks import (
+    _PENDING_ERRORS,
+    INVALID_SENTINEL,
+    make_placeholder_resolver,
+    make_post_cleanup_hook,
+    make_session_end_hook,
+)
 
 
 @pytest.fixture()

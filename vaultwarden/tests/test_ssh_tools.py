@@ -2,26 +2,26 @@
 
 Renamed from test_ssh_tools_v028.py in the v0.2.9 test consolidation.
 """
-import base64
-import json
 import os
-import tempfile
-from unittest.mock import MagicMock, patch
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vaultwarden.tools import (
-    _validate_ssh_key_file, _resolve_socket_path,
-)
 from vaultwarden import errors
-
+from vaultwarden.tools import (
+    _resolve_socket_path,
+    _validate_ssh_key_file,
+)
 
 # ── SSH key file validation ──────────────────────────────────────────────
 
 def test_validate_ssh_key_file_valid(tmp_path):
     key = tmp_path / "id_ed25519"
-    key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA...\n-----END OPENSSH PRIVATE KEY-----\n")
+    key.write_text(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA...\n"
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    )
     _validate_ssh_key_file(str(key))  # should not raise
 
 
@@ -145,6 +145,7 @@ def test_store_ssh_rejects_duplicate_name():
 def test_use_ssh_passphrase_via_stdin_only():
     """Verify passphrase is passed via subprocess input, not a file."""
     import inspect
+
     from vaultwarden import tools
     source = inspect.getsource(tools.h_use_ssh)
     assert "input=passphrase" in source
