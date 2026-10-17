@@ -1,4 +1,3 @@
-# vaultwarden/errors.py — v0.2.8
 """Structured error types and LLM-safe error responses for the Vaultwarden plugin.
 
 Error response format (per plan §11):

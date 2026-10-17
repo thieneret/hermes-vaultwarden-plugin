@@ -1,4 +1,3 @@
-# vaultwarden/auth.py — v0.2.8
 """Auth Manager + Session Store (plan §4, §5).
 
 v0.2.8: this module imports `os` at top level — the SSH key wrappers

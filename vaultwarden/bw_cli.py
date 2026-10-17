@@ -1,4 +1,3 @@
-# vaultwarden/bw_cli.py — v0.2.8
 """Thin, isolated wrapper around the ``bw`` (Bitwarden CLI) binary.
 
 Every subprocess is executed with a MINIMAL, explicitly constructed env:

@@ -1,4 +1,3 @@
-# vaultwarden/__init__.py — v0.2.3
 """Hermes Agent — Vaultwarden secrets management plugin (v0.2.3).
 
 Entry point: ``register(ctx)`` (see plan §4/§12).
@@ -19,8 +18,7 @@ from typing import Any
 from .auth import AuthManager, ensure_appdata_dir
 from .bw_cli import BwCli, find_bw_binary
 from .config import PluginConfig, load_config
-from .hooks import (make_placeholder_resolver, make_post_cleanup_hook,
-                    make_session_end_hook)
+from .hooks import make_placeholder_resolver, make_post_cleanup_hook, make_session_end_hook
 from .placeholders import PlaceholderRegistry
 from .security import get_logger
 from .tools import get_tools

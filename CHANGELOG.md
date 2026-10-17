@@ -5,6 +5,25 @@ Author: **thieneret**
 
 ---
 
+## [0.3.2] — Version Headers Removal & Lint Cleanup
+
+### Removed
+- Per-file version header comments from all `.py` files — version is now
+  declared in exactly two places: `plugin.yaml` and `pyproject.toml`
+- `tests/test_version_headers.py` (per-file header assertions)
+
+### Changed
+- Plugin.yaml version check relocated to `test_integration.py` as a
+  stronger test that verifies plugin.yaml and pyproject.toml versions match
+
+### Fixed
+- All ruff linting errors (I001, E401, F401, F841, E501) for a clean CI run
+- Auto-sorted imports across production and test files
+- Removed unused imports and local variables
+
+### Added
+- None (test count decreased due to version header test removal)
+
 ## [0.3.0] — Infrastructure & Developer Experience
 
 ### Added

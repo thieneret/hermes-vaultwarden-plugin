@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import stat
 import sys
 import tempfile
@@ -12,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from vaultwarden.auth import AuthManager            # noqa: E402
+from vaultwarden.auth import AuthManager  # noqa: E402
 from vaultwarden.config import PluginConfig, load_config  # noqa: E402
 from vaultwarden.placeholders import PlaceholderRegistry  # noqa: E402
 

@@ -110,11 +110,8 @@ def test_ensure_appdata_dir_chmod700(tmp_path):
 
 
 def test_unavailable_before_init():
-    class Dummy:
-        pass
     # fresh manager without ensure_authenticated is still CONFIGURED-capable;
     # UNINITIALIZED gate exercised via check_fn semantics:
-    cfg = make_config()
     mgr = AuthManager.__new__(AuthManager)  # bypass init on purpose
     mgr._state = AuthState.UNINITIALIZED
     assert mgr.is_available() is False
@@ -196,8 +193,8 @@ def test_do_unlock_has_no_early_return_guard():
 
 def test_auth_empty_userid_forces_reauth(monkeypatch):
     """SECURITY (integration): bw status WITHOUT userId => re-auth, no adoption."""
-    from unittest.mock import MagicMock
     import threading
+    from unittest.mock import MagicMock
 
     auth = AuthManager.__new__(AuthManager)
     auth._lock = threading.RLock()

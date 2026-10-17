@@ -1,4 +1,3 @@
-# vaultwarden/config.py — v0.2.3
 """Configuration loading for the Vaultwarden plugin (plan §4, §9).
 
 Layers:

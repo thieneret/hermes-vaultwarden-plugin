@@ -7,7 +7,7 @@ import threading
 import pytest
 
 from vaultwarden import errors
-from vaultwarden.placeholders import PlaceholderRegistry, TOKEN_PREFIX
+from vaultwarden.placeholders import TOKEN_PREFIX, PlaceholderRegistry
 
 TOKEN_RE = re.compile(r"^__VW_SECRET_[0-9a-f]{12}__$")
 
@@ -78,7 +78,8 @@ def test_max_placeholders_cap():
 
 def test_clear_wipes_all():
     reg = PlaceholderRegistry()
-    reg.create("a", "password"); reg.create("b", "notes")
+    reg.create("a", "password")
+    reg.create("b", "notes")
     reg.clear()
     assert reg.snapshot() == {}
 
@@ -118,6 +119,8 @@ def test_concurrent_consume_single_winner():
             pass
 
     ts = [threading.Thread(target=worker) for _ in range(10)]
-    for t in ts: t.start()
-    for t in ts: t.join()
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
     assert len(winners) == 1   # exactly one resolution despite races
