@@ -552,12 +552,6 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     return _tools
 
 
-# ── SSH Key Management helpers (v0.2.8) ──────────────────────────────────
-# Module-level mirrors of the closures above so they are importable and
-# unit-testable in isolation (tests/test_ssh_tools_v028.py). The handlers
-# registered by get_tools() close over the auth/config instances; these
-# helpers carry the same validation/resolution logic.
-
 _SSH_KEY_PREFIXES = ("-----BEGIN", "ssh-", "ecdsa-", "ssh-ed25519")
 
 
@@ -642,11 +636,6 @@ def _resolve_socket_path(ssh_auth_sock: str | None) -> tuple[str, bool]:
         else:
             sock = _start_agent_default()
             return sock, True
-
-
-def _ssh_tools(auth, config):
-    """Return {tool_name: bound handler} from get_tools() (v0.2.8 helper)."""
-    return {s["name"]: h for s, h in get_tools(auth, config, None)}
 
 
 def h_store_ssh(args: dict, **kw: Any) -> str:
@@ -854,100 +843,7 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
                     pass
     return _guard(run)
 
-    # ================================================== SSH key management
-    # v0.2.8: store/update/delete/use SSH keys (login item + file attachment)
 
-    _SSH_KEY_PREFIXES = ("-----BEGIN", "ssh-", "ecdsa-", "ssh-ed25519")
-
-    def _validate_ssh_key_file(path: str) -> None:
-        """Validate that path exists, is readable, and looks like an SSH key."""
-        if not os.path.isfile(path):
-            # errors.NotFoundError carries code "NOT_FOUND".
-            raise errors.NotFoundError(
-                f"File not found: {path}",
-                suggestion="Provide an absolute path to an existing SSH key file.")
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                head = f.read(256)
-        except OSError as exc:
-            raise _vault_error(
-                f"Cannot read file: {path}", code="VALIDATION_ERROR",
-                suggestion="Check file permissions.") from exc
-        if not any(head.strip().startswith(p) for p in _SSH_KEY_PREFIXES):
-            raise _vault_error(
-                f"File does not appear to be an SSH key: {path}",
-                code="VALIDATION_ERROR",
-                suggestion="Expected a file starting with '-----BEGIN' or 'ssh-'.")
-
-    def _resolve_socket_path(ssh_auth_sock: str | None) -> tuple[str, bool]:
-        """Resolve the ssh-agent socket path.
-
-        Returns (socket_path, agent_started_by_plugin).
-
-        Resolution logic:
-        1. If ssh_auth_sock is provided:
-           - Contains '/' or is an existing file → treat as direct path
-           - Otherwise → treat as env var name, resolve it
-           - Check if agent runs on that socket; if not, start one with -a
-        2. If not provided:
-           - Read $SSH_AUTH_SOCK
-           - If set and agent running → use it
-           - If set but agent NOT running → start agent with -a $SSH_AUTH_SOCK
-           - If empty → start agent, parse socket from output
-        """
-        def _agent_running(sock: str) -> bool:
-            try:
-                r = subprocess.run(["ssh-add", "-l"],
-                                   env={**os.environ, "SSH_AUTH_SOCK": sock},
-                                   capture_output=True, text=True, timeout=5)
-                return r.returncode in (0, 1)
-            except Exception:
-                return False
-
-        def _start_agent_at(sock: str) -> None:
-            subprocess.run(["ssh-agent", "-a", sock],
-                           capture_output=True, text=True, timeout=10)
-
-        def _start_agent_default() -> str:
-            r = subprocess.run(["ssh-agent"], capture_output=True, text=True,
-                               timeout=10)
-            for line in (r.stdout or "").splitlines():
-                if line.startswith("SSH_AUTH_SOCK="):
-                    return line.split("=", 1)[1].rstrip(";")
-            raise _vault_error(
-                "Failed to start ssh-agent: could not parse socket path.",
-                code="AGENT_ERROR")
-
-        if ssh_auth_sock:
-            if "/" in ssh_auth_sock or os.path.exists(ssh_auth_sock):
-                sock = ssh_auth_sock
-            else:
-                env_val = os.environ.get(ssh_auth_sock, "")
-                if not env_val:
-                    raise _vault_error(
-                        f"Environment variable '{ssh_auth_sock}' is not set or empty.",
-                        code="VALIDATION_ERROR",
-                        suggestion=(
-                            "Provide a direct socket path (e.g. /tmp/ssh-xxx/agent.123) "
-                            "or set the environment variable first."))
-                sock = env_val
-
-            if _agent_running(sock):
-                return sock, False
-            else:
-                _start_agent_at(sock)
-                return sock, True
-        else:
-            env_sock = os.environ.get("SSH_AUTH_SOCK", "")
-            if env_sock:
-                if _agent_running(env_sock):
-                    return env_sock, False
-                else:
-                    _start_agent_at(env_sock)
-                    return env_sock, True
-            else:
-                sock = _start_agent_default()
-                return sock, True
 
     def h_store_ssh(args: dict, **kw: Any) -> str:
         def run():
@@ -978,7 +874,6 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
             }
         return _guard(run)
 
-    yield schemas.VAULTWARDEN_STORE_SSH, h_store_ssh
 
     def h_update_ssh(args: dict, **kw: Any) -> str:
         def run():
@@ -1028,7 +923,6 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
             return {"updated": True, "id": item_id, "name": name}
         return _guard(run)
 
-    yield schemas.VAULTWARDEN_UPDATE_SSH, h_update_ssh
 
     def h_delete_ssh(args: dict, **kw: Any) -> str:
         def run():
@@ -1058,7 +952,6 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
             return {"deleted": True, "id": item_id, "permanent": permanent}
         return _guard(run)
 
-    yield schemas.VAULTWARDEN_DELETE_SSH, h_delete_ssh
 
     def h_use_ssh(args: dict, **kw: Any) -> str:
         def run():
@@ -1138,104 +1031,6 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
                         os.unlink(key_path)
                     except OSError:
                         pass
-        return _guard(run)
-
-    yield schemas.VAULTWARDEN_USE_SSH, h_use_ssh
-
-
-# ── SSH Key Management helpers (v0.2.8) ──────────────────────────────────
-# Module-level mirrors of the closures above so they are importable and
-# unit-testable in isolation (tests/test_ssh_tools_v028.py). The handlers
-# registered by get_tools() close over the auth/config instances; these
-# helpers carry the same validation/resolution logic.
-
-_SSH_KEY_PREFIXES = ("-----BEGIN", "ssh-", "ecdsa-", "ssh-ed25519")
-
-
-def _validate_ssh_key_file(path: str) -> None:
-    """Validate that path exists, is readable, and looks like an SSH key."""
-    if not os.path.isfile(path):
-        # errors.NotFoundError carries code "NOT_FOUND".
-        raise errors.NotFoundError(
-            f"File not found: {path}",
-            suggestion="Provide an absolute path to an existing SSH key file.")
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            head = f.read(256)
-    except OSError as exc:
-        raise _vault_error(
-            f"Cannot read file: {path}", code="VALIDATION_ERROR",
-            suggestion="Check file permissions.") from exc
-    if not any(head.strip().startswith(p) for p in _SSH_KEY_PREFIXES):
-        raise _vault_error(
-            f"File does not appear to be an SSH key: {path}",
-            code="VALIDATION_ERROR",
-            suggestion="Expected a file starting with '-----BEGIN' or 'ssh-'.")
-
-
-def _resolve_socket_path(ssh_auth_sock: str | None) -> tuple[str, bool]:
-    """Resolve the ssh-agent socket path (module-level mirror, v0.2.8).
-
-    Returns (socket_path, agent_started_by_plugin). Resolution rules are
-    documented on the closure version inside get_tools().
-    """
-    def _agent_running(sock: str) -> bool:
-        try:
-            r = subprocess.run(["ssh-add", "-l"],
-                               env={**os.environ, "SSH_AUTH_SOCK": sock},
-                               capture_output=True, text=True, timeout=5)
-            return r.returncode in (0, 1)
-        except Exception:
-            return False
-
-    def _start_agent_at(sock: str) -> None:
-        subprocess.run(["ssh-agent", "-a", sock],
-                       capture_output=True, text=True, timeout=10)
-
-    def _start_agent_default() -> str:
-        r = subprocess.run(["ssh-agent"], capture_output=True, text=True,
-                           timeout=10)
-        for line in (r.stdout or "").splitlines():
-            if line.startswith("SSH_AUTH_SOCK="):
-                return line.split("=", 1)[1].rstrip(";")
-        raise _vault_error(
-            "Failed to start ssh-agent: could not parse socket path.",
-            code="AGENT_ERROR")
-
-    if ssh_auth_sock:
-        if "/" in ssh_auth_sock or os.path.exists(ssh_auth_sock):
-            sock = ssh_auth_sock
-        else:
-            env_val = os.environ.get(ssh_auth_sock, "")
-            if not env_val:
-                raise _vault_error(
-                    f"Environment variable '{ssh_auth_sock}' is not set or empty.",
-                    code="VALIDATION_ERROR",
-                    suggestion=(
-                        "Provide a direct socket path (e.g. /tmp/ssh-xxx/agent.123) "
-                        "or set the environment variable first."))
-            sock = env_val
-
-        if _agent_running(sock):
-            return sock, False
-        else:
-            _start_agent_at(sock)
-            return sock, True
-    else:
-        env_sock = os.environ.get("SSH_AUTH_SOCK", "")
-        if env_sock:
-            if _agent_running(env_sock):
-                return env_sock, False
-            else:
-                _start_agent_at(env_sock)
-                return env_sock, True
-        else:
-            sock = _start_agent_default()
-            return sock, True
-
-
-# ---------------------------------------------------------- item builders
-_TYPE_NUMBERS = {"login": 1, "note": 2, "card": 3, "identity": 4}
 
 
 def _build_item(args: dict) -> dict:
