@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-vaultwarden-plugin"
+version = "0.3.0"
+description = "Vaultwarden secrets management and SSH key integration for Hermes Agent."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "thieneret" }
+]
+keywords = ["hermes", "hermes-agent", "vaultwarden", "bitwarden", "secrets", "ssh"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration",
+]
+# No runtime dependencies — the plugin uses only Python stdlib
+# (json, base64, subprocess, os, tempfile) plus the external
+# Bitwarden CLI (`bw`) binary and OpenSSH tools.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "ruff>=0.4.0",
+    "mypy>=1.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/thieneret/hermes-vaultwarden-plugin"
+Repository = "https://github.com/thieneret/hermes-vaultwarden-plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vaultwarden"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "vaultwarden",
+    "plugin.yaml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["vaultwarden/tests"]
+addopts = "-p no:libtmux"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
