@@ -1,9 +1,12 @@
-# Vaultwarden Plugin for Hermes Agent
-
 > ⚠️ **WARNING: This entire plugin was vibe-coded.**
 > It was developed through AI-assisted coding sessions without
 > traditional manual code review of every line. Use at your own
 > risk. Audit before production deployment.
+
+> ⚠️ This is my first "vibe-coded" program, intended primarily for my own use. Use it entirely at your own risk!
+> ⚠️ AI audit results: 
+
+# Vaultwarden Plugin for Hermes Agent
 
 Secure secrets management for Hermes Agent via Vaultwarden. Provides safe access to vault items through a placeholder injection architecture, plus SSH key storage and ssh-agent integration.
 
