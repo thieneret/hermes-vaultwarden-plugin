@@ -162,3 +162,234 @@ def test_direct_retrieval_escape_hatch(bw_cli, registry):
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
     assert res.get("direct_value") == "sup3r-s3cret-pg!"
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_guard_json_string_v024.py — _guard() JSON-string exit
+# ---------------------------------------------------------------------------
+
+def test_guard_returns_json_string():
+    """v0.2.4: _guard must return str, not dict."""
+    import json
+    from vaultwarden.tools import _guard
+
+    result = _guard(lambda: {"key": "value", "count": 42})
+    assert isinstance(result, str), f"Expected str, got {type(result)}"
+    parsed = json.loads(result)
+    assert parsed == {"key": "value", "count": 42}
+
+
+def test_guard_error_returns_json_string():
+    """v0.2.4: _guard error paths must also return str."""
+    import json
+    from vaultwarden.tools import _guard
+    from vaultwarden import errors
+
+    def failing():
+        raise errors.NotFoundError("Item not found.")
+
+    result = _guard(failing)
+    assert isinstance(result, str), f"Expected str, got {type(result)}"
+    parsed = json.loads(result)
+    assert "error" in parsed
+    assert parsed["error_code"] == "NOT_FOUND"
+
+
+def test_all_handlers_return_str():
+    """v0.2.4: every tool handler must return str via _guard."""
+    import json
+    from unittest.mock import MagicMock
+    from vaultwarden.tools import get_tools
+    from vaultwarden.placeholders import PlaceholderRegistry
+
+    auth = MagicMock()
+    auth.status_snapshot.return_value = {"auth_state": "unlocked"}
+    auth.sync.return_value = {"synced": True}
+    auth.list_items.return_value = []
+    auth.generate_password.return_value = "test-password-123"
+
+    config = MagicMock()
+    config.allow_write = True
+    config.allow_direct_secret_retrieval = False
+
+    registry = PlaceholderRegistry(ttl_seconds=300, max_entries=50)
+
+    for schema, handler in get_tools(auth, config, registry):
+        tool_name = schema["name"]
+        try:
+            if tool_name == "vaultwarden_status":
+                result = handler({})
+            elif tool_name == "vaultwarden_sync":
+                result = handler({"force": False})
+            elif tool_name == "vaultwarden_list":
+                result = handler({"limit": 10})
+            elif tool_name == "vaultwarden_search":
+                result = handler({"query": "test"})
+            elif tool_name == "vaultwarden_generate_password":
+                result = handler({"mode": "password", "length": 16})
+            else:
+                continue  # skip tools that need complex mocking
+
+            assert isinstance(result, str), \
+                f"{tool_name}: expected str, got {type(result).__name__}"
+            json.loads(result)  # must be valid JSON
+        except Exception as exc:
+            raise AssertionError(f"{tool_name}: handler failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_bugfixes_v12.py (BUG-1..BUG-5 tool parts)
+# ---------------------------------------------------------------------------
+
+def test_generate_password_uses_flag_syntax(monkeypatch):
+    """bw generate <len> --uppercase --lowercase --number --special (no 1/0)."""
+    import json as _json
+    from vaultwarden.auth import AuthManager
+    from vaultwarden.tools import get_tools
+    from vaultwarden.placeholders import PlaceholderRegistry
+    from vaultwarden.tests.conftest import make_config
+
+    captured: list[list[str]] = []
+
+    class FakeBw:
+        def generate_password(self, session_key, args):
+            captured.append(list(args))
+            return "genpw"
+
+    cfg = make_config()
+    auth = AuthManager.__new__(AuthManager)          # skip real init
+    auth._bw = FakeBw()                              # noqa: SLF001
+    auth.run_with_recovery = lambda fn: fn("sess")   # type: ignore[attr-defined]
+
+    def wrap(handler):
+        def inner(args, **kw):
+            r = handler(args, **kw)
+            return _json.loads(r) if isinstance(r, str) else r
+        return inner
+
+    tools = {s["name"]: wrap(h) for s, h in get_tools(auth, cfg, PlaceholderRegistry())}
+
+    res = tools["vaultwarden_generate_password"]({"mode": "password", "length": 20})
+    assert res["generated"] == "genpw"
+    assert captured[-1] == ["20", "--uppercase", "--lowercase", "--number", "--special"]
+
+    res = tools["vaultwarden_generate_password"](
+        {"mode": "password", "length": 16, "uppercase": False, "special": False})
+    assert captured[-1] == ["16", "--lowercase", "--number"]  # only True flags kept
+
+    res = tools["vaultwarden_generate_password"](
+        {"mode": "passphrase", "words": 4, "separator": "-"})
+    assert captured[-1] == ["--passphrase", "-w", "4", "--separator", "-"]
+
+
+def test_generate_password_works_without_write_permission(tools_by_name):
+    """BUG-2: generation is not a vault mutation -> allow_write=false is fine."""
+    res = tools_by_name["vaultwarden_generate_password"]({"length": 24})
+    assert "error" not in res
+    assert res["generated"] == "Zk9#xQ2vLm8pRt4wYb7n"  # fake bw deterministic
+    pass_res = tools_by_name["vaultwarden_generate_password"](
+        {"mode": "passphrase", "words": 6, "separator": "."})
+    assert pass_res["mode"] == "passphrase" and "error" not in pass_res
+
+
+def test_generate_password_via_fake_bw_flags(tools_by_name):
+    """End-to-end through the fake bw: unknown positional 1/0 args would be
+    rejected by a real CLI; the flag form must succeed in both modes."""
+    for args in ({"mode": "password", "length": 20},
+                 {"mode": "passphrase", "words": 3}):
+        res = tools_by_name["vaultwarden_generate_password"](args)
+        assert "error" not in res, res
+
+
+def test_list_folder_id_uses_folderid_flag(bw_cli, appdata, monkeypatch):
+    """vaultwarden_list(folder_id=...) must invoke `bw list items --folderid abc`."""
+    import json as _json
+    from vaultwarden.auth import AuthManager
+    from vaultwarden.tools import get_tools
+    from vaultwarden.placeholders import PlaceholderRegistry
+    from vaultwarden.tests.conftest import make_config
+
+    seen: list = []
+    orig = bw_cli.list_items
+
+    def spy(session_key, filters=None):
+        seen.append(list(filters or []))
+        return orig(session_key, filters)
+
+    monkeypatch.setattr(bw_cli, "list_items", spy)
+    cfg = make_config()
+    auth = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
+    auth.ensure_authenticated()
+
+    def wrap(handler):
+        def inner(args, **kw):
+            r = handler(args, **kw)
+            return _json.loads(r) if isinstance(r, str) else r
+        return inner
+
+    tools = {s["name"]: wrap(h) for s, h in
+             get_tools(auth, cfg, PlaceholderRegistry())}
+
+    res = tools["vaultwarden_list"]({"folder_id": "f1"})
+    assert seen[-1] == ["--folderid", "f1"]           # exact flag form
+    assert res["total"] == 1 and res["items"][0]["name"] == "Postgres prod"
+
+    res_note = tools["vaultwarden_list"]({"type": "note"})
+    assert seen[-1] == []                             # no --filter-type passed
+    assert [i["name"] for i in res_note["items"]] == ["API keys"]
+
+
+def test_list_bad_folder_returns_empty(tools_by_name):
+    res = tools_by_name["vaultwarden_list"]({"folder_id": "does-not-exist"})
+    assert res["total"] == 0 and res["items"] == []
+
+
+def test_delete_permanent_with_confirm(write_tools_by_name):
+    res = write_tools_by_name["vaultwarden_delete"](
+        {"item_id": "aaaa1111-0000-0000-0000-000000000001",
+         "confirm": True, "permanent": True})
+    assert res["deleted"] is True and res["permanent"] is True
+
+
+def test_search_uses_native_search_flag(bw_cli, monkeypatch):
+    import json as _json
+    from vaultwarden.auth import AuthManager
+    from vaultwarden.tools import get_tools
+    from vaultwarden.placeholders import PlaceholderRegistry
+    from vaultwarden.tests.conftest import make_config
+
+    seen: list = []
+    orig = bw_cli.list_items
+
+    def spy(session_key, filters=None):
+        seen.append(list(filters or []))
+        return orig(session_key, filters)
+
+    monkeypatch.setattr(bw_cli, "list_items", spy)
+    cfg = make_config()
+    auth = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
+    auth.ensure_authenticated()
+
+    def wrap(handler):
+        def inner(args, **kw):
+            r = handler(args, **kw)
+            return _json.loads(r) if isinstance(r, str) else r
+        return inner
+
+    tools = {s["name"]: wrap(h) for s, h in
+             get_tools(auth, cfg, PlaceholderRegistry())}
+
+    res = tools["vaultwarden_search"]({"query": "github"})
+    assert seen[-1] == ["--search", "github"]         # native path used
+    assert res["count"] == 0                          # fake bw: no match
+
+    res2 = tools["vaultwarden_search"]({"query": "postgres"})
+    assert seen[-1] == ["--search", "postgres"]
+    assert res2["count"] >= 1
+
+    # uri field is NOT natively searchable -> full-list fallback expected
+    tools["vaultwarden_search"]({"query": "grafana", "field": "uri"})
+    assert seen[-1] == []
+    # explicit type filter also falls back to client-side filtering
+    tools["vaultwarden_search"]({"query": "api", "type": "note"})
+    assert seen[-1] == []

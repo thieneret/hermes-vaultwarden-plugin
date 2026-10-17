@@ -5,6 +5,26 @@ Author: **thieneret**
 
 ---
 
+## [0.2.9] — Test Suite Consolidation
+
+### Changed
+- Consolidated 7 version-specific test files into a clean functional
+  structure (test_config, test_auth, test_tools, test_schemas,
+  test_security, test_ssh_tools, etc.)
+- Removed version numbers from test filenames — tests now target the
+  current behavior, not a historical version
+- Deduplicated all version-header assertions into a single
+  data-driven test in test_version_headers.py
+
+### Removed
+- test_config_hermes_api_v018.py, test_bugfixes_v12.py,
+  test_security_hardening_v022.py, test_cleanup_hardening_v023.py,
+  test_guard_json_string_v024.py, test_cleanup_hardening_v026.py,
+  test_ssh_tools_v028.py (contents merged into functional test files)
+- Obsolete tests asserting removed behavior: `input_schema` key
+  (now `parameters`), handler `dict` return (now `str`),
+  `auto_unlock` config key (removed)
+
 ## [0.2.8] — SSH Key Management — 2026-10-17
 
 ### Added
