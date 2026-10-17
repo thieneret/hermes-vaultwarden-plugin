@@ -83,8 +83,8 @@ def test_version_headers_v024():
     from pathlib import Path
 
     pkg_dir = Path(vaultwarden.__file__).resolve().parent
-    # v0.2.7: tools.py bumped for the explicit-null cleanup.
-    expected_versions = {"tools.py": "v0.2.7"}
+    # v0.2.8: tools.py bumped again for the SSH key management tools.
+    expected_versions = {"tools.py": "v0.2.8"}
     for name, expected in expected_versions.items():
         path = pkg_dir / name
         with open(path, 'r') as f:

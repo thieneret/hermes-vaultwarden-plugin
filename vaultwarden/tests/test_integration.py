@@ -43,12 +43,16 @@ def _register_ok(monkeypatch, tmp_path, fake_bw, section_extra=None, env_extra=N
 def test_register_full_flow_and_tool_count(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     assert ok is True
-    assert len(ctx.tools) == 9
+    # v0.2.8: 9 base tools + 4 SSH key management tools
+    assert len(ctx.tools) == 13
     names = {t["name"] for t in ctx.tools}
     assert names == {
         "vaultwarden_status", "vaultwarden_sync", "vaultwarden_list",
         "vaultwarden_search", "vaultwarden_get_secret_ref", "vaultwarden_store",
-        "vaultwarden_update", "vaultwarden_delete", "vaultwarden_generate_password"}
+        "vaultwarden_update", "vaultwarden_delete", "vaultwarden_generate_password",
+        # v0.2.8: SSH key management
+        "vaultwarden_store_ssh", "vaultwarden_update_ssh",
+        "vaultwarden_delete_ssh", "vaultwarden_use_ssh"}
     assert all(t["toolset"] == "vaultwarden" for t in ctx.tools)
     assert all(t["check_fn"]() for t in ctx.tools)
     assert [k for k, _ in ctx.middleware] == ["tool_request"]
