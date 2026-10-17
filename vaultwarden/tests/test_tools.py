@@ -393,3 +393,30 @@ def test_search_uses_native_search_flag(bw_cli, monkeypatch):
     # explicit type filter also falls back to client-side filtering
     tools["vaultwarden_search"]({"query": "api", "type": "note"})
     assert seen[-1] == []
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_store_edit_v027.py (payload builder parts)
+# ---------------------------------------------------------------------------
+
+def test_build_item_has_no_explicit_nulls():
+    """v0.2.7: _build_item must not inject match/passwordRevisionDate nulls."""
+    from vaultwarden.tools import _build_item
+    item = _build_item({"type": "login", "name": "x", "username": "u",
+                        "password": "p", "uri": "https://example.com"})
+    login = item["login"]
+    assert "passwordRevisionDate" not in login
+    assert login["uris"][0] == {"uri": "https://example.com"}
+    assert "match" not in login["uris"][0]
+
+
+def test_apply_updates_has_no_explicit_nulls():
+    """v0.2.7: _apply_updates must not inject match/passwordRevisionDate nulls."""
+    from vaultwarden.tools import _apply_updates
+    current = {"id": "abc", "name": "old", "login": {"username": "u"}}
+    merged = _apply_updates(current, {"password": "newpw",
+                                      "uri": "https://example.com"})
+    login = merged["login"]
+    assert "passwordRevisionDate" not in login
+    assert login["uris"][0] == {"uri": "https://example.com"}
+    assert "match" not in login["uris"][0]

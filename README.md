@@ -191,7 +191,7 @@ vaultwarden/
 python -m pytest vaultwarden/tests/ -q -p no:libtmux
 ```
 
-Current suite: **184 tests**.
+Current suite: **178 tests**.
 
 ## License
 

@@ -250,3 +250,46 @@ def test_check_fn_is_named_closure(fake_bw, appdata):
     assert check() is False                      # uninitialised state
     auth.ensure_authenticated()
     assert check() is True
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_store_edit_v027.py (auth forwarding parts)
+# ---------------------------------------------------------------------------
+
+def test_auth_edit_item_passes_item_id():
+    """v0.2.7: auth.edit_item must forward the item id to bw_cli.edit_item."""
+    from unittest.mock import MagicMock
+    bw = MagicMock()
+    bw.edit_item.return_value = {"id": "abc"}
+
+    config = MagicMock()
+    config.session_timeout_seconds = 14400
+
+    auth = AuthManager(bw, config, client_secret="cs", master_password="mp")
+    auth._state = AuthState.UNLOCKED
+    auth._session_key = "SESSION"
+
+    auth.edit_item({"id": "abc", "name": "n"})
+    args, _ = bw.edit_item.call_args
+    assert args[1] == "abc", f"edit_item called with args: {args}"
+
+
+def test_auth_create_item_uses_new_encode_item_signature():
+    """v0.2.7: auth.create_item calls encode_item with only the item."""
+    import base64
+    from unittest.mock import MagicMock
+    bw = MagicMock()
+    bw.create_item.return_value = {"id": "abc"}
+
+    config = MagicMock()
+    config.session_timeout_seconds = 14400
+
+    auth = AuthManager(bw, config, client_secret="cs", master_password="mp")
+    auth._state = AuthState.UNLOCKED
+    auth._session_key = "SESSION"
+
+    auth.create_item({"name": "n"})
+    args, _ = bw.create_item.call_args
+    # create_item(session, blob) — 2 args, blob is valid base64
+    assert len(args) == 2
+    base64.b64decode(args[1])  # must not raise
