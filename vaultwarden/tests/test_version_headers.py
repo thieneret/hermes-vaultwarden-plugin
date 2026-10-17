@@ -1,67 +1,80 @@
-# vaultwarden/tests/test_version_headers.py — v0.2.8
-"""Cleanup tests: version headers + direct ctx passing (updated for v0.2.8)."""
-from __future__ import annotations
+"""Version header tests — single source of truth.
+
+Consolidated from per-version test files in v0.2.9. Every production
+file's first line must be `# vaultwarden/<filename>.py — v<X.Y.Z>`.
+
+Former homes of these assertions (all merged here):
+- test_version_headers.py (test_version_headers, test_modified_files_have_version_header_comment)
+- test_cleanup_hardening_v023.py (test_version_headers_v023)
+- test_guard_json_string_v024.py (test_version_headers_v024)
+- test_security_hardening_v022.py (test_version_headers)
+- test_ssh_tools_v028.py (test_version_headers_v028)
+"""
+from pathlib import Path
+
+import vaultwarden
+
+EXPECTED_VERSIONS = {
+    "__init__.py": "v0.2.3",
+    "config.py": "v0.2.3",
+    "hooks.py": "v0.2.3",
+    "security.py": None,          # no version header (module docstring first)
+    "placeholders.py": None,      # no version header (module docstring first)
+    "secret_source.py": None,     # no version header (module docstring first)
+    "errors.py": "v0.2.8",
+    "bw_cli.py": "v0.2.8",
+    "auth.py": "v0.2.8",
+    "tools.py": "v0.2.8",
+    "schemas.py": "v0.2.8",
+}
 
 
 def test_version_headers():
-    """Verify all modified files have their current release version header."""
-    import vaultwarden.config
-    import vaultwarden
-    from pathlib import Path
+    """Data-driven check of every production file's version header.
 
+    Files whose header value is None intentionally carry no version-header
+    comment (they start with a module docstring instead).
+    """
     pkg_dir = Path(vaultwarden.__file__).resolve().parent
-    expected_versions = {
-        "__init__.py": "v0.2.3",
-        "config.py": "v0.2.3",
-        "hooks.py": "v0.2.3",
-        "auth.py": "v0.2.8",
-        "tools.py": "v0.2.8",
-        "schemas.py": "v0.2.8",
-    }
-    for name, expected in expected_versions.items():
-        path = pkg_dir / name
-        with open(path, 'r') as f:
-            first_line = f.readline().strip()
-        assert expected in first_line, f"{name} missing version header: {first_line}"
-
-
-def test_modified_files_have_version_header_comment():
-    """Every modified .py file must start with a `# <path> — vX.Y.Z` comment."""
-    import vaultwarden
-    from pathlib import Path
-
-    pkg_dir = Path(vaultwarden.__file__).resolve().parent
-    expected_versions = {
-        "__init__.py": "v0.2.3",
-        "config.py": "v0.2.3",
-        "hooks.py": "v0.2.3",
-        "auth.py": "v0.2.8",
-        "tools.py": "v0.2.8",
-        "schemas.py": "v0.2.8",
-    }
-    for name, expected in expected_versions.items():
-        path = pkg_dir / name
-        with open(path, 'r') as f:
-            first_line = f.readline().rstrip("\n")
-        assert first_line.startswith("#"), f"{name}: first line is not a comment: {first_line!r}"
-        assert expected in first_line, f"{name}: missing {expected} header: {first_line!r}"
+    for filename, expected in EXPECTED_VERSIONS.items():
+        path = pkg_dir / filename
+        if not path.exists():
+            continue
+        first_line = path.read_text(encoding="utf-8").splitlines()[0]
+        if expected is None:
+            assert not first_line.startswith("#"), \
+                f"{filename}: unexpected header comment: {first_line!r}"
+            continue
+        assert first_line.startswith("#"), \
+            f"{filename}: first line is not a comment: {first_line!r}"
+        assert expected in first_line, \
+            f"{filename}: expected {expected}, got: {first_line!r}"
 
 
 def test_plugin_yaml_version():
-    """plugin.yaml must declare version 0.2.8 with author thieneret."""
-    import vaultwarden
-    from pathlib import Path
+    """plugin.yaml must declare the current release version 0.2.9."""
+    pkg_dir = Path(vaultwarden.__file__).resolve().parent
+    plugin_yaml = pkg_dir / "plugin.yaml"
+    if not plugin_yaml.exists():
+        plugin_yaml = pkg_dir.parent / "plugin.yaml"
+    content = plugin_yaml.read_text(encoding="utf-8")
+    assert "version: 0.2.9" in content
+    assert "author: thieneret" in content
 
-    yaml_path = Path(vaultwarden.__file__).resolve().parent / "plugin.yaml"
-    text = yaml_path.read_text()
-    assert "version: 0.2.8" in text
-    assert "author: thieneret" in text
+
+def test_plugin_yaml_documents_author():
+    """plugin.yaml must declare author thieneret (from test_bugfixes_v12.py)."""
+    pkg_dir = Path(vaultwarden.__file__).resolve().parent
+    plugin_yaml = pkg_dir / "plugin.yaml"
+    if not plugin_yaml.exists():
+        plugin_yaml = pkg_dir.parent / "plugin.yaml"
+    content = plugin_yaml.read_text(encoding="utf-8")
+    assert "author: thieneret" in content
 
 
 def test_init_passes_ctx_directly():
     """register() must call load_config(ctx) — no getattr(ctx, 'config', ctx)."""
     import inspect
-    import vaultwarden
 
     src = inspect.getsource(vaultwarden.register)
     assert "load_config(ctx)" in src

@@ -117,3 +117,157 @@ def test_bool_string_coercion():
     cfg = load_config(FakePluginContext({"enabled": "true",
                                          "allow_write": "yes"}), env={})
     assert cfg.enabled and cfg.allow_write
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_config_hermes_api_v018.py (v0.2.9 test restructure)
+# ---------------------------------------------------------------------------
+
+def test_get_config_api_plugin_relative_keys():
+    ctx = FakePluginContext({
+        "enabled": True,
+        "server_url": "https://vault.example.com",
+        "client_id": "user.abc-123",
+        "client_secret_env": "VW_CLIENT_SECRET",
+        "allow_write": True,
+        "bw_cli_path": "/opt/data/bin/bw",
+    })
+    cfg = load_config(ctx, env={})
+    assert cfg.enabled is True
+    assert cfg.server_url == "https://vault.example.com"
+    assert cfg.client_id == "user.abc-123"
+    assert cfg.allow_write is True
+    assert cfg.bw_cli_path == "/opt/data/bin/bw"
+    # unset keys fall back to _DEFAULTS
+    assert cfg.auto_sync is True
+    assert cfg.sync_interval_seconds == 300
+
+
+def test_get_config_empty_settings_uses_defaults(no_config_fallback):
+    cfg = load_config(FakePluginContext({}), env={})
+    assert cfg.enabled is False
+    assert cfg.server_url == ""
+
+
+def test_object_style_context_wrapping_get_config():
+    class Wrapper:
+        def __init__(self, inner):
+            self.config = inner
+
+    inner = FakePluginContext({"enabled": True, "server_url": "https://wrapped"})
+    cfg = load_config(Wrapper(inner), env={})
+    assert cfg.enabled is True
+    assert cfg.server_url == "https://wrapped"
+
+
+def test_get_config_raising_is_tolerated(no_config_fallback):
+    class BrokenCtx:
+        def get_config(self, key, default=None):
+            raise RuntimeError("no manifest")
+    # Must not raise; falls back to defaults.
+    cfg = load_config(BrokenCtx(), env={})
+    assert cfg.enabled is False
+
+
+def test_no_file_or_dict_fallback(monkeypatch, tmp_path, no_config_fallback):
+    """v0.2.0: raw mappings and file paths are NOT valid sources anymore."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    vaultwarden:\n      settings:\n"
+        "        enabled: true\n        server_url: https://should-not-load\n")
+    with pytest.raises(ConfigError):
+        load_config(str(tmp_path / "config.yaml"), env={})
+    with pytest.raises(ConfigError):
+        load_config({"plugins": {"entries": {"vaultwarden": {"settings": {
+            "server_url": "https://should-not-load"}}}}}, env={})
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_cleanup_hardening_v023.py (config parts)
+# ---------------------------------------------------------------------------
+
+def test_auto_unlock_removed():
+    """v0.2.3: auto_unlock key must not exist in config defaults or plugin.yaml."""
+    from vaultwarden.config import _DEFAULTS
+    assert "auto_unlock" not in _DEFAULTS
+
+    from pathlib import Path
+    import vaultwarden
+    yaml_path = Path(vaultwarden.__file__).resolve().parent / "plugin.yaml"
+    text = yaml_path.read_text()
+    assert "auto_unlock" not in text
+
+
+def test_master_password_mandatory_via_resolve():
+    """v0.2.3: missing master password VALUE must fail at resolve_secret()."""
+    from vaultwarden.config import PluginConfig
+    from vaultwarden import errors
+
+    cfg = PluginConfig(
+        section={"server_url": "https://vault.example.com",
+                 "client_id": "user.12345678-1234-1234-1234-123456789abc"},
+        env_snapshot={},  # no VW_MASTER_PASSWORD in the snapshot
+    )
+    try:
+        cfg.resolve_secret(cfg.master_password_env_name, required=True)
+        assert False, "Should have raised ConfigError"
+    except errors.ConfigError as e:
+        assert "VW_MASTER_PASSWORD" in str(e.message)
+
+
+def test_master_password_env_name_defaults():
+    """v0.2.3: env var NAME always has a sensible default."""
+    from vaultwarden.config import PluginConfig
+    cfg = PluginConfig(section={})
+    assert cfg.master_password_env_name == "VW_MASTER_PASSWORD"
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_bugfixes_v12.py (BUG-6/7 config & misc parts)
+# ---------------------------------------------------------------------------
+
+def test_config_dict_source_needs_no_yaml(monkeypatch):
+    """Plugin config loads from a plain dict even when PyYAML is missing."""
+    import builtins
+    import sys
+    real_import = builtins.__import__
+
+    def blocked(name, *a, **k):
+        if name == "yaml" or name.startswith("yaml."):
+            raise ImportError("No module named 'yaml'")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    monkeypatch.delitem(sys.modules, "yaml", raising=False)
+    from vaultwarden.tests.conftest import make_config
+    cfg = make_config(section={"server_url": "https://vw.example"})
+    assert cfg.server_url == "https://vw.example"     # no crash, no yaml import
+
+
+def test_config_file_source_rejected_without_yaml(tmp_path, monkeypatch):
+    """v0.2.0: file-path sources are no longer supported at all — the plugin
+    reads config ONLY via PluginContext.get_config(), so no YAML parsing is
+    required and a path source raises ConfigError even without PyYAML."""
+    import builtins
+    import sys
+    real_import = builtins.__import__
+
+    def blocked(name, *a, **k):
+        if name == "yaml" or name.startswith("yaml."):
+            raise ImportError("No module named 'yaml'")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    monkeypatch.delitem(sys.modules, "yaml", raising=False)
+
+    f = tmp_path / "flat.yaml"
+    f.write_text("enabled: true\nserver_url: https://from-fallback\n")
+    with pytest.raises(ConfigError):
+        load_config(str(f), env={})
+
+
+def test_plugin_yaml_documents_full_binary_path():
+    text = open(str(__import__("pathlib").Path(
+        __file__).resolve().parents[1] / "plugin.yaml"), encoding="utf-8").read()
+    assert "FULL path" in text
+    assert "directory path alone is NOT sufficient" in text

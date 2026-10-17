@@ -1,4 +1,7 @@
-# vaultwarden/tests/test_ssh_tools_v028.py — v0.2.8
+"""SSH tool tests: key validation, socket resolution, store/use safety.
+
+Renamed from test_ssh_tools_v028.py in the v0.2.9 test consolidation.
+"""
 import base64
 import json
 import os
@@ -164,16 +167,3 @@ def test_plugin_yaml_includes_ssh_tools():
         assert tool in content, f"{tool} missing from plugin.yaml provides_tools"
 
 
-# ── Version headers ──────────────────────────────────────────────────────
-
-def test_version_headers_v028():
-    """Verify modified files have v0.2.8 version header."""
-    import vaultwarden
-    pkg_dir = Path(vaultwarden.__file__).resolve().parent
-    modified = ["schemas.py", "tools.py", "bw_cli.py", "auth.py", "errors.py"]
-    for name in modified:
-        path = pkg_dir / name
-        with open(path, "r") as f:
-            first_line = f.readline().strip()
-        assert "v0.2.8" in first_line, \
-            f"{name} missing v0.2.8 header: {first_line}"

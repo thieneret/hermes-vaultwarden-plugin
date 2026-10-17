@@ -133,3 +133,85 @@ def test_parse_error_on_malformed_json(fake_bw, appdata, monkeypatch):
     cli = BwCli(fake_bw, appdata)
     with pytest.raises(errors.ParseError):
         cli.list_items("sess")
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_cleanup_hardening_v023.py (encode stdin part)
+# ---------------------------------------------------------------------------
+
+def test_encode_uses_stdin():
+    """Bug #2 fix (v0.2.3): bw encode must use stdin, not CLI argument."""
+    import inspect
+    from vaultwarden.bw_cli import BwCli
+    src = inspect.getsource(BwCli.encode)
+    assert "input=value" in src or "input=" in src
+    assert '["encode", value]' not in src
+
+
+def test_encode_roundtrip_via_fake_bw(bw_cli, appdata):
+    """Functional proof of the stdin path against the fake bw binary."""
+    import base64
+    enc = bw_cli.encode("sess", "hello stdin world")
+    assert base64.b64decode(enc).decode() == "hello stdin world"
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_store_edit_v027.py (encode_item parts)
+# ---------------------------------------------------------------------------
+
+def test_encode_item_signature_simplified():
+    """v0.2.7: encode_item takes only the item dict (no session/bw params)."""
+    import inspect
+    sig = inspect.signature(encode_item)
+    assert list(sig.parameters.keys()) == ["item"], \
+        f"Expected ['item'], got {list(sig.parameters.keys())}"
+
+
+def test_encode_item_encodes_entire_json_with_stdlib_base64():
+    """v0.2.7: encode_item produces standard base64 of the raw JSON."""
+    import base64
+    import json
+    item = {"type": 1, "name": "test",
+            "login": {"username": "a", "password": "b"}}
+    blob = encode_item(item)
+
+    # Must be valid base64
+    decoded = base64.b64decode(blob).decode("utf-8")
+    parsed = json.loads(decoded)
+
+    # Decoded JSON must contain RAW values (no per-field double-encoding)
+    assert parsed["name"] == "test"
+    assert parsed["login"]["username"] == "a"
+    assert parsed["login"]["password"] == "b"
+
+
+def test_encode_item_handles_unicode():
+    """v0.2.7: UTF-8 round-trip must preserve non-ASCII characters."""
+    import base64
+    import json
+    item = {"type": 1, "name": "árvíztűrő tükörfúrógép",
+            "login": {"username": "ü"}}
+    blob = encode_item(item)
+    decoded = base64.b64decode(blob).decode("utf-8")
+    parsed = json.loads(decoded)
+    assert parsed["name"] == "árvíztűrő tükörfúrógép"
+    assert parsed["login"]["username"] == "ü"
+
+
+def test_encode_item_drops_empty_values():
+    """v0.2.7: None/empty values must be omitted from the payload."""
+    import base64
+    import json
+    item = {"type": 1, "name": "test", "notes": "", "folderId": None,
+            "login": {"username": "a"}}
+    parsed = json.loads(base64.b64decode(encode_item(item)).decode("utf-8"))
+    assert "notes" not in parsed
+    assert "folderId" not in parsed
+
+
+def test_edit_item_signature_includes_item_id():
+    """v0.2.7: bw_cli.edit_item must accept item_id as a positional arg."""
+    import inspect
+    sig = inspect.signature(BwCli.edit_item)
+    params = list(sig.parameters.keys())
+    assert "item_id" in params, f"edit_item params: {params}"

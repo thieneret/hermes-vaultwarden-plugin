@@ -118,3 +118,178 @@ def test_unavailable_before_init():
     mgr = AuthManager.__new__(AuthManager)  # bypass init on purpose
     mgr._state = AuthState.UNINITIALIZED
     assert mgr.is_available() is False
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_cleanup_hardening_v026.py (status parts)
+# ---------------------------------------------------------------------------
+
+def test_status_snapshot_shows_unlocked_when_session_active():
+    """v0.2.6: status_snapshot must show 'unlocked' when session is active."""
+    from unittest.mock import MagicMock
+
+    bw = MagicMock()
+    bw.status.return_value = {"status": "locked", "serverUrl": "https://vault.example.com"}
+
+    config = MagicMock()
+    config.server_url = "https://vault.example.com"
+    config.session_timeout_seconds = 14400
+    config.auto_sync = False
+    config.enabled = True
+    config.allow_write = True
+
+    auth = AuthManager(bw, config, client_secret="cs", master_password="mp")
+    auth._state = AuthState.UNLOCKED
+    auth._session_key = "test-session-key"
+    auth._session_created_at = time.time()
+
+    snapshot = auth.status_snapshot()
+    assert snapshot["session_active"] is True
+    assert snapshot["auth_state"] == "unlocked"
+    assert snapshot["server_status"]["state"] == "unlocked", \
+        f"Expected 'unlocked', got {snapshot['server_status']['state']}"
+
+
+def test_status_snapshot_shows_locked_when_no_session():
+    """v0.2.6: status_snapshot falls back to bw status when no session."""
+    from unittest.mock import MagicMock
+
+    bw = MagicMock()
+    bw.status.return_value = {"status": "locked", "serverUrl": "https://vault.example.com"}
+
+    config = MagicMock()
+    config.server_url = "https://vault.example.com"
+    config.session_timeout_seconds = 14400
+    config.auto_sync = False
+    config.enabled = True
+    config.allow_write = True
+
+    auth = AuthManager(bw, config, client_secret="cs", master_password="mp")
+    auth._state = AuthState.LOGGED_IN
+    auth._session_key = None
+
+    snapshot = auth.status_snapshot()
+    assert snapshot["session_active"] is False
+    assert snapshot["server_status"]["state"] == "locked"
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_cleanup_hardening_v023.py (unlock guard part)
+# ---------------------------------------------------------------------------
+
+def test_do_unlock_has_no_early_return_guard():
+    """v0.2.3: _do_unlock() must ALWAYS attempt the unlock (no toggle guard)."""
+    import ast
+    import inspect
+    import textwrap
+    body = ast.parse(textwrap.dedent(inspect.getsource(AuthManager._do_unlock)))
+    fn = body.body[0]
+    # No conditional early-return at the top of the method body.
+    for stmt in fn.body:
+        assert not isinstance(stmt, ast.If), "unexpected guard in _do_unlock"
+        assert not isinstance(stmt, ast.Return), "unexpected early return in _do_unlock"
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_security_hardening_v022.py (fail-closed auth part)
+# ---------------------------------------------------------------------------
+
+def test_auth_empty_userid_forces_reauth(monkeypatch):
+    """SECURITY (integration): bw status WITHOUT userId => re-auth, no adoption."""
+    from unittest.mock import MagicMock
+    import threading
+
+    auth = AuthManager.__new__(AuthManager)
+    auth._lock = threading.RLock()
+    auth._state = AuthState.CONFIGURED
+    auth._session_key = None
+    auth._last_sync = 0.0
+    auth._bw = MagicMock()
+
+    class _Cfg:
+        server_url = "https://vault.example.com"
+
+    auth._config = _Cfg()
+    auth._client_id = "user.1234-5678"
+
+    # bw status reports an UNLOCKED session but NO userId at all.
+    monkeypatch.setattr(auth, "probe_status", lambda: {
+        "serverUrl": "https://vault.example.com",
+        "userId": "",
+        "status": "unlocked",
+    })
+    adopted: list = []
+    monkeypatch.setattr(auth, "_adopt_existing_unlocked_session",
+                        lambda: adopted.append(True))
+    monkeypatch.setattr(auth, "_configure_server", lambda: None)
+    monkeypatch.setattr(auth, "_do_login", lambda: None)
+    monkeypatch.setattr(auth, "_do_unlock", lambda: None)
+    monkeypatch.setattr(auth, "_maybe_initial_sync", lambda: None)
+
+    auth.ensure_authenticated()
+
+    # Fail-closed: unknown session must NOT be adopted; Case B logout ran.
+    assert not adopted, "empty userId must not adopt an unknown session"
+    auth._bw.logout.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_bugfixes_v12.py (BUG-9 part)
+# ---------------------------------------------------------------------------
+
+def test_check_fn_is_named_closure(fake_bw, appdata):
+    from vaultwarden import _make_check_fn
+    from vaultwarden.bw_cli import BwCli
+    from vaultwarden.tests.conftest import make_config
+
+    cfg = make_config()
+    auth = AuthManager(BwCli(fake_bw, appdata), cfg,
+                       client_secret="cs-secret", master_password="mp-secret")
+    check = _make_check_fn(auth)
+    assert callable(check) and check.__name__ == "check"
+    assert check() is False                      # uninitialised state
+    auth.ensure_authenticated()
+    assert check() is True
+
+
+# ---------------------------------------------------------------------------
+# Consolidated from test_store_edit_v027.py (auth forwarding parts)
+# ---------------------------------------------------------------------------
+
+def test_auth_edit_item_passes_item_id():
+    """v0.2.7: auth.edit_item must forward the item id to bw_cli.edit_item."""
+    from unittest.mock import MagicMock
+    bw = MagicMock()
+    bw.edit_item.return_value = {"id": "abc"}
+
+    config = MagicMock()
+    config.session_timeout_seconds = 14400
+
+    auth = AuthManager(bw, config, client_secret="cs", master_password="mp")
+    auth._state = AuthState.UNLOCKED
+    auth._session_key = "SESSION"
+
+    auth.edit_item({"id": "abc", "name": "n"})
+    args, _ = bw.edit_item.call_args
+    assert args[1] == "abc", f"edit_item called with args: {args}"
+
+
+def test_auth_create_item_uses_new_encode_item_signature():
+    """v0.2.7: auth.create_item calls encode_item with only the item."""
+    import base64
+    from unittest.mock import MagicMock
+    bw = MagicMock()
+    bw.create_item.return_value = {"id": "abc"}
+
+    config = MagicMock()
+    config.session_timeout_seconds = 14400
+
+    auth = AuthManager(bw, config, client_secret="cs", master_password="mp")
+    auth._state = AuthState.UNLOCKED
+    auth._session_key = "SESSION"
+
+    auth.create_item({"name": "n"})
+    args, _ = bw.create_item.call_args
+    # create_item(session, blob) — 2 args, blob is valid base64
+    assert len(args) == 2
+    base64.b64decode(args[1])  # must not raise
