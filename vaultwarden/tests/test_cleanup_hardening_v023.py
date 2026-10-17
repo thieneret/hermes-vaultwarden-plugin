@@ -65,7 +65,7 @@ def test_version_headers_v023():
         "auth.py":     "v0.2.7",  # bumped in v0.2.7 (encode_item/create/edit BUGFIX)
         "hooks.py":    "v0.2.3",
         "bw_cli.py":   "v0.2.7",  # bumped in v0.2.7 (stdlib base64 + stdin transport)
-        "tools.py":    "v0.2.7",  # bumped in v0.2.7 (explicit-null cleanup)
+        "tools.py":    "v0.2.8",  # bumped in v0.2.8 (SSH key item support)
     }
     for name, expected in expected_versions.items():
         path = pkg_dir / name

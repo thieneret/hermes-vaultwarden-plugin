@@ -101,7 +101,7 @@ def test_list_folder_id_uses_folderid_flag(bw_cli, appdata, monkeypatch):
     assert seen[-1] == ["--folderid", "f1"]           # exact flag form
     assert res["total"] == 1 and res["items"][0]["name"] == "Postgres prod"
 
-    res_note = tools["vaultwarden_list"]({"type": "note"})
+    res_note = tools["vaultwarden_list"]({"type": "securenote"})
     assert seen[-1] == []                             # no --filter-type passed
     assert [i["name"] for i in res_note["items"]] == ["API keys"]
 
@@ -151,7 +151,7 @@ def test_search_uses_native_search_flag(bw_cli, monkeypatch):
     tools["vaultwarden_search"]({"query": "grafana", "field": "uri"})
     assert seen[-1] == []
     # explicit type filter also falls back to client-side filtering
-    tools["vaultwarden_search"]({"query": "api", "type": "note"})
+    tools["vaultwarden_search"]({"query": "api", "type": "securenote"})
     assert seen[-1] == []
 
 

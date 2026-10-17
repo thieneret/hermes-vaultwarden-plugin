@@ -1,5 +1,5 @@
-# vaultwarden/schemas.py — v0.2.6
-"""JSON schemas for the 9 vaultwarden_* tools (plan §8).
+# vaultwarden/schemas.py — v0.2.8
+"""JSON schemas for the vaultwarden_* tools (plan §8).
 
 Handlers receive these as validated `args` dicts. None of the schemas
 accept or return raw secret values except vaultwarden_generate_password,
@@ -14,8 +14,8 @@ properties and required lists. Switched to "parameters" in v0.2.6.
 """
 from __future__ import annotations
 
-ITEM_TYPES = ["login", "note", "card", "identity"]
-SECRET_FIELDS = ["password", "username", "totp", "notes", "uri"]
+ITEM_TYPES = ["login", "securenote", "card", "identity", "sshkey"]
+SECRET_FIELDS = ["password", "username", "totp", "notes", "uri", "privateKey"]
 
 #: Canonical key holding each tool's JSON Schema. The deployed Hermes Agent
 #: registry expects the OpenAI-style "parameters" key (confirmed via live
@@ -139,6 +139,41 @@ VAULTWARDEN_STORE = {
     },
 }
 
+VAULTWARDEN_STORE_SSH = {
+    "name": "vaultwarden_store_ssh",
+    "description": (
+        "Create a new SSH key vault item (type 5). Requires allow_write=true. "
+        "WARNING: Bitwarden/Vaultwarden stores the private key WITHOUT passphrase "
+        "encryption — if the vault is compromised, the SSH key can be used immediately. "
+        "The private key is redacted from all logs. "
+        "Secret values passed here go straight into bw via the encode pipeline."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Item name (required)."},
+            "private_key": {
+                "type": "string",
+                "description": (
+                    "SSH private key content (e.g., '-----BEGIN OPENSSH PRIVATE KEY-----\\n...'). "
+                    "Can be a placeholder token from vaultwarden_get_secret_ref."
+                ),
+            },
+            "public_key": {
+                "type": "string",
+                "description": "SSH public key (e.g., 'ssh-ed25519 AAAA... user@host').",
+            },
+            "key_fingerprint": {
+                "type": "string",
+                "description": "Key fingerprint (e.g., 'SHA256:xxx'). Auto-generated if omitted.",
+            },
+            "notes": {"type": "string", "description": "Optional notes."},
+            "folder_id": {"type": "string", "description": "Folder UUID."},
+        },
+        "required": ["name", "private_key"],
+    },
+}
+
 VAULTWARDEN_UPDATE = {
     "name": "vaultwarden_update",
     "description": ("Update an existing item via fetch-modify-save. Requires "
@@ -209,6 +244,7 @@ TOOL_SCHEMAS = [
     VAULTWARDEN_SEARCH,
     VAULTWARDEN_GET_SECRET_REF,
     VAULTWARDEN_STORE,
+    VAULTWARDEN_STORE_SSH,  # NEW in v0.2.8
     VAULTWARDEN_UPDATE,
     VAULTWARDEN_DELETE,
     VAULTWARDEN_GENERATE_PASSWORD,

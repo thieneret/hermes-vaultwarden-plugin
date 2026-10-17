@@ -1,5 +1,5 @@
-# vaultwarden/tools.py — v0.2.7
-"""Tool handlers for the 9 vaultwarden_* tools (plan §8).
+# vaultwarden/tools.py — v0.2.8
+"""Tool handlers for the vaultwarden_* tools (plan §8).
 
 ``get_tools(auth, config, registry)`` yields (schema, handler) pairs.
 v0.2.4: Handlers return JSON strings (Hermes tool_call requires str);
@@ -18,7 +18,7 @@ import json
 from typing import Any, Callable
 
 from . import errors, schemas
-from .auth import AuthManager
+from .auth import AuthManager, AuthState
 from .config import PluginConfig
 from .placeholders import PlaceholderRegistry
 from .security import get_logger, get_redacting_filter
@@ -27,10 +27,23 @@ log = get_logger("tools")
 
 Handler = Callable[..., str]
 
+#: v0.2.8: module-level auth/config used by the standalone-callable write
+#: handlers (h_store_ssh). ``get_tools()`` refreshes these whenever the
+#: plugin registers its tools; tests may inject mocks directly.
+auth: "AuthManager | None" = None
+config: "PluginConfig | None" = None
+
+
+def _resolve_auth(auth: "AuthManager | None",
+                  config: "PluginConfig | None"):
+    """Return (auth, config) — prefer explicit args, fall back to module globals."""
+    return (auth if auth is not None else globals()["auth"],
+            config if config is not None else globals()["config"])
+
 
 # --------------------------------------------------------------- helpers
 def _item_type_name(item: dict) -> str:
-    mapping = {1: "login", 2: "note", 3: "card", 4: "identity"}
+    mapping = {1: "login", 2: "securenote", 3: "card", 4: "identity", 5: "sshkey"}
     t = item.get("type")
     if isinstance(t, int):
         return mapping.get(t, str(t))
@@ -71,6 +84,9 @@ def _field_value(item: dict, field_name: str, custom_field_name: str | None) -> 
         return str(uris[0].get("uri") or "") if uris else ""
     if field_name == "notes":
         return str(item.get("notes") or "")
+    if field_name == "privateKey":
+        # v0.2.8: SSH key items (type 5) expose their private key here.
+        return str((item.get("sshKey") or {}).get("privateKey") or "")
     raise errors.ConfigError(f"Unsupported field '{field_name}'.")
 
 
@@ -120,9 +136,82 @@ def _guard(fn: Callable[[], dict]) -> str:
 
 
 # --------------------------------------------------------------- handlers
+def _h_store_ssh_impl(args: dict, auth: "AuthManager | None" = None,
+                      config: "PluginConfig | None" = None,
+                      **kw: Any) -> str:
+    """Create a new SSH key item (type 5).
+
+    v0.2.8: SECURITY NOTE — Bitwarden/Vaultwarden stores the private key
+    WITHOUT passphrase encryption inside the vault item (plaintext within
+    the encrypted vault entry): if the vault is compromised the SSH key can
+    be used immediately. The plugin therefore redacts the private key (and
+    every other string argument) from all logs via the shared
+    RedactingFilter, exactly like h_store/h_update do.
+
+    Callable standalone (module-level auth/config set by get_tools()) or
+    with explicit auth/config keyword arguments.
+    """
+    def run():
+        _auth, _config = _resolve_auth(auth, config)
+        _require_write(_config)
+
+        item = {
+            "type": 5,
+            "name": args["name"],
+        }
+
+        # SSH key fields
+        ssh_key = {}
+        if args.get("private_key"):
+            ssh_key["privateKey"] = args["private_key"]
+        if args.get("public_key"):
+            ssh_key["publicKey"] = args["public_key"]
+        if args.get("key_fingerprint"):
+            ssh_key["keyFingerprint"] = args["key_fingerprint"]
+
+        if ssh_key:
+            item["sshKey"] = ssh_key
+
+        # Optional metadata
+        if args.get("notes"):
+            item["notes"] = args["notes"]
+        if args.get("folder_id"):
+            item["folderId"] = args["folder_id"]
+
+        # Redact private key (and every other string arg) from logs
+        redactor = get_redacting_filter()
+        redact_strings = _collect_secret_strings(args)
+        for t in redact_strings:
+            redactor.register_secret(t)
+        try:
+            created = _auth.create_item(item)
+            log.info("Created SSH key vault item '%s' (%s).",
+                     created.get("name"), created.get("id"))
+            return {"created": True, "id": created.get("id"),
+                    "item": _metadata(created)}
+        finally:
+            for t in redact_strings:
+                redactor.forget_secret(t)
+    return _guard(run)
+
+
+def h_store_ssh(args: dict, **kw: Any) -> str:
+    """Public v0.2.8 handler: create an SSH key item (type 5).
+
+    Thin delegator to ``_h_store_ssh_impl`` so the tool can be imported and
+    called directly from tests; when invoked through ``get_tools()`` the
+    closure wrapper passes this plugin instance's auth/config explicitly.
+    """
+    return _h_store_ssh_impl(args, **kw)
+
+
 def get_tools(auth: AuthManager, config: PluginConfig,
               registry: PlaceholderRegistry):
     """Yield (schema, handler) for every enabled tool."""
+    # v0.2.8: expose the active auth/config at module level so h_store_ssh
+    # is importable/callable standalone (see module globals above).
+    globals()["auth"] = auth
+    globals()["config"] = config
 
     # ------------------------------------------------------------ status
     def h_status(args: dict, **kw: Any) -> str:
@@ -245,6 +334,15 @@ def get_tools(auth: AuthManager, config: PluginConfig,
 
     yield schemas.VAULTWARDEN_STORE, h_store
 
+    # ---------------------------------------------------------- store_ssh
+    # v0.2.8: thin wrapper — the implementation lives in the module-level
+    # h_store_ssh above so it is importable/callable standalone; the closure
+    # binding passes this plugin instance's auth/config explicitly.
+    def h_store_ssh(args: dict, **kw: Any) -> str:
+        return _h_store_ssh_impl(args, auth=auth, config=config, **kw)
+
+    yield schemas.VAULTWARDEN_STORE_SSH, h_store_ssh
+
     # -------------------------------------------------------------- update
     def h_update(args: dict, **kw: Any) -> str:
         def run():
@@ -329,7 +427,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
 
 
 # ---------------------------------------------------------- item builders
-_TYPE_NUMBERS = {"login": 1, "note": 2, "card": 3, "identity": 4}
+_TYPE_NUMBERS = {"login": 1, "securenote": 2, "card": 3, "identity": 4, "sshkey": 5}
 
 
 def _build_item(args: dict) -> dict:
@@ -350,6 +448,17 @@ def _build_item(args: dict) -> dict:
         login["uris"] = [{"uri": args["uri"]}]
     if login:
         item["login"] = login
+    # v0.2.8: SSH key items (Bitwarden type 5, introduced in 2024.12.0).
+    if (args.get("type") or "login") == "sshkey":
+        ssh_key: dict[str, Any] = {}
+        if args.get("private_key"):
+            ssh_key["privateKey"] = args["private_key"]
+        if args.get("public_key"):
+            ssh_key["publicKey"] = args["public_key"]
+        if args.get("key_fingerprint"):
+            ssh_key["keyFingerprint"] = args["key_fingerprint"]
+        if ssh_key:
+            item["sshKey"] = ssh_key
     fields = []
     for cf in args.get("custom_fields") or []:
         fields.append({"name": cf["name"], "value": cf["value"],
