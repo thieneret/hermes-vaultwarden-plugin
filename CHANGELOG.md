@@ -5,6 +5,15 @@ Author: **thieneret**
 
 ---
 
+## [0.3.3] — SSH Passphrase Retrieval Fix
+
+### Fixed
+- `vaultwarden_use_ssh` no longer prompts the user for a passphrase.
+  Root cause: `bw get item` does not return encrypted fields (password
+  is null). Passphrase is now retrieved via the dedicated
+  `bw get password <item_id>` command.
+- Added `BwCli.get_password()` method for decrypted password retrieval.
+
 ## [0.3.2] — Version Headers Removal & Lint Cleanup
 
 ### Removed

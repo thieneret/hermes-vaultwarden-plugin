@@ -168,3 +168,41 @@ def test_plugin_yaml_includes_ssh_tools():
         assert tool in content, f"{tool} missing from plugin.yaml provides_tools"
 
 
+# ── v0.3.3: passphrase retrieval regression ──────────────────────────────
+
+def test_get_ssh_key_uses_get_password():
+    """v0.3.3: get_ssh_key must call bw get_password, not read from get_item."""
+    import time as _time
+
+    from unittest.mock import MagicMock
+
+    from vaultwarden.auth import AuthManager, AuthState
+
+    bw = MagicMock()
+    bw.get_password.return_value = "stored-passphrase"
+    # NOTE: the real BwCli method used by auth.py is `item_get`; this mock
+    # also stubs `get_item` so the assertion below holds either way.
+    bw.item_get.return_value = {
+        "id": "abc",
+        "name": "SSH - Test",
+        "login": {"username": "deploy", "password": None},  # null!
+        "attachments": [{"id": "att1", "fileName": "id_ed25519"}],
+    }
+    bw.get_attachment.return_value = "/tmp/key"
+
+    config = MagicMock()
+    config.session_timeout_seconds = 14400
+
+    auth = AuthManager(bw, config, client_secret="cs", master_password="mp")
+    auth._state = AuthState.UNLOCKED
+    auth._session_key = "SESSION"
+    auth._session_created_at = _time.time()  # session is fresh, not expired
+
+    key_path, passphrase = auth.get_ssh_key("abc", "/tmp/key")
+
+    # Must use get_password, NOT get_item's login.password
+    bw.get_password.assert_called_once_with("SESSION", "abc")
+    assert passphrase == "stored-passphrase"
+    assert key_path == "/tmp/key"
+
+

@@ -465,14 +465,18 @@ class AuthManager:
     def get_ssh_key(self, item_id: str, output_path: str) -> tuple[str, str]:
         """Download SSH key attachment and return (key_path, passphrase).
 
-        v0.2.8: returns the temp file path (caller sets permissions and
-        cleans up) and the passphrase from the item's password field.
+        v0.3.3 (BUGFIX): passphrase is retrieved via `bw get password`,
+        NOT from `bw get item` output (which returns null for encrypted
+        fields). This fixes vaultwarden_use_ssh prompting the user for a
+        passphrase instead of using the stored one.
         """
         def _do(session: str):
-            item = self._bw.item_get(session, item_id)
-            login = item.get("login") or {}
-            passphrase = login.get("password") or ""
+            # v0.3.3: bw get item does NOT include encrypted fields.
+            # Use the dedicated `bw get password` command instead.
+            passphrase = self._bw.get_password(session, item_id)
 
+            # Get item metadata to find the attachment
+            item = self._bw.item_get(session, item_id)
             attachments = item.get("attachments") or []
             if not attachments:
                 raise errors.VaultwardenError(

@@ -1,6 +1,6 @@
 # vaultwarden/plugin.yaml — v0.2.8
 name: vaultwarden
-version: 0.3.2
+version: 0.3.3
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key
