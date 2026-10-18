@@ -11,6 +11,7 @@ Design rules (plan §10):
 """
 from __future__ import annotations
 
+import json as _json
 import logging
 import re
 import shlex
@@ -147,11 +148,67 @@ def get_redacting_filter() -> RedactingFilter:
     return _shared_filter
 
 
+_SECRET_KEY_PATTERNS = (
+    "password", "passphrase", "secret", "token", "key",
+    "credential", "api_key", "apikey", "master_password",
+    "client_secret", "session_key",
+)
+
+
+class StructuredJsonFormatter(logging.Formatter):
+    """JSON formatter that redacts secret-like keys at format time.
+
+    This is a defense-in-depth layer: it ensures that even if a caller
+    accidentally passes a secret value in a structured log field, it
+    will be replaced with [REDACTED] before the record reaches any
+    handler or sink.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        # Include structured extra fields if present
+        if hasattr(record, "vw_extra") and isinstance(record.vw_extra, dict):
+            entry["data"] = self._redact_dict(record.vw_extra)
+        return _json.dumps(entry, ensure_ascii=False)
+
+    def _redact_dict(self, d: dict) -> dict:
+        """Recursively redact values whose keys match secret patterns."""
+        result = {}
+        for k, v in d.items():
+            if any(p in k.lower() for p in _SECRET_KEY_PATTERNS):
+                result[k] = "[REDACTED]"
+            elif isinstance(v, dict):
+                result[k] = self._redact_dict(v)
+            else:
+                result[k] = v
+        return result
+
+
+def log_structured(logger: logging.Logger, level: int, message: str,
+                   **fields) -> None:
+    """Emit a structured log record with automatic secret redaction."""
+    record = logger.makeRecord(
+        logger.name, level, "(unknown)", 0, message, (), None
+    )
+    record.vw_extra = fields
+    logger.handle(record)
+
+
 def get_logger(name: str) -> logging.Logger:
     """Logger wired into the shared redaction filter.
 
     v0.1.7: ensures at least one handler exists so plugin logs are visible
     even when Hermes does not configure the hermes.plugins.* hierarchy.
+
+    v0.3.6 (VWP-07): the fallback StreamHandler uses StructuredJsonFormatter
+    so plugin log output is JSON with secret-like fields redacted at format
+    time. The RedactingFilter remains on the logger as an additional
+    defense-in-depth layer; both layers coexist.
     """
     logger = logging.getLogger(f"hermes.plugins.vaultwarden.{name}")
     if not any(isinstance(f, RedactingFilter) for f in logger.filters):
@@ -160,8 +217,7 @@ def get_logger(name: str) -> logging.Logger:
     # handlers, add a StreamHandler so logs appear in container stdout.
     if not logger.handlers and not logging.getLogger().handlers:
         handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        handler.setFormatter(StructuredJsonFormatter())
         logger.addHandler(handler)
     return logger
 

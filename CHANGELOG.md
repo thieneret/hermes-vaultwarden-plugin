@@ -5,6 +5,21 @@ Author: **thieneret**
 
 ---
 
+## [0.3.6] - 2026-10-18
+
+### Security (audit findings VWP-07, VWP-15, VWP-16)
+
+- **VWP-15:** CI ruff lint steps are now blocking (removed
+  `continue-on-error: true` and `|| echo` fallback). Lint failures
+  now prevent merge.
+- **VWP-16:** Dev dependencies pinned via `uv.lock`. CI installs
+  exclusively from the lockfile (`uv sync --frozen`).
+- **VWP-07 (low):** Created `SECURITY.md` documenting the threat model
+  and clarifying that `RedactingFilter` is defense-in-depth, not a
+  primary security control.
+- **VWP-07 (high):** Added `StructuredJsonFormatter` for JSON structured
+  logging with automatic redaction of secret-like keys at format time.
+
 ## [0.3.5] — tools.py Deduplication
 
 ### Changed
