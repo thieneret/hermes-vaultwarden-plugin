@@ -5,6 +5,19 @@ Author: **thieneret**
 
 ---
 
+## [0.3.5] — tools.py Deduplication
+
+### Changed
+- Eliminated duplicate definitions of SSH tool handlers in tools.py.
+  Module-level functions are now the single source of truth;
+  get_tools() closures are thin wrappers that bind auth/config.
+- Helper functions (_validate_ssh_key_file, _resolve_socket_path)
+  have exactly one module-level definition.
+
+### Fixed
+- Removed maintenance hazard where changes had to be applied to
+  both closure and module-level copies of the same function.
+
 ## [0.3.4] — SSH Askpass Passphrase Delivery
 
 ### Fixed

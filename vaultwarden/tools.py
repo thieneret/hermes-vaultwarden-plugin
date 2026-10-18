@@ -350,228 +350,32 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     _tools.append((schemas.VAULTWARDEN_GENERATE_PASSWORD, h_generate))
 
     # ================================================== SSH key management
-    # v0.2.8: store/update/delete/use SSH keys (login item + file attachment).
-    # Validation/socket helpers are the module-level functions defined below
-    # (_validate_ssh_key_file / _resolve_socket_path); handlers registered here
-    # close over auth/config only.
+    # v0.3.5: the single implementations of the SSH tool handlers live at
+    # module level below (h_store_ssh / h_update_ssh / h_delete_ssh /
+    # h_use_ssh). The registrations here are thin wrappers that bind the
+    # per-session auth/config objects — no duplicated implementation code.
+    # Helpers (_validate_ssh_key_file / _resolve_socket_path) are also
+    # module-level only.
 
-    def h_store_ssh(args: dict, **kw: Any) -> str:
-        def run():
-            _require_write(config)
-            name = str(args["name"])
-            user = str(args["user"])
-            passphrase = str(args["pass"])
-            file_path = str(args["file"])
+    def _h_store_ssh_bound(args: dict, **kw: Any) -> str:
+        return h_store_ssh(args, auth=auth, config=config, **kw)
 
-            _validate_ssh_key_file(file_path)
+    _tools.append((schemas.VAULTWARDEN_STORE_SSH, _h_store_ssh_bound))
 
-            redactor = get_redacting_filter()
-            redactor.register_secret(passphrase)
-            try:
-                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    redactor.register_secret(f.read())
-            except OSError:
-                pass
+    def _h_update_ssh_bound(args: dict, **kw: Any) -> str:
+        return h_update_ssh(args, auth=auth, config=config, **kw)
 
-            result = auth.create_ssh_item(name, user, passphrase, file_path)
-            log.info("Stored SSH key item '%s' (%s).", name, result.get("id"))
-            return {
-                "created": True,
-                "id": result.get("id", ""),
-                "name": name,
-                "ssh_user": user,
-                "attachment": os.path.basename(file_path),
-            }
-        return _guard(run)
+    _tools.append((schemas.VAULTWARDEN_UPDATE_SSH, _h_update_ssh_bound))
 
-    _tools.append((schemas.VAULTWARDEN_STORE_SSH, h_store_ssh))
+    def _h_delete_ssh_bound(args: dict, **kw: Any) -> str:
+        return h_delete_ssh(args, auth=auth, config=config, **kw)
 
-    def h_update_ssh(args: dict, **kw: Any) -> str:
-        def run():
-            _require_write(config)
-            name = str(args["name"])
+    _tools.append((schemas.VAULTWARDEN_DELETE_SSH, _h_delete_ssh_bound))
 
-            matches = auth.search_items(name)
-            exact = [m for m in matches if m.get("name") == name]
-            if not exact:
-                raise errors.NotFoundError(
-                    f"No SSH key item named '{name}'.",
-                    suggestion="Use vaultwarden_list to see available items.")
-            if len(exact) > 1:
-                raise _vault_error(
-                    f"Multiple items match name '{name}' ({len(exact)} found).",
-                    code="AMBIGUOUS_ERROR",
-                    suggestion="Use vaultwarden_search to find the correct item_id.")
-            item = exact[0]
-            item_id = item.get("id", "")
+    def _h_use_ssh_bound(args: dict, **kw: Any) -> str:
+        return h_use_ssh(args, auth=auth, config=config, **kw)
 
-            updates = {}
-            if args.get("user"):
-                updates["username"] = str(args["user"])
-            if args.get("pass"):
-                updates["password"] = str(args["pass"])
-                get_redacting_filter().register_secret(str(args["pass"]))
-            if args.get("notes") is not None:
-                updates["notes"] = str(args["notes"])
-
-            if updates:
-                current = auth.get_item(item_id)
-                login = dict(current.get("login") or {})
-                login.update(updates)
-                current["login"] = login
-                auth.edit_item(current)
-
-            if args.get("file"):
-                file_path = str(args["file"])
-                _validate_ssh_key_file(file_path)
-                session = auth.get_session()
-                atts = item.get("attachments") or []
-                for att in atts:
-                    auth._bw.delete_attachment(session, att.get("id", ""), item_id)
-                auth._bw.create_attachment(session, file_path, item_id)
-
-            log.info("Updated SSH key item '%s' (%s).", name, item_id)
-            return {"updated": True, "id": item_id, "name": name}
-        return _guard(run)
-
-    _tools.append((schemas.VAULTWARDEN_UPDATE_SSH, h_update_ssh))
-
-    def h_delete_ssh(args: dict, **kw: Any) -> str:
-        def run():
-            _require_write(config)
-            if not args.get("confirm"):
-                raise errors.PermissionError_(
-                    "Deletion requires explicit confirm=true.",
-                    suggestion="Re-run with confirm=true to proceed.")
-
-            name = str(args["name"])
-            matches = auth.search_items(name)
-            exact = [m for m in matches if m.get("name") == name]
-            if not exact:
-                raise errors.NotFoundError(f"No SSH key item named '{name}'.")
-            if len(exact) > 1:
-                raise _vault_error(
-                    f"Multiple items match name '{name}'.",
-                    code="AMBIGUOUS_ERROR")
-            item_id = exact[0].get("id", "")
-            permanent = bool(args.get("permanent"))
-
-            def _do(session: str):
-                auth._bw.delete_item(session, item_id, permanent)
-            auth.run_with_recovery(_do)
-            log.warning("Deleted SSH key item '%s' (%s, permanent=%s).",
-                        name, item_id, permanent)
-            return {"deleted": True, "id": item_id, "permanent": permanent}
-        return _guard(run)
-
-    _tools.append((schemas.VAULTWARDEN_DELETE_SSH, h_delete_ssh))
-
-    def h_use_ssh(args: dict, **kw: Any) -> str:
-        def run():
-            name = str(args["name"])
-            ssh_auth_sock_param = args.get("ssh_auth_sock")
-
-            matches = auth.search_items(name)
-            exact = [m for m in matches if m.get("name") == name]
-            if not exact:
-                raise errors.NotFoundError(
-                    f"No SSH key item named '{name}'.",
-                    suggestion="Use vaultwarden_list to see available items.")
-            if len(exact) > 1:
-                raise _vault_error(
-                    f"Multiple items match name '{name}'.",
-                    code="AMBIGUOUS_ERROR")
-            item = exact[0]
-            item_id = item.get("id", "")
-
-            sock, agent_started = _resolve_socket_path(ssh_auth_sock_param)
-
-            key_path = None
-            askpass_path = None
-            try:
-                # v0.2.8: SSH key delivery — temp file unavoidable (ssh-add
-                # reads the key from a file; stdin is reserved for the
-                # passphrase). mkstemp is atomic; 0600; deleted in `finally`.
-                fd, key_path = tempfile.mkstemp(suffix=".sshkey", prefix="vw_")
-                os.close(fd)
-                os.chmod(key_path, 0o600)
-
-                key_path, passphrase = auth.get_ssh_key(item_id, key_path)
-                os.chmod(key_path, 0o600)
-
-                redactor = get_redacting_filter()
-                redactor.register_secret(passphrase)
-                try:
-                    with open(key_path, "r", encoding="utf-8",
-                              errors="replace") as f:
-                        redactor.register_secret(f.read())
-                except OSError:
-                    pass
-
-                # Create askpass script: contains ONLY the echo command,
-                # no secret content. Passphrase delivered via env var.
-                fd_ap, askpass_path = tempfile.mkstemp(
-                    suffix=".sh", prefix="vw_askpass_")
-                with os.fdopen(fd_ap, "w") as f:
-                    f.write('#!/bin/sh\necho "$VW_SSH_PASS"\n')
-                os.chmod(askpass_path, 0o700)
-
-                # Passphrase delivery via SSH_ASKPASS mechanism.
-                # The askpass script contains ONLY `echo "$VW_SSH_PASS"` —
-                # no secret content in the file. The passphrase is passed
-                # via environment variable to the subprocess only.
-                env = {
-                    "SSH_AUTH_SOCK": sock,
-                    "HOME": os.environ.get("HOME", "/"),
-                    "SSH_ASKPASS_REQUIRE": "force",
-                    "SSH_ASKPASS": askpass_path,
-                    "VW_SSH_PASS": passphrase,
-                }
-                proc = subprocess.run(
-                    ["ssh-add", key_path],
-                    env=env,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True, text=True, timeout=30,
-                )
-                if proc.returncode != 0:
-                    stderr = (proc.stderr or "").strip()
-                    raise errors.AuthError(
-                        f"ssh-add failed (exit {proc.returncode}): {stderr}",
-                        suggestion="Check if the passphrase is correct.")
-
-                fp_proc = subprocess.run(
-                    ["ssh-keygen", "-lf", key_path],
-                    capture_output=True, text=True, timeout=10)
-                fingerprint = (fp_proc.stdout or "").strip().split()[1] \
-                    if fp_proc.returncode == 0 else "unknown"
-
-                return {
-                    "loaded": True,
-                    "item": name,
-                    "ssh_user": (item.get("login") or {}).get("username", ""),
-                    "key_fingerprint": fingerprint,
-                    "ssh_auth_sock": sock,
-                    "agent_started_by_plugin": agent_started,
-                    "message": (
-                        f"Key loaded. Export SSH_AUTH_SOCK={sock} for "
-                        "subsequent SSH commands."),
-                }
-            finally:
-                # Clean up temp key file
-                if key_path and os.path.exists(key_path):
-                    try:
-                        os.unlink(key_path)
-                    except OSError:
-                        pass
-                # Clean up askpass script
-                if askpass_path and os.path.exists(askpass_path):
-                    try:
-                        os.unlink(askpass_path)
-                    except OSError:
-                        pass
-        return _guard(run)
-
-    _tools.append((schemas.VAULTWARDEN_USE_SSH, h_use_ssh))
+    _tools.append((schemas.VAULTWARDEN_USE_SSH, _h_use_ssh_bound))
 
     return _tools
 
@@ -601,10 +405,12 @@ def _validate_ssh_key_file(path: str) -> None:
 
 
 def _resolve_socket_path(ssh_auth_sock: str | None) -> tuple[str, bool]:
-    """Resolve the ssh-agent socket path (module-level mirror, v0.2.8).
+    """Resolve the ssh-agent socket path (single module-level definition).
 
-    Returns (socket_path, agent_started_by_plugin). Resolution rules are
-    documented on the closure version inside get_tools().
+    Returns (socket_path, agent_started_by_plugin). Resolution rules:
+     - explicit param: direct path if it contains '/' or exists, otherwise
+       treated as an environment variable name holding the socket path;
+     - no param: fall back to $SSH_AUTH_SOCK, then start a fresh agent.
     """
     def _agent_running(sock: str) -> bool:
         try:
@@ -662,16 +468,17 @@ def _resolve_socket_path(ssh_auth_sock: str | None) -> tuple[str, bool]:
             return sock, True
 
 
-def h_store_ssh(args: dict, **kw: Any) -> str:
+def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
+                **kw: Any) -> str:
     """Store an SSH key as a login item + file attachment (v0.2.8).
 
-    Module-level implementation mirroring the get_tools() closure so it is
-    directly importable and unit-testable. username=SSH user, password=
+    v0.3.5: single module-level source of truth — get_tools() registers a
+    thin wrapper that binds auth/config. username=SSH user, password=
     passphrase, key=file attachment; name uniqueness enforced by auth.
     """
 
     def run():
-        _require_write(kw["config"])
+        _require_write(config)
         name = str(args["name"])
         user = str(args["user"])
         passphrase = str(args["pass"])
@@ -687,7 +494,8 @@ def h_store_ssh(args: dict, **kw: Any) -> str:
         except OSError:
             pass
 
-        result = kw["auth"].create_ssh_item(name, user, passphrase, file_path)
+        result = auth.create_ssh_item(name, user, passphrase, file_path)
+        log.info("Stored SSH key item '%s' (%s).", name, result.get("id"))
         return {
             "created": True,
             "id": result.get("id", ""),
@@ -698,13 +506,13 @@ def h_store_ssh(args: dict, **kw: Any) -> str:
     return _guard(run)
 
 
-def h_update_ssh(args: dict, **kw: Any) -> str:
+def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
+                 **kw: Any) -> str:
     """Update an existing SSH key item — user/pass/notes/key attachment."""
 
     def run():
-        _require_write(kw["config"])
+        _require_write(config)
         name = str(args["name"])
-        auth = kw["auth"]
 
         matches = auth.search_items(name)
         exact = [m for m in matches if m.get("name") == name]
@@ -745,22 +553,23 @@ def h_update_ssh(args: dict, **kw: Any) -> str:
                 auth._bw.delete_attachment(session, att.get("id", ""), item_id)
             auth._bw.create_attachment(session, file_path, item_id)
 
+        log.info("Updated SSH key item '%s' (%s).", name, item_id)
         return {"updated": True, "id": item_id, "name": name}
     return _guard(run)
 
 
-def h_delete_ssh(args: dict, **kw: Any) -> str:
+def h_delete_ssh(args: dict, auth: AuthManager, config: PluginConfig,
+                 **kw: Any) -> str:
     """Delete an SSH key item (including its attachment). confirm=true required."""
 
     def run():
-        _require_write(kw["config"])
+        _require_write(config)
         if not args.get("confirm"):
             raise errors.PermissionError_(
                 "Deletion requires explicit confirm=true.",
                 suggestion="Re-run with confirm=true to proceed.")
 
         name = str(args["name"])
-        auth = kw["auth"]
         matches = auth.search_items(name)
         exact = [m for m in matches if m.get("name") == name]
         if not exact:
@@ -775,11 +584,13 @@ def h_delete_ssh(args: dict, **kw: Any) -> str:
         def _do(session: str):
             auth._bw.delete_item(session, item_id, permanent)
         auth.run_with_recovery(_do)
+        log.warning("Deleted SSH key item '%s' (%s, permanent=%s).",
+                    name, item_id, permanent)
         return {"deleted": True, "id": item_id, "permanent": permanent}
     return _guard(run)
 
 
-def h_use_ssh(args: dict, **kw: Any) -> str:
+def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
     """Load an SSH private key from the vault into ssh-agent (v0.2.8).
 
     Security guarantees:
@@ -797,7 +608,6 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
     def run():
         name = str(args["name"])
         ssh_auth_sock_param = args.get("ssh_auth_sock")
-        auth = kw["auth"]
 
         matches = auth.search_items(name)
         exact = [m for m in matches if m.get("name") == name]
