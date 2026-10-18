@@ -4,7 +4,8 @@
 > risk. Audit before production deployment.
 
 > ⚠️ This is my first "vibe-coded" program, intended primarily for my own use. Use it entirely at your own risk!
-> ⚠️ AI audit results: 
+> 
+> ⚠️ AI audit results: [Qwen](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20Qwen3.8-max.md) [ChatGPT](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20ChatGPT.md)
 
 # Vaultwarden Plugin for Hermes Agent
 
