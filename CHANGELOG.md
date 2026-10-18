@@ -5,6 +5,34 @@ Author: **thieneret**
 
 ---
 
+## [0.3.7] - 2026-10-18
+
+### Breaking Changes
+
+- **VWP-12:** Removed `vaultwarden_generate_password` tool (13 → 12 tools).
+  Password generation is now integrated into `vaultwarden_store` and
+  `vaultwarden_update` via `generate=true`. Generated passwords are stored
+  directly in the vault and never returned to the LLM — only a placeholder
+  is returned.
+- **VWP-14:** Removed `allow_direct_secret_retrieval` config option entirely.
+  `vaultwarden_get_secret_ref` always returns only a placeholder. No escape
+  hatch remains for direct secret retrieval.
+
+### Security
+
+- **VWP-08:** SSH subprocess calls (`ssh-add`, `ssh-agent`, `ssh-keygen`)
+  now use a minimal isolated environment via `_ssh_base_env()`, mirroring
+  the isolation already applied to `bw` calls. The parent environment is
+  no longer inherited, preventing leakage of host variables and PATH
+  manipulation.
+
+### Documentation
+
+- **README.md:** Tool table updated (13 → 12). `allow_direct_secret_retrieval`
+  removed from configuration table.
+- **SECURITY.md:** Updated to reflect SSH env isolation as a primary
+  control and removal of the direct retrieval escape hatch.
+
 ## [0.3.6] - 2026-10-18
 
 ### Security (audit findings VWP-07, VWP-15, VWP-16)

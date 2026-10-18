@@ -1,6 +1,6 @@
 # vaultwarden/plugin.yaml — v0.2.8
 name: vaultwarden
-version: 0.3.6
+version: 0.3.7
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key
@@ -17,7 +17,8 @@ provides_tools:
   - vaultwarden_store
   - vaultwarden_update
   - vaultwarden_delete
-  - vaultwarden_generate_password
+  # v0.3.7 (VWP-12): vaultwarden_generate_password removed — generation is
+  # integrated into vaultwarden_store / vaultwarden_update via generate=true.
   # v0.2.8: SSH key management
   - vaultwarden_store_ssh
   - vaultwarden_update_ssh
@@ -54,10 +55,8 @@ config:
     type: boolean
     default: false
     description: Register the optional SecretSource adapter (disabled by default).
-  allow_direct_secret_retrieval:
-    type: boolean
-    default: false
-    description: Allow returning raw secret values from get_secret_ref (NOT recommended).
+  # v0.3.7 (VWP-14): allow_direct_secret_retrieval removed entirely.
+  # vaultwarden_get_secret_ref always returns only a placeholder.
   auto_sync:
     type: boolean
     default: true

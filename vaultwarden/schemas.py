@@ -1,8 +1,10 @@
-"""JSON schemas for the 13 vaultwarden_* tools (plan §8).
+"""JSON schemas for the 12 vaultwarden_* tools (plan §8).
 
-Handlers receive these as validated `args` dicts. None of the schemas
-accept or return raw secret values except vaultwarden_generate_password,
-which returns a freshly generated password explicitly by design.
+Handlers receive these as validated `args` dicts. No schema accepts or
+returns raw secret values in its RESPONSE (v0.3.7, VWP-12): password
+generation is integrated into vaultwarden_store / vaultwarden_update via
+the `generate=true` parameter — the generated value goes directly into
+the vault item and only a placeholder is returned.
 
 Schema key convention (BUG-8 — RESOLVED in v0.2.6):
 The per-tool JSON Schema lives under the "parameters" key (OpenAI
@@ -103,11 +105,42 @@ VAULTWARDEN_GET_SECRET_REF = {
     },
 }
 
+_GENERATE_PROPERTIES = {
+    "generate": {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "Generate a password instead of using the password field. "
+            "The generated password is stored directly in the vault and "
+            "never returned to the caller."),
+    },
+    "generate_options": {
+        "type": "object",
+        "description": "Password generation options. Used only when generate=true.",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["password", "passphrase"],
+                "default": "password"
+            },
+            "length": {"type": "integer", "default": 20},
+            "words": {"type": "integer", "default": 4},
+            "separator": {"type": "string", "default": "-"},
+            "uppercase": {"type": "boolean", "default": True},
+            "lowercase": {"type": "boolean", "default": True},
+            "numbers": {"type": "boolean", "default": True},
+            "special": {"type": "boolean", "default": True}
+        }
+    }
+}
+
 VAULTWARDEN_STORE = {
     "name": "vaultwarden_store",
     "description": ("Create a new vault item. Requires allow_write=true. "
                     "Secret values passed here go straight into bw via the "
-                    "encode pipeline and are redacted from all logs."),
+                    "encode pipeline and are redacted from all logs. "
+                    "Supports generate=true to auto-generate a password "
+                    "stored directly in the vault (never returned)."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -133,6 +166,7 @@ VAULTWARDEN_STORE = {
                     "required": ["name", "value"],
                 },
             },
+            **_GENERATE_PROPERTIES,
         },
         "required": ["name"],
     },
@@ -141,7 +175,9 @@ VAULTWARDEN_STORE = {
 VAULTWARDEN_UPDATE = {
     "name": "vaultwarden_update",
     "description": ("Update an existing item via fetch-modify-save. Requires "
-                    "allow_write=true. Omitted fields stay unchanged."),
+                    "allow_write=true. Omitted fields stay unchanged. "
+                    "Supports generate=true to regenerate the password, "
+                    "stored directly in the vault (never returned)."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -152,6 +188,7 @@ VAULTWARDEN_UPDATE = {
             "uri": {"type": "string"},
             "notes": {"type": "string"},
             "custom_fields": VAULTWARDEN_STORE["parameters"]["properties"]["custom_fields"],
+            **_GENERATE_PROPERTIES,
         },
         "required": ["item_id"],
     },
@@ -171,33 +208,6 @@ VAULTWARDEN_DELETE = {
                         "description": "Must be true — explicit user confirmation."},
         },
         "required": ["item_id", "confirm"],
-    },
-}
-
-VAULTWARDEN_GENERATE_PASSWORD = {
-    "name": "vaultwarden_generate_password",
-    "description": ("Generate a strong password or passphrase with bw. The "
-                    "ONLY tool that intentionally returns a secret value "
-                    "(freshly generated, not read from the vault)."),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "mode": {"type": "string", "enum": ["password", "passphrase"],
-                     "default": "password"},
-            "length": {"type": "integer", "minimum": 8, "maximum": 128,
-                       "default": 20,
-                       "description": "Password length (mode=password)."},
-            "uppercase": {"type": "boolean", "default": True},
-            "lowercase": {"type": "boolean", "default": True},
-            "numbers": {"type": "boolean", "default": True},
-            "special": {"type": "boolean", "default": True},
-            "words": {"type": "integer", "minimum": 3, "maximum": 20,
-                      "default": 4,
-                      "description": "Word count (mode=passphrase)."},
-            "separator": {"type": "string", "default": "-",
-                          "description": "Passphrase separator."},
-        },
-        "required": [],
     },
 }
 
@@ -300,7 +310,8 @@ TOOL_SCHEMAS = [
     VAULTWARDEN_STORE,
     VAULTWARDEN_UPDATE,
     VAULTWARDEN_DELETE,
-    VAULTWARDEN_GENERATE_PASSWORD,
+    # v0.3.7 (VWP-12): VAULTWARDEN_GENERATE_PASSWORD removed — generation
+    # is integrated into STORE/UPDATE via generate=true.
     # v0.2.8: SSH key management
     VAULTWARDEN_STORE_SSH,
     VAULTWARDEN_UPDATE_SSH,

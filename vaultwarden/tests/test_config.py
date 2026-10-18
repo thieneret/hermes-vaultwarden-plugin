@@ -37,7 +37,9 @@ def test_defaults_when_no_settings(no_config_fallback):
     assert cfg.enabled is False
     assert cfg.allow_write is False
     assert cfg.allow_startup_secret_injection is False
-    assert cfg.allow_direct_secret_retrieval is False
+    # v0.3.7 (VWP-14): allow_direct_secret_retrieval removed entirely —
+    # the escape hatch no longer exists on PluginConfig.
+    assert not hasattr(cfg, "allow_direct_secret_retrieval")
     assert cfg.auto_sync is True
     assert cfg.sync_interval_seconds == 300
     assert cfg.session_timeout_seconds == 14400

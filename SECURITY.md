@@ -16,13 +16,20 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 
 | Control | Mechanism |
 |---------|-----------|
-| Placeholder injection | Secrets never enter the agent's context window. `vaultwarden_get_secret_ref` returns a `__VW_SECRET_xxxx__` token; the real value is injected only at command execution time via middleware. |
+| Placeholder injection | Secrets never enter the agent's context window. `vaultwarden_get_secret_ref` returns a `__VW_SECRET_xxxx__` token; the real value is injected only at command execution time via middleware. No escape hatch (direct secret retrieval removed in v0.3.7). |
 | Subprocess env isolation | All `bw` calls run with a minimal, explicitly constructed environment. The parent environment is NEVER inherited. |
+| SSH environment isolation | All SSH subprocess calls (`ssh-add`, `ssh-agent`, `ssh-keygen`) run via `_ssh_base_env()` — a minimal, explicitly allowlisted environment. The parent environment is NEVER inherited. |
+| Password generation | `vaultwarden_store` / `vaultwarden_update` with `generate=true` generate a password and store it directly in the vault. The generated value is never returned to the LLM — only a placeholder is. |
 | Session key in memory only | The Bitwarden session key is never written to disk. |
 | SSH passphrase via env | The SSH passphrase is delivered via `SSH_ASKPASS` + environment variable, never written to a file. |
 | Temp file cleanup | SSH key temp files are created with `mkstemp()` (0600 perms) and deleted in a `finally` block. |
 
 ## Defense-in-Depth: Log Redaction
+
+As of v0.3.7, the `allow_direct_secret_retrieval` escape hatch has been
+completely removed. There is no code path that returns a raw secret to
+the LLM. The placeholder model is the only supported path for secret
+access.
 
 The `RedactingFilter` (in `security.py`) is a **defense-in-depth** mechanism.
 It provides an additional layer of protection but has known limitations:
@@ -49,6 +56,8 @@ Fields whose keys match secret-like patterns (`password`, `passphrase`,
 - Always call `register_secret()` before any operation that handles secrets.
 - Always call `forget_secret()` in a `finally` block.
 - Never pass secret values as log message arguments.
+- Generated passwords (via `generate=true`) must never be returned to the
+  caller — only a placeholder.
 
 ## Supply Chain
 

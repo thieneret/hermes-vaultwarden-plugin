@@ -1,6 +1,7 @@
 """Unit tests: tool handlers — metadata-only outputs, gating, CRUD, generation."""
 from __future__ import annotations
 
+import os
 import re
 
 TOKEN_RE = re.compile(r"^__VW_SECRET_[0-9a-f]{12}__$")
@@ -70,7 +71,9 @@ def test_get_secret_ref_returns_placeholder_not_secret(tools_by_name, registry):
     assert TOKEN_RE.match(res["placeholder"])
     assert res["ttl_seconds"] == 300
     assert "sup3r-s3cret-pg!" not in str(res)
-    assert "direct_value" not in res          # default OFF
+    # v0.3.7 (VWP-14): direct retrieval escape hatch removed — a raw value
+    # key can never appear in the response, under any configuration.
+    assert "direct_value" not in res
     assert len(registry.snapshot()) == 1
 
 
@@ -97,20 +100,19 @@ def test_get_secret_ref_unknown_item(tools_by_name):
 
 
 def test_write_tools_blocked_when_disabled(tools_by_name):
-    # v0.1.5 (FAIL-11): vaultwarden_generate_password is NOT a vault mutation
-    # (BUG-2 / v0.1.2 fix, protected by test_bugfixes_v12) — it must SUCCEED
-    # with allow_write=false; only store/update/delete are blocked.
+    # v0.3.7 (VWP-12): vaultwarden_generate_password no longer exists;
+    # store/update/delete are blocked with allow_write=false (and this also
+    # covers generate=true, which is a vault mutation and must be blocked).
     for name, args in (
         ("vaultwarden_store", {"type": "login", "name": "x"}),
+        ("vaultwarden_store", {"type": "login", "name": "x", "generate": True}),
         ("vaultwarden_update", {"item_id": "a", "name": "b"}),
+        ("vaultwarden_update", {"item_id": "a", "generate": True}),
         ("vaultwarden_delete", {"item_id": "a", "confirm": True}),
     ):
         res = tools_by_name[name](args)
-        assert res["error_code"] == "PERMISSION_ERROR", name
+        assert res["error_code"] == "PERMISSION_ERROR", (name, args)
         assert res["recoverable"] is False
-    gen_res = tools_by_name["vaultwarden_generate_password"]({"length": 16})
-    assert "error" not in gen_res, \
-        "generate_password should work without write permission (BUG-2)"
 
 
 def test_store_update_delete_cycle(write_tools_by_name):
@@ -134,12 +136,64 @@ def test_store_update_delete_cycle(write_tools_by_name):
     assert perm["permanent"] is True
 
 
-def test_generate_password(write_tools_by_name):
-    res = write_tools_by_name["vaultwarden_generate_password"]({"length": 24})
-    assert res["generated"] == "Zk9#xQ2vLm8pRt4wYb7n"  # fake bw deterministic
-    pass_res = write_tools_by_name["vaultwarden_generate_password"](
-        {"mode": "passphrase", "words": 6, "separator": "."})
-    assert pass_res["mode"] == "passphrase"
+FAKE_GEN_PW = "Zk9#xQ2vLm8pRt4wYb7n"   # deterministic fake-bw generate output
+
+
+def test_store_generate_true(write_tools_by_name, appdata, registry):
+    """v0.3.7 (VWP-12): store + generate=true stores pw, returns placeholder."""
+    import json as _json
+
+    res = write_tools_by_name["vaultwarden_store"]({
+        "type": "login", "name": "Gen service", "username": "svc",
+        "generate": True, "generate_options": {"length": 24}})
+    assert res["created"] is True and res["id"] == "new-item-id-0001"
+    assert res["password_generated"] is True
+    assert TOKEN_RE.match(res["password_placeholder"])
+    assert res["placeholder_ttl_seconds"] == 300
+    # The raw generated password must NEVER appear in the response...
+    blob = _json.dumps(res)
+    assert FAKE_GEN_PW not in blob
+    assert "generated" not in res or res.get("password_generated") is True
+    # ...while it IS stored in the vault item (fake bw persists items).
+    with open(appdata / "fake_items.json") as f:
+        stored = _json.load(f)["new-item-id-0001"]
+    assert stored["login"]["password"] == FAKE_GEN_PW
+    # Placeholder registered for later command-time injection.
+    snap = registry.snapshot()
+    assert res["password_placeholder"] in snap
+    assert snap[res["password_placeholder"]]["field"] == "password"
+
+
+def test_update_generate_true(write_tools_by_name, appdata, registry):
+    """v0.3.7 (VWP-12): update + generate=true regenerates pw in place."""
+    import json as _json
+
+    # Seed an editable item through the fake bw persistence layer.
+    write_tools_by_name["vaultwarden_store"]({
+        "type": "login", "name": "To regen", "username": "u",
+        "password": "old-pw"})
+    upd = write_tools_by_name["vaultwarden_update"]({
+        "item_id": "new-item-id-0001", "generate": True,
+        "generate_options": {"mode": "passphrase", "words": 4, "separator": "-"}})
+    assert upd["updated"] is True
+    assert upd["password_generated"] is True
+    assert TOKEN_RE.match(upd["password_placeholder"])
+    assert upd["placeholder_ttl_seconds"] == 300
+    blob = _json.dumps(upd)
+    assert FAKE_GEN_PW not in blob      # raw value never returned
+    assert "old-pw" not in blob         # metadata-only response
+    with open(appdata / "fake_items.json") as f:
+        stored = _json.load(f)["new-item-id-0001"]
+    assert stored["login"]["password"] == FAKE_GEN_PW
+    snap = registry.snapshot()
+    assert snap[upd["password_placeholder"]]["field"] == "password"
+
+
+def test_store_without_generate_has_no_placeholder_fields(write_tools_by_name):
+    res = write_tools_by_name["vaultwarden_store"]({
+        "type": "login", "name": "Plain", "username": "u", "password": "pw1"})
+    assert "password_generated" not in res
+    assert "password_placeholder" not in res
 
 
 def test_error_envelope_format(tools_by_name):
@@ -149,11 +203,14 @@ def test_error_envelope_format(tools_by_name):
     assert set(bad) >= {"error", "error_code", "recoverable"}
 
 
-def test_direct_retrieval_escape_hatch(bw_cli, registry):
+def test_direct_retrieval_escape_hatch_removed(bw_cli, registry):
+    """v0.3.7 (VWP-14): no code path returns a raw secret — even if the
+    legacy setting key is present in the config section."""
     from vaultwarden.auth import AuthManager
     from vaultwarden.tests.conftest import make_config
     from vaultwarden.tools import get_tools
     cfg = make_config(section={"allow_direct_secret_retrieval": True})
+    assert not hasattr(cfg, "allow_direct_secret_retrieval")  # option gone
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
     mgr.ensure_authenticated()
     # v0.1.5 (FAIL-2): get_tools yields (schema_dict, handler) tuples; dict()
@@ -161,7 +218,9 @@ def test_direct_retrieval_escape_hatch(bw_cli, registry):
     tools = _dict_tools({s["name"]: h for s, h in get_tools(mgr, cfg, registry)})
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    assert res.get("direct_value") == "sup3r-s3cret-pg!"
+    assert TOKEN_RE.match(res["placeholder"])
+    assert "direct_value" not in res
+    assert "sup3r-s3cret-pg!" not in str(res)
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +268,9 @@ def test_all_handlers_return_str():
     auth.status_snapshot.return_value = {"auth_state": "unlocked"}
     auth.sync.return_value = {"synced": True}
     auth.list_items.return_value = []
-    auth.generate_password.return_value = "test-password-123"
 
     config = MagicMock()
     config.allow_write = True
-    config.allow_direct_secret_retrieval = False
 
     registry = PlaceholderRegistry(ttl_seconds=300, max_entries=50)
 
@@ -228,8 +285,6 @@ def test_all_handlers_return_str():
                 result = handler({"limit": 10})
             elif tool_name == "vaultwarden_search":
                 result = handler({"query": "test"})
-            elif tool_name == "vaultwarden_generate_password":
-                result = handler({"mode": "password", "length": 16})
             else:
                 continue  # skip tools that need complex mocking
 
@@ -244,8 +299,9 @@ def test_all_handlers_return_str():
 # Consolidated from test_bugfixes_v12.py (BUG-1..BUG-5 tool parts)
 # ---------------------------------------------------------------------------
 
-def test_generate_password_uses_flag_syntax(monkeypatch):
-    """bw generate <len> --uppercase --lowercase --number --special (no 1/0)."""
+def test_store_generate_uses_flag_syntax(monkeypatch):
+    """v0.3.7 (VWP-12): bw generate <len> --uppercase --lowercase --number
+    --special (no 1/0) — via vaultwarden_store(generate=true)."""
     import json as _json
 
     from vaultwarden.auth import AuthManager
@@ -260,10 +316,13 @@ def test_generate_password_uses_flag_syntax(monkeypatch):
             captured.append(list(args))
             return "genpw"
 
-    cfg = make_config()
+    cfg = make_config(section={"allow_write": True})
     auth = AuthManager.__new__(AuthManager)          # skip real init
     auth._bw = FakeBw()                              # noqa: SLF001
     auth.run_with_recovery = lambda fn: fn("sess")   # type: ignore[attr-defined]
+    auth.create_item = lambda item: dict(item, id="gen-id-1")
+    auth.get_item = lambda iid: {"id": iid, "name": "n", "login": {}}
+    auth.edit_item = lambda item: item
 
     def wrap(handler):
         def inner(args, **kw):
@@ -273,36 +332,85 @@ def test_generate_password_uses_flag_syntax(monkeypatch):
 
     tools = {s["name"]: wrap(h) for s, h in get_tools(auth, cfg, PlaceholderRegistry())}
 
-    res = tools["vaultwarden_generate_password"]({"mode": "password", "length": 20})
-    assert res["generated"] == "genpw"
+    res = tools["vaultwarden_store"]({
+        "type": "login", "name": "x", "generate": True,
+        "generate_options": {"mode": "password", "length": 20}})
+    assert res["password_generated"] is True
+    assert "genpw" not in _json.dumps(res)           # raw value never returned
     assert captured[-1] == ["20", "--uppercase", "--lowercase", "--number", "--special"]
 
-    res = tools["vaultwarden_generate_password"](
-        {"mode": "password", "length": 16, "uppercase": False, "special": False})
+    tools["vaultwarden_store"]({
+        "type": "login", "name": "x", "generate": True,
+        "generate_options": {"length": 16, "uppercase": False, "special": False}})
     assert captured[-1] == ["16", "--lowercase", "--number"]  # only True flags kept
 
-    res = tools["vaultwarden_generate_password"](
-        {"mode": "passphrase", "words": 4, "separator": "-"})
+    tools["vaultwarden_update"]({
+        "item_id": "abc", "generate": True,
+        "generate_options": {"mode": "passphrase", "words": 4, "separator": "-"}})
     assert captured[-1] == ["--passphrase", "-w", "4", "--separator", "-"]
 
 
-def test_generate_password_works_without_write_permission(tools_by_name):
-    """BUG-2: generation is not a vault mutation -> allow_write=false is fine."""
-    res = tools_by_name["vaultwarden_generate_password"]({"length": 24})
-    assert "error" not in res
-    assert res["generated"] == "Zk9#xQ2vLm8pRt4wYb7n"  # fake bw deterministic
-    pass_res = tools_by_name["vaultwarden_generate_password"](
-        {"mode": "passphrase", "words": 6, "separator": "."})
-    assert pass_res["mode"] == "passphrase" and "error" not in pass_res
+def test_generate_requires_write_permission(tools_by_name):
+    """v0.3.7 (VWP-12): generate=true is a vault mutation -> blocked when
+    allow_write=false (replaces the old BUG-2 exemption of the removed tool)."""
+    res = tools_by_name["vaultwarden_store"](
+        {"type": "login", "name": "x", "generate": True})
+    assert res["error_code"] == "PERMISSION_ERROR"
 
 
-def test_generate_password_via_fake_bw_flags(tools_by_name):
+def test_generate_via_fake_bw_flags(write_tools_by_name):
     """End-to-end through the fake bw: unknown positional 1/0 args would be
     rejected by a real CLI; the flag form must succeed in both modes."""
-    for args in ({"mode": "password", "length": 20},
+    for opts in ({"mode": "password", "length": 20},
                  {"mode": "passphrase", "words": 3}):
-        res = tools_by_name["vaultwarden_generate_password"](args)
+        res = write_tools_by_name["vaultwarden_store"](
+            {"type": "login", "name": f"svc-{opts['mode']}", "generate": True,
+             "generate_options": opts})
         assert "error" not in res, res
+        assert res["password_generated"] is True
+
+
+# ---------------------------------------------------------------------------
+# VWP-08 (v0.3.7): SSH subprocess environment isolation
+# ---------------------------------------------------------------------------
+
+def test_ssh_base_env_allowlist_only(monkeypatch):
+    """_ssh_base_env returns ONLY PATH/HOME/LC_ALL plus filtered extras."""
+    from vaultwarden.tools import _ssh_base_env
+
+    monkeypatch.setenv("SECRET_TEST_VAR", "should_not_leak")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "should_not_leak_either")
+    env = _ssh_base_env()
+    assert set(env) == {"PATH", "HOME", "LC_ALL"}
+    assert "SECRET_TEST_VAR" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert env["LC_ALL"] == "C"
+
+
+def test_ssh_base_env_extras_and_falsy_filtering(monkeypatch):
+    """Extras are merged; falsy extra values are dropped entirely."""
+    from vaultwarden.tools import _ssh_base_env
+
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/parent/leaky/sock")
+    env = _ssh_base_env({"SSH_AUTH_SOCK": "/tmp/test", "SSH_ASKPASS": "",
+                         "VW_SSH_PASS": None})
+    assert env["SSH_AUTH_SOCK"] == "/tmp/test"      # explicit override wins
+    assert "SSH_ASKPASS" not in env                 # falsy -> dropped
+    assert "VW_SSH_PASS" not in env                 # None -> dropped
+    assert "SECRET_TEST_VAR" not in env
+    assert set(env) <= {"PATH", "HOME", "LC_ALL", "SSH_AUTH_SOCK"}
+
+
+def test_ssh_base_env_never_inherits_parent(monkeypatch):
+    """The parent environment is NEVER inherited wholesale."""
+    from vaultwarden.tools import _ssh_base_env
+
+    for k in list(os.environ):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("PATH", "/minimal/bin")
+    env = _ssh_base_env()
+    assert len(env) == 3                            # PATH, HOME, LC_ALL only
+    assert env["PATH"] == "/minimal/bin"
 
 
 def test_list_folder_id_uses_folderid_flag(bw_cli, appdata, monkeypatch):

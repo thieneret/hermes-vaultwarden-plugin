@@ -45,13 +45,30 @@ def test_store_schema_type_not_required():
     assert props.get("type", {}).get("default") == "login"
 
 
-def test_generate_password_schema_defaults():
-    """v0.2.6: generate_password schema must declare defaults."""
-    from vaultwarden.schemas import VAULTWARDEN_GENERATE_PASSWORD
-    props = VAULTWARDEN_GENERATE_PASSWORD["parameters"]["properties"]
-    assert props["length"].get("default") == 20, "length must default to 20"
-    assert props["words"].get("default") == 4, "words must default to 4"
-    assert props["separator"].get("default") == "-", "separator must default to '-'"
+def test_generate_password_schema_removed():
+    """v0.3.7 (VWP-12): VAULTWARDEN_GENERATE_PASSWORD schema deleted."""
+    import vaultwarden.schemas as s
+    assert not hasattr(s, "VAULTWARDEN_GENERATE_PASSWORD")
+    names = [t["name"] for t in s.TOOL_SCHEMAS]
+    assert "vaultwarden_generate_password" not in names
+    assert len(names) == 12
+
+
+def test_store_update_generate_schema_defaults():
+    """v0.3.7 (VWP-12): store/update expose generate + generate_options."""
+    from vaultwarden.schemas import VAULTWARDEN_STORE, VAULTWARDEN_UPDATE
+    for schema in (VAULTWARDEN_STORE, VAULTWARDEN_UPDATE):
+        props = schema["parameters"]["properties"]
+        assert props["generate"]["type"] == "boolean"
+        assert props["generate"].get("default") is False
+        go = props["generate_options"]
+        assert go["type"] == "object"
+        gprops = go["properties"]
+        assert gprops["mode"]["enum"] == ["password", "passphrase"]
+        assert gprops["mode"].get("default") == "password"
+        assert gprops["length"].get("default") == 20, "length must default to 20"
+        assert gprops["words"].get("default") == 4, "words must default to 4"
+        assert gprops["separator"].get("default") == "-", "separator must default to '-'"
 
 
 def test_sync_schema_has_force():
