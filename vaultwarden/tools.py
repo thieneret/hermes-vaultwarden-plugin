@@ -1,14 +1,15 @@
-"""Tool handlers for the 13 vaultwarden_* tools (plan §8).
+"""Tool handlers for the 12 vaultwarden_* tools (plan §8).
 
 ``get_tools(auth, config, registry)`` yields (schema, handler) pairs.
 v0.2.4: Handlers return JSON strings (Hermes tool_call requires str);
 on failure they return the standard error envelope serialized to JSON:
 {"error", "error_code", "recoverable", "suggestion"}.
 
-Hard rule: no handler ever returns a stored secret value. The single
-exception is vaultwarden_generate_password (explicitly by design) and
-vaultwarden_get_secret_ref when allow_direct_secret_retrieval=true
-(default false — placeholders are used instead).
+Hard rule (VWP-12 / VWP-14, v0.3.7): no handler EVER returns a raw
+secret value. Generated passwords (via ``generate=true`` on store /
+update) go directly into the vault item; only a placeholder is
+returned. ``vaultwarden_get_secret_ref`` always returns only a
+placeholder — the direct-retrieval escape hatch was removed.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import json
 import os
 import subprocess
 import tempfile
+from pathlib import Path
 from typing import Any, Callable
 
 from . import errors, schemas
@@ -31,6 +33,56 @@ Handler = Callable[..., str]
 
 
 # --------------------------------------------------------------- helpers
+def _ssh_base_env(extra: dict | None = None) -> dict:
+    """Minimal, isolated environment for SSH subprocess calls.
+
+    Mirrors BwCli.base_env(): only explicitly allowlisted keys are
+    passed through. The parent environment is NEVER inherited.
+
+    VWP-08 (v0.3.7): prevents leakage of sensitive host variables and
+    PATH manipulation via the inherited environment.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", str(Path.home())),
+        "LC_ALL": "C",
+    }
+    if extra:
+        env.update({k: v for k, v in extra.items() if v})
+    return env
+
+
+def _generate_password(auth: AuthManager, options: dict) -> str:
+    """Generate a password or passphrase via bw generate.
+
+    Returns the raw generated string. Caller is responsible for
+    registering it with RedactingFilter and never returning it
+    to the LLM.
+
+    Real bw generate syntax (BUG-1 fix, retained from v0.1.2):
+      password:   bw generate <length> --uppercase --lowercase
+                  --number --special   (note the singular "--number")
+      passphrase: bw generate --passphrase -w N --separator S
+    """
+    mode = options.get("mode") or "password"
+    if mode == "passphrase":
+        words = int(options.get("words") or 4)
+        sep = str(options.get("separator") or "-")
+        bw_args = ["--passphrase", "-w", str(words), "--separator", sep]
+    else:
+        length = int(options.get("length") or 20)
+        bw_args = [str(length)]
+        if options.get("uppercase", True):
+            bw_args.append("--uppercase")
+        if options.get("lowercase", True):
+            bw_args.append("--lowercase")
+        if options.get("numbers", True):
+            bw_args.append("--number")
+        if options.get("special", True):
+            bw_args.append("--special")
+    return auth.generate_password(bw_args)
+
+
 def _item_type_name(item: dict) -> str:
     mapping = {1: "login", 2: "note", 3: "card", 4: "identity"}
     t = item.get("type")
@@ -140,9 +192,11 @@ def get_tools(auth: AuthManager, config: PluginConfig,
               registry: PlaceholderRegistry) -> list[tuple[dict, Handler]]:
     """Return (schema, handler) pairs for all vaultwarden tools.
 
-    v0.2.8: returns a concrete list of 13 (schema, handler) pairs — the
+    v0.2.8: returns a concrete list of (schema, handler) pairs — the
     SSH key management tools (store/update/delete/use_ssh) are appended at
     the end of the list.
+    v0.3.7 (VWP-12): 12 tools — vaultwarden_generate_password was removed;
+    password generation is integrated into store/update via generate=true.
     """
     _tools: list[tuple[dict, Handler]] = []
 
@@ -239,8 +293,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 "usage": ("Insert this exact token into a terminal command; it is "
                           "replaced with the real value at execution time (single use)."),
             }
-            if config.allow_direct_secret_retrieval:  # DEFAULT OFF — escape hatch
-                result["direct_value"] = value
+            # VWP-14 (v0.3.7): the allow_direct_secret_retrieval escape hatch
+            # was removed — `value` stays in local memory only and NEVER
+            # appears in the returned dict. Placeholder is the ONLY path.
             return result
         return _guard(run)
 
@@ -251,18 +306,50 @@ def get_tools(auth: AuthManager, config: PluginConfig,
         def run():
             _require_write(config)
             redactor = get_redacting_filter()
+
+            generated_pw = None
+            generate = bool(args.get("generate", False))
+
+            if generate:
+                gen_opts = args.get("generate_options") or {}
+                generated_pw = _generate_password(auth, gen_opts)
+                redactor.register_secret(generated_pw)
+
             tracked = _collect_secret_strings(args)
             for t in tracked:
                 redactor.register_secret(t)
+
             try:
                 item = _build_item(args)
+
+                # VWP-12: If generate=true, override the password field.
+                # The generated value goes straight into the vault item and
+                # is NEVER returned to the LLM — only a placeholder is.
+                if generated_pw is not None:
+                    login = item.get("login") or {}
+                    login["password"] = generated_pw
+                    item["login"] = login
+
                 created = auth.create_item(item)
-                log.info("Created vault item '%s' (%s).", created.get("name"), created.get("id"))
-                return {"created": True, "id": created.get("id"),
-                        "item": _metadata(created)}
+                log.info("Created vault item '%s' (%s).",
+                         created.get("name"), created.get("id"))
+
+                result = {"created": True, "id": created.get("id"),
+                          "item": _metadata(created)}
+
+                if generated_pw is not None:
+                    item_id = created.get("id") or ""
+                    entry = registry.create(item_id, "password")
+                    result["password_generated"] = True
+                    result["password_placeholder"] = entry.token
+                    result["placeholder_ttl_seconds"] = registry.ttl_seconds
+
+                return result
             finally:
                 for t in tracked:
                     redactor.forget_secret(t)
+                if generated_pw is not None:
+                    redactor.forget_secret(generated_pw)
         return _guard(run)
 
     _tools.append((schemas.VAULTWARDEN_STORE, h_store))
@@ -272,20 +359,50 @@ def get_tools(auth: AuthManager, config: PluginConfig,
         def run():
             _require_write(config)
             redactor = get_redacting_filter()
+
+            generated_pw = None
+            generate = bool(args.get("generate", False))
+
+            if generate:
+                gen_opts = args.get("generate_options") or {}
+                generated_pw = _generate_password(auth, gen_opts)
+                redactor.register_secret(generated_pw)
+
             tracked = _collect_secret_strings(args)
             for t in tracked:
                 redactor.register_secret(t)
+
             try:
                 item_id = str(args["item_id"])
                 current = auth.get_item(item_id)
                 merged = _apply_updates(current, args)
+
+                # VWP-12: If generate=true, override the password field.
+                # The generated value goes straight into the vault item and
+                # is NEVER returned to the LLM — only a placeholder is.
+                if generated_pw is not None:
+                    login = merged.get("login") or {}
+                    login["password"] = generated_pw
+                    merged["login"] = login
+
                 updated = auth.edit_item(merged)
                 log.info("Updated vault item %s.", item_id)
-                return {"updated": True, "id": updated.get("id") or item_id,
-                        "item": _metadata(updated)}
+
+                result = {"updated": True, "id": updated.get("id") or item_id,
+                          "item": _metadata(updated)}
+
+                if generated_pw is not None:
+                    entry = registry.create(item_id, "password")
+                    result["password_generated"] = True
+                    result["password_placeholder"] = entry.token
+                    result["placeholder_ttl_seconds"] = registry.ttl_seconds
+
+                return result
             finally:
                 for t in tracked:
                     redactor.forget_secret(t)
+                if generated_pw is not None:
+                    redactor.forget_secret(generated_pw)
         return _guard(run)
 
     _tools.append((schemas.VAULTWARDEN_UPDATE, h_update))
@@ -309,45 +426,6 @@ def get_tools(auth: AuthManager, config: PluginConfig,
         return _guard(run)
 
     _tools.append((schemas.VAULTWARDEN_DELETE, h_delete))
-
-    # ----------------------------------------------------- generate_password
-    def h_generate(args: dict, **kw: Any) -> str:
-        def run():
-            # BUG-2 fix: no _require_write() here — generation does not touch
-            # the vault (plan §8), so it works with allow_write=false.
-            mode = args.get("mode") or "password"
-            if mode == "passphrase":
-                words = int(args.get("words") or 4)
-                sep = str(args.get("separator") or "-")
-                # BUG-1 fix: real bw generate passphrase syntax uses flags,
-                # not positional 1/0 values: bw generate --passphrase -w N --separator S
-                bw_args = ["--passphrase", "-w", str(words), "--separator", sep]
-            else:
-                length = int(args.get("length") or 20)
-                upper = args.get("uppercase", True)
-                lower = args.get("lowercase", True)
-                nums = args.get("numbers", True)
-                special = args.get("special", True)
-                # BUG-1 fix: real bw generate password syntax uses flags, not
-                # positional 1/0 values: bw generate <length> --uppercase
-                # --lowercase --number --special (verified against the Bitwarden
-                # CLI source; note the singular "--number"). Only include a flag
-                # when the corresponding boolean is True.
-                bw_args = [str(length)]
-                if upper:
-                    bw_args.append("--uppercase")
-                if lower:
-                    bw_args.append("--lowercase")
-                if nums:
-                    bw_args.append("--number")
-                if special:
-                    bw_args.append("--special")
-            pw = auth.generate_password(bw_args)
-            log.info("Generated a new %s (value not logged).", mode)
-            return {"mode": mode, "generated": pw, "length": len(pw)}
-        return _guard(run)
-
-    _tools.append((schemas.VAULTWARDEN_GENERATE_PASSWORD, h_generate))
 
     # ================================================== SSH key management
     # v0.3.5: the single implementations of the SSH tool handlers live at
@@ -415,7 +493,7 @@ def _resolve_socket_path(ssh_auth_sock: str | None) -> tuple[str, bool]:
     def _agent_running(sock: str) -> bool:
         try:
             r = subprocess.run(["ssh-add", "-l"],
-                               env={**os.environ, "SSH_AUTH_SOCK": sock},
+                               env=_ssh_base_env({"SSH_AUTH_SOCK": sock}),
                                capture_output=True, text=True, timeout=5)
             return r.returncode in (0, 1)
         except Exception:
@@ -423,10 +501,12 @@ def _resolve_socket_path(ssh_auth_sock: str | None) -> tuple[str, bool]:
 
     def _start_agent_at(sock: str) -> None:
         subprocess.run(["ssh-agent", "-a", sock],
+                       env=_ssh_base_env(),
                        capture_output=True, text=True, timeout=10)
 
     def _start_agent_default() -> str:
-        r = subprocess.run(["ssh-agent"], capture_output=True, text=True,
+        r = subprocess.run(["ssh-agent"], env=_ssh_base_env(),
+                           capture_output=True, text=True,
                            timeout=10)
         for line in (r.stdout or "").splitlines():
             if line.startswith("SSH_AUTH_SOCK="):
@@ -655,13 +735,14 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
             # The askpass script contains ONLY `echo "$VW_SSH_PASS"` —
             # no secret content in the file. The passphrase is passed
             # via environment variable to the subprocess only.
-            env = {
+            # VWP-08: env built via _ssh_base_env() — minimal allowlist,
+            # parent environment NEVER inherited.
+            env = _ssh_base_env({
                 "SSH_AUTH_SOCK": sock,
-                "HOME": os.environ.get("HOME", "/"),
                 "SSH_ASKPASS_REQUIRE": "force",
                 "SSH_ASKPASS": askpass_path,
                 "VW_SSH_PASS": passphrase,
-            }
+            })
             proc = subprocess.run(
                 ["ssh-add", key_path],
                 env=env,
@@ -676,6 +757,7 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
 
             fp_proc = subprocess.run(
                 ["ssh-keygen", "-lf", key_path],
+                env=_ssh_base_env(),
                 capture_output=True, text=True, timeout=10)
             fingerprint = (fp_proc.stdout or "").strip().split()[1] \
                 if fp_proc.returncode == 0 else "unknown"

@@ -47,7 +47,9 @@ _DEFAULTS: dict[str, Any] = {
     "appdata_dir_env": "VW_APPDATA_DIR",
     "allow_write": False,
     "allow_startup_secret_injection": False,
-    "allow_direct_secret_retrieval": False,
+    # v0.3.7 (VWP-14): allow_direct_secret_retrieval REMOVED entirely.
+    # There is no code path that returns a raw secret to the LLM; the
+    # placeholder model is the only supported path for secret access.
     "auto_sync": True,
     "sync_interval_seconds": 300,
     "session_timeout_seconds": 14400,
@@ -188,9 +190,8 @@ class PluginConfig:
     def allow_startup_secret_injection(self) -> bool:
         return _as_bool(self._raw("allow_startup_secret_injection"))
 
-    @property
-    def allow_direct_secret_retrieval(self) -> bool:
-        return _as_bool(self._raw("allow_direct_secret_retrieval"))
+    # v0.3.7 (VWP-14): allow_direct_secret_retrieval property removed —
+    # direct secret retrieval no longer exists anywhere in the plugin.
 
     @property
     def auto_sync(self) -> bool:

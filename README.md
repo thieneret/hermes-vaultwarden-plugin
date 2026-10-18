@@ -16,7 +16,7 @@ Secure secrets management for Hermes Agent via Vaultwarden. Provides safe access
 
 ## Features
 
-- **13 registered tools** covering vault read/write, secret references, and SSH key management
+- **12 registered tools** covering vault read/write, secret references, and SSH key management
 - **Placeholder injection** — raw secrets never enter the agent's context window
 - **SSH key management** — store private keys as vault attachments, load them into ssh-agent on demand
 - **Bitwarden CLI integration** — all vault operations go through the audited `bw` binary
@@ -95,7 +95,6 @@ plugins:
         master_password_env: VW_MASTER_PASSWORD
         allow_write: false
         allow_startup_secret_injection: false
-        allow_direct_secret_retrieval: false
         auto_sync: true
         sync_interval_seconds: 300
         session_timeout_seconds: 14400
@@ -118,7 +117,6 @@ VW_MASTER_PASSWORD="your-master-password"
 | Setting | Effect |
 |---------|--------|
 | `allow_write` | Enables `store`/`update`/`delete` operations. Default: `false` |
-| `allow_direct_secret_retrieval` | Permits returning raw secrets. **Strongly discouraged.** Default: `false` |
 | `session_timeout_seconds` | Vault session lifetime. Default: `14400` (4h) |
 | `placeholder_ttl_seconds` | Placeholder token lifetime. Default: `300` (5min) |
 | `auto_sync` | Sync vault before read operations |
@@ -134,9 +132,8 @@ VW_MASTER_PASSWORD="your-master-password"
 | `vaultwarden_list` | List items — metadata only | ❌ |
 | `vaultwarden_search` | Search items by name/username/uri — metadata only | ❌ |
 | `vaultwarden_get_secret_ref` | Generate a single-use placeholder token | ❌ |
-| `vaultwarden_generate_password` | Generate a strong password/passphrase (the only tool that returns a secret) | ❌ |
-| `vaultwarden_store` | Create a new vault item | ✅ |
-| `vaultwarden_update` | Update an existing item | ✅ |
+| `vaultwarden_store` | Create a new vault item. Supports `generate=true` to auto-generate a password stored directly in the vault. | ✅ |
+| `vaultwarden_update` | Update an existing item. Supports `generate=true` to regenerate the password, stored directly in the vault. | ✅ |
 | `vaultwarden_delete` | Delete an item (`confirm=true` required) | ✅ |
 
 ### SSH key management tools
@@ -214,7 +211,7 @@ vaultwarden/
 ├── config.py        # Settings load, env resolution, config fallback
 ├── auth.py          # AuthManager: state machine, session, recovery
 ├── bw_cli.py        # BwCli: subprocess wrapper, base64 encoding, attachments
-├── tools.py         # 13 tool handlers
+├── tools.py         # 12 tool handlers
 ├── schemas.py       # OpenAI-style JSON schemas
 ├── placeholders.py  # Single-use placeholder registry
 ├── security.py      # RedactingFilter, escaping
