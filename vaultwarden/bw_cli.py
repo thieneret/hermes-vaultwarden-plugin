@@ -221,6 +221,19 @@ class BwCli:
             raise errors.NotFoundError(f"No item matching '{query}'.")
         return data
 
+    def get_password(self, session_key: str, item_id: str) -> str:
+        """`bw get password <item_id>` -> decrypted password string.
+
+        v0.3.3: bw get item does NOT return encrypted fields (password
+        is null in the output). This dedicated command retrieves the
+        decrypted password value.
+        """
+        data = self.run(["get", "password", item_id],
+                        env={"BW_SESSION": session_key}, raw=True)
+        if isinstance(data, str):
+            return data.strip()
+        return str(data).strip()
+
     def create_item(self, session_key: str, encoded_json: str) -> dict:
         """`bw create item` via stdin -> created item JSON.
 
