@@ -487,6 +487,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             sock, agent_started = _resolve_socket_path(ssh_auth_sock_param)
 
             key_path = None
+            askpass_path = None
             try:
                 # v0.2.8: SSH key delivery — temp file unavoidable (ssh-add
                 # reads the key from a file; stdin is reserved for the
@@ -507,12 +508,29 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 except OSError:
                     pass
 
-                # Passphrase delivery: stdin pipe ONLY — NEVER a temp file.
-                env = {"SSH_AUTH_SOCK": sock,
-                       "HOME": os.environ.get("HOME", "/")}
+                # Create askpass script: contains ONLY the echo command,
+                # no secret content. Passphrase delivered via env var.
+                fd_ap, askpass_path = tempfile.mkstemp(
+                    suffix=".sh", prefix="vw_askpass_")
+                with os.fdopen(fd_ap, "w") as f:
+                    f.write('#!/bin/sh\necho "$VW_SSH_PASS"\n')
+                os.chmod(askpass_path, 0o700)
+
+                # Passphrase delivery via SSH_ASKPASS mechanism.
+                # The askpass script contains ONLY `echo "$VW_SSH_PASS"` —
+                # no secret content in the file. The passphrase is passed
+                # via environment variable to the subprocess only.
+                env = {
+                    "SSH_AUTH_SOCK": sock,
+                    "HOME": os.environ.get("HOME", "/"),
+                    "SSH_ASKPASS_REQUIRE": "force",
+                    "SSH_ASKPASS": askpass_path,
+                    "VW_SSH_PASS": passphrase,
+                }
                 proc = subprocess.run(
                     ["ssh-add", key_path],
-                    env=env, input=passphrase,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True, text=True, timeout=30,
                 )
                 if proc.returncode != 0:
@@ -539,9 +557,16 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                         "subsequent SSH commands."),
                 }
             finally:
+                # Clean up temp key file
                 if key_path and os.path.exists(key_path):
                     try:
                         os.unlink(key_path)
+                    except OSError:
+                        pass
+                # Clean up askpass script
+                if askpass_path and os.path.exists(askpass_path):
+                    try:
+                        os.unlink(askpass_path)
                     except OSError:
                         pass
         return _guard(run)
@@ -758,11 +783,14 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
     """Load an SSH private key from the vault into ssh-agent (v0.2.8).
 
     Security guarantees:
-    - Passphrase delivered via stdin pipe ONLY (subprocess input=...);
-      NEVER written to a temp file.
-    - Key material: temp file unavoidable (ssh-add reads key from file,
-      stdin reserved for passphrase). Created with tempfile.mkstemp()
-      (atomic), chmod 0600, deleted in `finally`.
+    - Passphrase delivered via the SSH_ASKPASS mechanism: a dynamically
+      generated shell script containing ONLY `echo "$VW_SSH_PASS"` runs
+      as the askpass helper; the passphrase itself is passed to the
+      subprocess via environment variable only — NEVER written to any
+      file and NEVER entering the agent's context window.
+    - Key material: temp file unavoidable (ssh-add reads key from file).
+      Created with tempfile.mkstemp() (atomic), chmod 0600, deleted in
+      `finally` along with the askpass script.
     - Both passphrase and key content registered with RedactingFilter.
     """
 
@@ -787,6 +815,7 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
         sock, agent_started = _resolve_socket_path(ssh_auth_sock_param)
 
         key_path = None
+        askpass_path = None
         try:
             fd, key_path = tempfile.mkstemp(suffix=".sshkey", prefix="vw_")
             os.close(fd)
@@ -804,11 +833,29 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
             except OSError:
                 pass
 
-            env = {"SSH_AUTH_SOCK": sock,
-                   "HOME": os.environ.get("HOME", "/")}
+            # Create askpass script: contains ONLY the echo command,
+            # no secret content. Passphrase delivered via env var.
+            fd_ap, askpass_path = tempfile.mkstemp(
+                suffix=".sh", prefix="vw_askpass_")
+            with os.fdopen(fd_ap, "w") as f:
+                f.write('#!/bin/sh\necho "$VW_SSH_PASS"\n')
+            os.chmod(askpass_path, 0o700)
+
+            # Passphrase delivery via SSH_ASKPASS mechanism.
+            # The askpass script contains ONLY `echo "$VW_SSH_PASS"` —
+            # no secret content in the file. The passphrase is passed
+            # via environment variable to the subprocess only.
+            env = {
+                "SSH_AUTH_SOCK": sock,
+                "HOME": os.environ.get("HOME", "/"),
+                "SSH_ASKPASS_REQUIRE": "force",
+                "SSH_ASKPASS": askpass_path,
+                "VW_SSH_PASS": passphrase,
+            }
             proc = subprocess.run(
                 ["ssh-add", key_path],
-                env=env, input=passphrase,
+                env=env,
+                stdin=subprocess.DEVNULL,
                 capture_output=True, text=True, timeout=30,
             )
             if proc.returncode != 0:
@@ -835,9 +882,16 @@ def h_use_ssh(args: dict, **kw: Any) -> str:
                     "subsequent SSH commands."),
             }
         finally:
+            # Clean up temp key file
             if key_path and os.path.exists(key_path):
                 try:
                     os.unlink(key_path)
+                except OSError:
+                    pass
+            # Clean up askpass script
+            if askpass_path and os.path.exists(askpass_path):
+                try:
+                    os.unlink(askpass_path)
                 except OSError:
                     pass
     return _guard(run)
