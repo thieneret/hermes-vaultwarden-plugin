@@ -5,6 +5,22 @@ Author: **thieneret**
 
 ---
 
+## [0.3.4] — SSH Askpass Passphrase Delivery
+
+### Fixed
+- `vaultwarden_use_ssh` no longer times out. Root cause: `ssh-add` does
+  not reliably read passphrase from stdin when loading a key from a file
+  in a non-interactive container (no tty).
+- Switched to SSH_ASKPASS mechanism: a dynamically generated shell script
+  (`echo "$VW_SSH_PASS"`) delivers the passphrase via environment variable.
+  The passphrase is never written to any file and never enters the agent's
+  context window.
+
+### Security
+- Askpass script contains ONLY the echo command — no secret content
+- Passphrase exists only in subprocess environment during execution
+- Removed temporary debug logging added in v0.3.3 diagnostics
+
 ## [0.3.3] — SSH Passphrase Retrieval Fix
 
 ### Fixed

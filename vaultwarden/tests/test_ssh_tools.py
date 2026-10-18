@@ -142,13 +142,23 @@ def test_store_ssh_rejects_duplicate_name():
 
 # ── Passphrase never in temp file ────────────────────────────────────────
 
-def test_use_ssh_passphrase_via_stdin_only():
-    """Verify passphrase is passed via subprocess input, not a file."""
+def test_use_ssh_passphrase_via_askpass_env_only():
+    """v0.3.4: passphrase delivered via SSH_ASKPASS env var, never a file.
+
+    The askpass script contains ONLY `echo "$VW_SSH_PASS"` — no secret
+    content. The broken stdin-pipe approach (`input=passphrase`) must be
+    gone; ssh-add runs with stdin=DEVNULL instead.
+    """
     import inspect
 
     from vaultwarden import tools
     source = inspect.getsource(tools.h_use_ssh)
-    assert "input=passphrase" in source
+    assert "input=passphrase" not in source
+    assert "SSH_ASKPASS_REQUIRE" in source
+    assert 'SSH_ASKPASS' in source
+    assert "VW_SSH_PASS" in source
+    assert "stdin=subprocess.DEVNULL" in source
+    assert "askpass_path" in source
     assert "passphrase_file" not in source
     assert "pass_file" not in source
 
