@@ -183,7 +183,6 @@ def test_plugin_yaml_includes_ssh_tools():
 def test_get_ssh_key_uses_get_password():
     """v0.3.3: get_ssh_key must call bw get_password, not read from get_item."""
     import time as _time
-
     from unittest.mock import MagicMock
 
     from vaultwarden.auth import AuthManager, AuthState
