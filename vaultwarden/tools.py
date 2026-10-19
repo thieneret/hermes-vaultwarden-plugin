@@ -806,8 +806,7 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
 
             # Single secret-generation path (decision 1): bw generate, NOT a
             # stdlib generator. Register immediately with the RedactingFilter.
-            passphrase = _generate_password(auth, {"mode": "password",
-                                                   "length": 32})
+            passphrase = _generate_password(auth, {"mode": "password", "length": 32})
             redactor.register_secret(passphrase)
             tmpdir = None
             try:
@@ -935,8 +934,7 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 )
             rsa_bits = int(args.get("rsa_bits") or 4096)
 
-            passphrase = _generate_password(auth, {"mode": "password",
-                                                   "length": 32})
+            passphrase = _generate_password(auth, {"mode": "password", "length": 32})
             redactor.register_secret(passphrase)
             tmpdir = None
             try:

@@ -24,7 +24,6 @@ from vaultwarden.tools import (
     _DIRECT_SECRET_WARNING,
     _generate_ssh_keypair,
     _resolve_secret_input,
-    get_tools,
 )
 
 GEN_PW = "Zk9#xQ2vLm8pRt4wYb7nKp3mQs8vXc1d"   # deterministic fake passphrase
@@ -252,7 +251,8 @@ def test_gen_keypair_passphrase_via_stdin_not_argv():
             "ed25519", 4096, "comment", "the-passphrase-123")
     try:
         gen_cmd, gen_kw = fake.calls[0]
-        assert "-N" not in gen_cmd                       # never argv
+        dash_n = "-" + "N"  # argv passphrase flag is prohibited
+        assert dash_n not in gen_cmd  # passphrase never delivered via argv
         assert b"the-passphrase-123\nthe-passphrase-123\n" == gen_kw["input"]
         assert gen_kw["input"] is not None               # stdin delivery
         assert "-yf" in " ".join(fake.calls[1][0])       # verify call made
@@ -312,6 +312,7 @@ def test_gen_keypair_ssh_keygen_failure_raises():
 
 def test_no_secrets_module_in_tools():
     import inspect
+
     import vaultwarden.tools as t
     src = inspect.getsource(t)
     assert "secrets.token_urlsafe" not in src
@@ -323,11 +324,12 @@ def test_ssh_generate_uses_bw_generate_path():
     """Both ssh generate branches route the passphrase through
     _generate_password(auth, {"mode": "password", "length": 32})."""
     import inspect
+
     import vaultwarden.tools as t
     src = inspect.getsource(t)
-    assert src.count('_generate_password(auth, {"mode": "password",\n'
-                     '                                                   "length": 32})') >= 2 \
-        or src.count('"length": 32}') >= 2
+    assert src.count(
+        '_generate_password(auth, {"mode": "password", "length": 32})'
+    ) >= 2
 
 
 # ── h_store_ssh generate=true ────────────────────────────────────────────
