@@ -5,6 +5,26 @@ Author: **thieneret**
 
 ---
 
+## [0.3.9] - 2026-10-19
+
+### Bugfix (VWP-12 regression — `bw generate` syntax)
+
+- **`generate=true` fix:** `_generate_password()` in `tools.py` built an
+  invalid `bw generate` argument list: a positional length (`bw generate 20
+  …`) in the password branch and the non-existent `-w` short alias in the
+  passphrase branch. The real `bw` CLI rejects positional args
+  ("too many arguments for 'generate'") and has no `-w` flag, so every
+  `vaultwarden_store` / `vaultwarden_update` call with `generate=true`
+  failed with `bw generate failed (exit 1)`. Corrected to
+  `--length <n>` and `--words <n>`.
+- **Test hardening:** added structural assertions on the `bw_args` list
+  produced by `_generate_password()` (via a recording mock auth), so the
+  fake-bw test blind spot that masked this regression is closed. The
+  assertions enforce: no positional numeric arg, `--length`/`--words` as
+  flags, no `-w` alias.
+
+No schema, config, or tool-count change. 12 tools.
+
 ## [0.3.8] - 2026-10-19
 
 ### Security & Reliability (audit finding VWP-11)
