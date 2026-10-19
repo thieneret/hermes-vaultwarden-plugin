@@ -56,6 +56,10 @@ _DEFAULTS: dict[str, Any] = {
     "placeholder_ttl_seconds": 300,
     "max_placeholders": 50,
     "bw_cli_path": "",
+    # VWP-10 (v0.3.8): retry / backoff for idempotent bw calls.
+    "bw_max_retries": 3,
+    "bw_backoff_base": 1.0,
+    "bw_max_delay": 10.0,
     "terminal_tool_names": [],
     "terminal_command_keys": [],
 }
@@ -219,6 +223,27 @@ class PluginConfig:
 
     # v0.2.2 (BUGFIX): configurable terminal tool names / command keys.
     # Empty list => hooks.py falls back to its built-in defaults.
+    # VWP-10 (v0.3.8): retry / backoff accessors. NOTE: the minimum bw
+    # version is NOT configurable (VWP-11 design decision — fail-closed,
+    # no override; see bw_cli._MIN_BW_VERSION).
+    @property
+    def bw_max_retries(self) -> int:
+        return _as_int(self._raw("bw_max_retries"), 3)
+
+    @property
+    def bw_backoff_base(self) -> float:
+        try:
+            return float(self._raw("bw_backoff_base"))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
+    def bw_max_delay(self) -> float:
+        try:
+            return float(self._raw("bw_max_delay"))
+        except (TypeError, ValueError):
+            return 10.0
+
     @property
     def terminal_tool_names(self) -> list[str]:
         raw = self._raw("terminal_tool_names")

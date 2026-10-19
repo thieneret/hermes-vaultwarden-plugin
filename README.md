@@ -29,7 +29,7 @@ Secure secrets management for Hermes Agent via Vaultwarden. Provides safe access
 | Dependency | Purpose |
 |------------|---------|
 | Hermes Agent | Host platform (plugin API) |
-| Bitwarden CLI (`bw`) | Vault operations (login, sync, CRUD) |
+| Bitwarden CLI (`bw`) | Vault operations (login, sync, CRUD). **Minimum version: 2026.9.1** (enforced at startup; plugin refuses to load below this) |
 | Vaultwarden server | Backend (any Bitwarden-compatible instance) |
 | OpenSSH ≥ 7.2 | SSH features (`ssh-add`, `ssh-agent`) — stdin passphrase fallback |
 
@@ -101,6 +101,9 @@ plugins:
         placeholder_ttl_seconds: 300
         max_placeholders: 50
         bw_cli_path: "/path/to/bw"
+        bw_max_retries: 3
+        bw_backoff_base: 1.0
+        bw_max_delay: 10.0
 ```
 
 ### `.env` (secrets)
@@ -120,6 +123,9 @@ VW_MASTER_PASSWORD="your-master-password"
 | `session_timeout_seconds` | Vault session lifetime. Default: `14400` (4h) |
 | `placeholder_ttl_seconds` | Placeholder token lifetime. Default: `300` (5min) |
 | `auto_sync` | Sync vault before read operations |
+| `bw_max_retries` | Max retry attempts for idempotent `bw` calls on network errors. Default: `3` |
+| `bw_backoff_base` | Base delay (seconds) for exponential backoff. Default: `1.0` |
+| `bw_max_delay` | Maximum delay cap (seconds). Default: `10.0` |
 
 ## Tools
 
@@ -202,6 +208,8 @@ If no agent is running on the resolved socket, one is started with `ssh-agent -a
 | SSH passphrase via stdin | Delivered through `subprocess.run(input=...)`, never a temp file |
 | SSH key temp file | `tempfile.mkstemp()` (atomic), `0600` perms, deleted in `finally` |
 | Fail-closed auth | Authentication failures never fall back silently |
+| bw version enforcement | `bw --version` checked at startup against a hardcoded minimum (2026.9.1); plugin refuses to load if below or unparseable — no override |
+| Structured error classification | Errors classified by source stability (Node.js codes → rate limit → bw state → server API); retry only on idempotent network errors with exponential backoff + jitter |
 
 ## Development
 
@@ -227,7 +235,7 @@ vaultwarden/
 pytest vaultwarden/tests/ -q
 ```
 
-Current suite: **178 tests**.
+Current suite: **244 tests**.
 
 ## License
 

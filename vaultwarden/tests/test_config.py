@@ -274,3 +274,46 @@ def test_plugin_yaml_documents_full_binary_path():
         __file__).resolve().parents[1] / "plugin.yaml"), encoding="utf-8").read()
     assert "FULL path" in text
     assert "directory path alone is NOT sufficient" in text
+
+
+# ---------------------------------------------------------------------------
+# VWP-10 (v0.3.8): retry / backoff config options. Exactly three new keys —
+# the minimum bw version stays NON-configurable (VWP-11 design decision).
+# ---------------------------------------------------------------------------
+
+class TestRetryBackoffConfig:
+    def test_defaults(self, plugin_config):
+        assert plugin_config.bw_max_retries == 3
+        assert plugin_config.bw_backoff_base == 1.0
+        assert plugin_config.bw_max_delay == 10.0
+
+    def test_overrides_parsed(self):
+        from vaultwarden.tests.conftest import make_config
+        cfg = make_config(section={
+            "bw_max_retries": 5,
+            "bw_backoff_base": 0.5,
+            "bw_max_delay": 30,
+        })
+        assert cfg.bw_max_retries == 5
+        assert cfg.bw_backoff_base == 0.5
+        assert cfg.bw_max_delay == 30.0
+
+    def test_bad_values_fall_back_to_defaults(self):
+        from vaultwarden.tests.conftest import make_config
+        cfg = make_config(section={
+            "bw_max_retries": "not-an-int",
+            "bw_backoff_base": "nan-ish",
+            "bw_max_delay": None,
+        })
+        assert cfg.bw_max_retries == 3
+        assert cfg.bw_backoff_base == 1.0
+        assert cfg.bw_max_delay == 10.0
+
+    def test_no_version_options_regression_guard(self):
+        # Step-1 invariant: bw version enforcement is fail-closed with NO
+        # override and must NEVER become a configuration option.
+        from vaultwarden.config import _DEFAULTS, PluginConfig
+        assert "min_bw_version" not in _DEFAULTS
+        assert "allow_untested_bw_version" not in _DEFAULTS
+        assert not hasattr(PluginConfig, "min_bw_version")
+        assert not hasattr(PluginConfig, "allow_untested_bw_version")

@@ -24,6 +24,23 @@ appdata = os.environ.get("BITWARDENCLI_APPDATA_DIR", "")
 def out(s=""):
     print(s)
 
+# VWP-11 (v0.3.8): BwCli.__init__ runs `bw --version` as its FIRST subprocess
+# call; the fake mirrors the real calendar-version output so every existing
+# test that constructs a BwCli passes the startup version check. Tests can
+# override via BW_FAKE_VERSION (empty string => empty stdout). base_env() is
+# a strict allowlist, so the version value is smuggled in through PATH: the
+# dir named "<version>=VWFAKEVERSION" encodes the desired output.
+if argv[:1] == ["--version"]:
+    ver = os.environ.get("BW_FAKE_VERSION", "")
+    if not ver:
+        for p in os.environ.get("PATH", "").split(os.pathsep):
+            base = os.path.basename(p.rstrip("/"))
+            if "=VWFAKEVERSION" in base:
+                ver = base.split("=VWFAKEVERSION")[0]
+                break
+    out(ver or "2026.9.1")
+    sys.exit(0)
+
 ITEMS = {
   "aaaa1111-0000-0000-0000-000000000001": {
       "id": "aaaa1111-0000-0000-0000-000000000001", "name": "Postgres prod", "type": 1,
