@@ -53,25 +53,25 @@ def _ssh_base_env(extra: dict | None = None) -> dict:
 
 
 def _generate_password(auth: AuthManager, options: dict) -> str:
-    """Generate a password or passphrase via bw generate.
+    """Generate a password/passphrase via `bw generate`.
 
     Returns the raw generated string. Caller is responsible for
     registering it with RedactingFilter and never returning it
     to the LLM.
 
-    Real bw generate syntax (BUG-1 fix, retained from v0.1.2):
-      password:   bw generate <length> --uppercase --lowercase
-                  --number --special   (note the singular "--number")
-      passphrase: bw generate --passphrase -w N --separator S
+    bw generate takes NO positional arguments: --length and --words are
+    flags, and there is no -w short alias (verified against the real CLI:
+    `bw generate 20 …` fails with "too many arguments"). Build the arg
+    list accordingly.
     """
     mode = options.get("mode") or "password"
     if mode == "passphrase":
         words = int(options.get("words") or 4)
         sep = str(options.get("separator") or "-")
-        bw_args = ["--passphrase", "-w", str(words), "--separator", sep]
+        bw_args = ["--passphrase", "--words", str(words), "--separator", sep]
     else:
         length = int(options.get("length") or 20)
-        bw_args = [str(length)]
+        bw_args = ["--length", str(length)]
         if options.get("uppercase", True):
             bw_args.append("--uppercase")
         if options.get("lowercase", True):

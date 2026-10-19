@@ -235,7 +235,7 @@ vaultwarden/
 pytest vaultwarden/tests/ -q
 ```
 
-Current suite: **244 tests**.
+Current suite: **247 tests**.
 
 ## License
 

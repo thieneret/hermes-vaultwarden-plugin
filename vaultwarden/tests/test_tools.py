@@ -300,8 +300,9 @@ def test_all_handlers_return_str():
 # ---------------------------------------------------------------------------
 
 def test_store_generate_uses_flag_syntax(monkeypatch):
-    """v0.3.7 (VWP-12): bw generate <len> --uppercase --lowercase --number
-    --special (no 1/0) — via vaultwarden_store(generate=true)."""
+    """v0.3.9 (VWP-12 hotfix): bw generate --length N --uppercase --lowercase
+    --number --special (no positional length, no -w alias) — via
+    vaultwarden_store(generate=true)."""
     import json as _json
 
     from vaultwarden.auth import AuthManager
@@ -337,17 +338,81 @@ def test_store_generate_uses_flag_syntax(monkeypatch):
         "generate_options": {"mode": "password", "length": 20}})
     assert res["password_generated"] is True
     assert "genpw" not in _json.dumps(res)           # raw value never returned
-    assert captured[-1] == ["20", "--uppercase", "--lowercase", "--number", "--special"]
+    assert captured[-1] == ["--length", "20", "--uppercase", "--lowercase",
+                            "--number", "--special"]
+    # bw generate accepts NO positional args: the length must follow the
+    # --length flag, never appear as a leading bare numeric token
+    assert captured[-1][0] == "--length"
 
     tools["vaultwarden_store"]({
         "type": "login", "name": "x", "generate": True,
         "generate_options": {"length": 16, "uppercase": False, "special": False}})
-    assert captured[-1] == ["16", "--lowercase", "--number"]  # only True flags kept
+    assert captured[-1] == ["--length", "16", "--lowercase", "--number"]  # only True flags kept
+    assert captured[-1][0] == "--length"
 
     tools["vaultwarden_update"]({
         "item_id": "abc", "generate": True,
         "generate_options": {"mode": "passphrase", "words": 4, "separator": "-"}})
-    assert captured[-1] == ["--passphrase", "-w", "4", "--separator", "-"]
+    assert captured[-1] == ["--passphrase", "--words", "4", "--separator", "-"]
+    assert "-w" not in captured[-1]                  # no short alias in bw
+
+
+# ---------------------------------------------------------------------------
+# VWP-12 hotfix (v0.3.9): structural assertions on the bw_args list produced
+# by _generate_password() directly, via a recording mock auth. This closes
+# the fake-bw blind spot: it does not depend on any fake bw behavior.
+# ---------------------------------------------------------------------------
+
+from vaultwarden.tools import _generate_password  # noqa: E402
+
+
+class _RecordingAuth:
+    """Captures the bw_args passed to generate_password, returns a dummy."""
+    def __init__(self):
+        self.captured = None
+    def generate_password(self, bw_args):
+        self.captured = list(bw_args)
+        return "DUMMY-PW"
+
+
+def test_generate_password_length_is_flag_not_positional():
+    auth = _RecordingAuth()
+    _generate_password(auth, {"mode": "password", "length": 20})
+    args = auth.captured
+    # bw generate accepts NO positional args — first element must be a flag
+    assert args[0] == "--length", f"expected --length flag, got {args[0]!r}"
+    assert args[1] == "20"
+    # No bare numeric token in argument position (i.e. directly after a
+    # value-taking flag or at the head of the list). The only numeric token
+    # allowed is the value consumed by --length itself.
+    numeric_positions = [i for i, a in enumerate(args) if a.isdigit()]
+    assert numeric_positions == [1], \
+        f"positional numeric arg present: {args}"
+    # Character-class flags preserved (long forms)
+    assert "--uppercase" in args and "--number" in args and "--special" in args
+
+
+def test_generate_password_words_is_long_flag_no_short_alias():
+    auth = _RecordingAuth()
+    _generate_password(auth, {"mode": "passphrase", "words": 4, "separator": "-"})
+    args = auth.captured
+    assert "--passphrase" in args
+    assert "--words" in args, "must use --words, not -w"
+    assert "-w" not in args, "-w short alias does not exist in bw"
+    idx = args.index("--words")
+    assert args[idx + 1] == "4"
+    assert "--separator" in args
+    sidx = args.index("--separator")
+    assert args[sidx + 1] == "-"
+
+
+def test_generate_password_default_mode_is_password():
+    auth = _RecordingAuth()
+    _generate_password(auth, {})  # no mode → password branch
+    args = auth.captured
+    assert args[0] == "--length"
+    assert args[1] == "20"  # default length
+    assert "--passphrase" not in args
 
 
 def test_generate_requires_write_permission(tools_by_name):

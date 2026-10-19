@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-vaultwarden-plugin"
-version = "0.3.8"
+version = "0.3.9"
 description = "Vaultwarden secrets management and SSH key integration for Hermes Agent."
 readme = "README.md"
 requires-python = ">=3.10"
