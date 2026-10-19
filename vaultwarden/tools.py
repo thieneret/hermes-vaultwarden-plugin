@@ -16,6 +16,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -81,6 +82,154 @@ def _generate_password(auth: AuthManager, options: dict) -> str:
         if options.get("special", True):
             bw_args.append("--special")
     return auth.generate_password(bw_args)
+
+
+# ----------------------------------------------------- secret input channels
+#: v0.4.0 (Feature 1): advisory returned in the tool response when a raw
+#: secret was passed directly in the tool call. NEVER interpolates the
+#: secret value itself — only parameter names.
+_DIRECT_SECRET_WARNING = (
+    "Direct secret input detected for {key!r} in {tool}. The value enters the "
+    "LLM context and chat history, which is not secure. Prefer {env_key!r} "
+    "(an environment variable) or {file_key!r} (an owner-only file, chmod 600) "
+    "instead."
+)
+
+
+def _resolve_secret_input(
+    args: dict, *, direct_key: str, env_key: str, file_key: str,
+    tool_name: str,
+) -> tuple[str | None, str | None]:
+    """Resolve a secret from exactly one of: direct value, env var, or file.
+
+    v0.4.0 (Feature 1): returns (value, warning). `warning` is a non-secret
+    advisory string when a raw secret was passed directly (also emitted to
+    the log), else None. Raises ConfigError on conflict (multiple sources)
+    or an unusable env/file source. Raises NotFoundError when a *_file path
+    does not exist. The file channel is strict: regular file, owner-readable
+    (mode & 0o400), no group/other access (mode & 0o077 == 0) — otherwise
+    the file is NOT read and ConfigError is raised.
+    """
+    provided = [k for k in (direct_key, env_key, file_key) if args.get(k)]
+    if len(provided) > 1:
+        raise errors.ConfigError(
+            f"{tool_name}: provide only ONE of {direct_key!r}, {env_key!r}, "
+            f"{file_key!r}; got {provided}",
+            suggestion="Choose a single secret source.",
+        )
+    if args.get(direct_key):
+        warning = _DIRECT_SECRET_WARNING.format(
+            key=direct_key, tool=tool_name, env_key=env_key, file_key=file_key,
+        )
+        log.warning(
+            "%s: raw secret passed directly via %r; prefer %r or %r",
+            tool_name, direct_key, env_key, file_key,
+        )
+        return str(args[direct_key]), warning
+    if args.get(env_key):
+        val = os.environ.get(str(args[env_key]), "")
+        if not val:
+            raise errors.ConfigError(
+                f"{tool_name}: environment variable {args[env_key]!r} "
+                f"(from {env_key!r}) is not set or empty",
+                suggestion="Set the variable in ~/.hermes/.env (chmod 600).",
+            )
+        return val, None
+    if args.get(file_key):
+        path = str(args[file_key])
+        if not os.path.isfile(path):
+            raise errors.NotFoundError(
+                f"{tool_name}: {file_key} not found: {path}",
+                suggestion="Provide an absolute path to an existing file.",
+            )
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            raise errors.ConfigError(
+                f"{tool_name}: cannot stat {file_key} path: {type(exc).__name__}"
+            ) from exc
+        mode = st.st_mode & 0o777
+        if mode & 0o077:
+            raise errors.ConfigError(
+                f"{tool_name}: {file_key} must be readable only by the owner "
+                f"(chmod 600); current mode is {oct(mode)}",
+                suggestion="Run: chmod 600 <file>",
+            )
+        if not (mode & 0o400):
+            raise errors.ConfigError(
+                f"{tool_name}: {file_key} is not readable by the owner "
+                f"(mode {oct(mode)})",
+                suggestion="Run: chmod 600 <file>",
+            )
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+        except OSError as exc:
+            raise errors.ConfigError(
+                f"{tool_name}: cannot read {file_key}: {type(exc).__name__}"
+            ) from exc
+        if not val:
+            raise errors.ConfigError(f"{tool_name}: {file_key} is empty")
+        return val, None
+    return None, None
+
+
+def _generate_ssh_keypair(
+    key_type: str, rsa_bits: int, comment: str, passphrase: str,
+) -> tuple[str, str, str, str]:
+    """Generate an SSH keypair in a temp dir; passphrase via STDIN (never argv).
+
+    v0.4.0 (Feature 2): returns (tmpdir, private_key_path, public_key_str,
+    fingerprint). Caller owns tmpdir cleanup (shutil.rmtree in finally) and
+    is responsible for registering `passphrase` with RedactingFilter before
+    calling and forgetting it after. The passphrase is a PARAMETER — this
+    helper never generates secrets (single generation path: the caller uses
+    _generate_password / `bw generate`).
+
+    Safety: after generation, verify the private key is actually encrypted by
+    attempting `ssh-keygen -yf` with stdin=DEVNULL; success means UNENCRYPTED
+    (passphrase delivery failed) -> abort.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="vw_sshgen_")
+    os.chmod(tmpdir, 0o700)
+    key_path = os.path.join(tmpdir, "key")
+    cmd = ["ssh-keygen", "-t", key_type, "-f", key_path, "-C", comment]
+    if key_type == "rsa":
+        cmd += ["-b", str(rsa_bits)]
+    stdin_data = f"{passphrase}\n{passphrase}\n".encode("utf-8")
+    proc = subprocess.run(
+        cmd, env=_ssh_base_env(), input=stdin_data,
+        capture_output=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        raise errors.VaultwardenError(
+            f"ssh-keygen failed (exit {proc.returncode})",
+            suggestion="Check ssh-keygen availability and key_type.",
+        )
+    # SAFETY VERIFY: an unencrypted key means stdin passphrase delivery failed.
+    verify = subprocess.run(
+        ["ssh-keygen", "-yf", key_path], env=_ssh_base_env(),
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+    )
+    if verify.returncode == 0:
+        raise errors.VaultwardenError(
+            "ssh-keygen produced an UNENCRYPTED private key (passphrase "
+            "delivery failed); aborting to avoid storing an unprotected key.",
+            suggestion="Report this; verify ssh-keygen stdin passphrase handling.",
+        )
+    pub_path = key_path + ".pub"
+    with open(pub_path, "r", encoding="utf-8") as f:
+        public_key = f.read().strip()
+    fp_proc = subprocess.run(
+        ["ssh-keygen", "-lf", pub_path], env=_ssh_base_env(),
+        capture_output=True, text=True, timeout=10,
+    )
+    fingerprint = "unknown"
+    if fp_proc.returncode == 0 and fp_proc.stdout:
+        parts = fp_proc.stdout.strip().split()
+        if len(parts) >= 2:
+            fingerprint = parts[1]
+    return tmpdir, key_path, public_key, fingerprint
 
 
 def _item_type_name(item: dict) -> str:
@@ -310,17 +459,45 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             generated_pw = None
             generate = bool(args.get("generate", False))
 
+            # v0.4.0 (Feature 1): resolve the password via the secret-input
+            # channels (raw / *_env / *_file). In generate mode no password
+            # input is allowed — generation takes precedence (v0.3.9 path).
+            if generate:
+                for k in ("password", "password_env", "password_file"):
+                    if args.get(k):
+                        raise errors.ConfigError(
+                            "vaultwarden_store: generate=true conflicts with "
+                            f"{k!r}; the generated password replaces it.",
+                            suggestion="Drop generate=true or remove the "
+                                       "password input channel.",
+                        )
+            else:
+                resolved_password, pw_warning = _resolve_secret_input(
+                    args, direct_key="password", env_key="password_env",
+                    file_key="password_file", tool_name="vaultwarden_store")
+
             if generate:
                 gen_opts = args.get("generate_options") or {}
                 generated_pw = _generate_password(auth, gen_opts)
                 redactor.register_secret(generated_pw)
+                pw_warning = None
 
             tracked = _collect_secret_strings(args)
+            if not generate and resolved_password:
+                tracked.append(resolved_password)
+                redactor.register_secret(resolved_password)
             for t in tracked:
                 redactor.register_secret(t)
 
             try:
                 item = _build_item(args)
+
+                # v0.4.0: fold the env/file-resolved password into the item
+                # (the raw channel is already inside args -> _build_item).
+                if not generate and resolved_password:
+                    login = item.get("login") or {}
+                    login["password"] = resolved_password
+                    item["login"] = login
 
                 # VWP-12: If generate=true, override the password field.
                 # The generated value goes straight into the vault item and
@@ -344,6 +521,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                     result["password_placeholder"] = entry.token
                     result["placeholder_ttl_seconds"] = registry.ttl_seconds
 
+                if pw_warning:
+                    result["warning"] = pw_warning
+
                 return result
             finally:
                 for t in tracked:
@@ -363,12 +543,33 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             generated_pw = None
             generate = bool(args.get("generate", False))
 
+            # v0.4.0 (Feature 1): resolve the password via the secret-input
+            # channels (raw / *_env / *_file). In generate mode no password
+            # input is allowed — generation takes precedence (v0.3.9 path).
+            if generate:
+                for k in ("password", "password_env", "password_file"):
+                    if args.get(k):
+                        raise errors.ConfigError(
+                            "vaultwarden_update: generate=true conflicts with "
+                            f"{k!r}; the generated password replaces it.",
+                            suggestion="Drop generate=true or remove the "
+                                       "password input channel.",
+                        )
+            else:
+                resolved_password, pw_warning = _resolve_secret_input(
+                    args, direct_key="password", env_key="password_env",
+                    file_key="password_file", tool_name="vaultwarden_update")
+
             if generate:
                 gen_opts = args.get("generate_options") or {}
                 generated_pw = _generate_password(auth, gen_opts)
                 redactor.register_secret(generated_pw)
+                pw_warning = None
 
             tracked = _collect_secret_strings(args)
+            if not generate and resolved_password:
+                tracked.append(resolved_password)
+                redactor.register_secret(resolved_password)
             for t in tracked:
                 redactor.register_secret(t)
 
@@ -376,6 +577,13 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 item_id = str(args["item_id"])
                 current = auth.get_item(item_id)
                 merged = _apply_updates(current, args)
+
+                # v0.4.0: fold the env/file-resolved password into the item
+                # (the raw channel is already inside args -> _apply_updates).
+                if not generate and resolved_password:
+                    login = merged.get("login") or {}
+                    login["password"] = resolved_password
+                    merged["login"] = login
 
                 # VWP-12: If generate=true, override the password field.
                 # The generated value goes straight into the vault item and
@@ -396,6 +604,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                     result["password_generated"] = True
                     result["password_placeholder"] = entry.token
                     result["placeholder_ttl_seconds"] = registry.ttl_seconds
+
+                if pw_warning:
+                    result["warning"] = pw_warning
 
                 return result
             finally:
@@ -555,18 +766,93 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
     v0.3.5: single module-level source of truth — get_tools() registers a
     thin wrapper that binds auth/config. username=SSH user, password=
     passphrase, key=file attachment; name uniqueness enforced by auth.
+
+    v0.4.0: two modes —
+     - generate=true: the plugin generates a 32-char passphrase via the SAME
+       _generate_password (`bw generate`) path used by store/update, then an
+       SSH keypair via ssh-keygen (passphrase delivered on STDIN, never
+       argv), stores private key as attachment + passphrase as the item
+       password, and returns ONLY the public key + fingerprint (non-secret).
+       pass/pass_env/pass_file/file are FORBIDDEN in this mode.
+     - upload (default): passphrase resolved via _resolve_secret_input
+       (pass / pass_env / pass_file); raw pass emits a dual-channel warning
+       (log + response "warning" field).
     """
 
     def run():
         _require_write(config)
         name = str(args["name"])
+        generate = bool(args.get("generate", False))
+        redactor = get_redacting_filter()
+
+        if generate:
+            # Generate mode: the plugin supplies pass + file itself.
+            for k in ("pass", "pass_env", "pass_file", "file"):
+                if args.get(k):
+                    raise errors.ConfigError(
+                        f"vaultwarden_store_ssh: generate=true conflicts with "
+                        f"{k!r}; the plugin generates the key and passphrase.",
+                        suggestion="Remove the supplied parameter or drop "
+                                   "generate=true.",
+                    )
+            key_type = str(args.get("key_type") or "ed25519")
+            if key_type not in ("ed25519", "rsa"):
+                raise errors.ConfigError(
+                    f"vaultwarden_store_ssh: unsupported key_type {key_type!r}",
+                    suggestion="Use 'ed25519' or 'rsa'.",
+                )
+            rsa_bits = int(args.get("rsa_bits") or 4096)
+            user = str(args.get("user") or "")
+
+            # Single secret-generation path (decision 1): bw generate, NOT a
+            # stdlib generator. Register immediately with the RedactingFilter.
+            passphrase = _generate_password(auth, {"mode": "password", "length": 32})
+            redactor.register_secret(passphrase)
+            tmpdir = None
+            try:
+                tmpdir, key_path, public_key, fingerprint = \
+                    _generate_ssh_keypair(key_type, rsa_bits,
+                                          comment=name, passphrase=passphrase)
+                try:
+                    with open(key_path, "r", encoding="utf-8",
+                              errors="replace") as f:
+                        redactor.register_secret(f.read())
+                except OSError:
+                    pass
+                result = auth.create_ssh_item(name, user, passphrase, key_path)
+                log.info("Generated %s SSH key item '%s' (%s).",
+                         key_type, name, result.get("id"))
+                return {
+                    "created": True,
+                    "id": result.get("id", ""),
+                    "name": name,
+                    "ssh_user": user,
+                    "key_type": key_type,
+                    "public_key": public_key,
+                    "fingerprint": fingerprint,
+                    "passphrase_generated": True,
+                }
+            finally:
+                if tmpdir is not None:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                redactor.forget_secret(passphrase)
+
+        # Upload mode: resolve the passphrase from exactly one channel.
+        passphrase, pw_warning = _resolve_secret_input(
+            args, direct_key="pass", env_key="pass_env",
+            file_key="pass_file", tool_name="vaultwarden_store_ssh")
+        if passphrase is None:
+            raise errors.ConfigError(
+                "vaultwarden_store_ssh: requires pass, pass_env, pass_file, "
+                "or generate=true.",
+                suggestion="Provide the passphrase via one channel, or set "
+                           "generate=true to create a new keypair.",
+            )
         user = str(args["user"])
-        passphrase = str(args["pass"])
         file_path = str(args["file"])
 
         _validate_ssh_key_file(file_path)
 
-        redactor = get_redacting_filter()
         redactor.register_secret(passphrase)
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
@@ -576,23 +862,39 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
 
         result = auth.create_ssh_item(name, user, passphrase, file_path)
         log.info("Stored SSH key item '%s' (%s).", name, result.get("id"))
-        return {
+        response = {
             "created": True,
             "id": result.get("id", ""),
             "name": name,
             "ssh_user": user,
             "attachment": os.path.basename(file_path),
         }
+        if pw_warning:
+            response["warning"] = pw_warning
+        return response
     return _guard(run)
 
 
 def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                  **kw: Any) -> str:
-    """Update an existing SSH key item — user/pass/notes/key attachment."""
+    """Update an existing SSH key item — user/pass/notes/key attachment.
+
+    v0.4.0: supports generate=true — a destructive KEY ROTATION (replaces
+    the existing keypair + passphrase) that REQUIRES confirm=true, mirroring
+    vaultwarden_delete_ssh. The new passphrase comes from the same
+    _generate_password (`bw generate`) path; the keypair from
+    _generate_ssh_keypair (stdin passphrase delivery). Only the public key +
+    fingerprint are returned. In generate mode pass/pass_env/pass_file/file
+    are forbidden. Without generate, the passphrase is resolved via
+    _resolve_secret_input (pass / pass_env / pass_file) with a dual-channel
+    warning on raw input.
+    """
 
     def run():
         _require_write(config)
         name = str(args["name"])
+        generate = bool(args.get("generate", False))
+        redactor = get_redacting_filter()
 
         matches = auth.search_items(name)
         exact = [m for m in matches if m.get("name") == name]
@@ -608,12 +910,85 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
         item = exact[0]
         item_id = item.get("id", "")
 
+        if generate:
+            # Key rotation is destructive — explicit confirmation required.
+            if not args.get("confirm"):
+                raise errors.PermissionError_(
+                    "vaultwarden_update_ssh: generate=true rotates (replaces) "
+                    "the existing keypair and passphrase; explicit "
+                    "confirmation required.",
+                    suggestion="Re-issue with confirm=true to rotate the key.")
+            for k in ("pass", "pass_env", "pass_file", "file"):
+                if args.get(k):
+                    raise errors.ConfigError(
+                        f"vaultwarden_update_ssh: generate=true conflicts with "
+                        f"{k!r}; the plugin generates the key and passphrase.",
+                        suggestion="Remove the supplied parameter or drop "
+                                   "generate=true.",
+                        )
+            key_type = str(args.get("key_type") or "ed25519")
+            if key_type not in ("ed25519", "rsa"):
+                raise errors.ConfigError(
+                    f"vaultwarden_update_ssh: unsupported key_type {key_type!r}",
+                    suggestion="Use 'ed25519' or 'rsa'.",
+                )
+            rsa_bits = int(args.get("rsa_bits") or 4096)
+
+            passphrase = _generate_password(auth, {"mode": "password", "length": 32})
+            redactor.register_secret(passphrase)
+            tmpdir = None
+            try:
+                tmpdir, key_path, public_key, fingerprint = \
+                    _generate_ssh_keypair(key_type, rsa_bits,
+                                          comment=name, passphrase=passphrase)
+                try:
+                    with open(key_path, "r", encoding="utf-8",
+                              errors="replace") as f:
+                        redactor.register_secret(f.read())
+                except OSError:
+                    pass
+
+                current = auth.get_item(item_id)
+                login = dict(current.get("login") or {})
+                if args.get("user"):
+                    login["username"] = str(args["user"])
+                login["password"] = passphrase
+                current["login"] = login
+                auth.edit_item(current)
+
+                session = auth.get_session()
+                for att in (item.get("attachments") or []):
+                    auth._bw.delete_attachment(session, att.get("id", ""),
+                                               item_id)
+                auth._bw.create_attachment(session, key_path, item_id)
+
+                log.warning("Rotated SSH key pair for item '%s' (%s).",
+                            name, item_id)
+                return {
+                    "updated": True,
+                    "id": item_id,
+                    "name": name,
+                    "key_type": key_type,
+                    "public_key": public_key,
+                    "fingerprint": fingerprint,
+                    "passphrase_rotated": True,
+                }
+            finally:
+                if tmpdir is not None:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                redactor.forget_secret(passphrase)
+
+        # Non-generate update path (upload semantics).
+        resolved_pass, pw_warning = _resolve_secret_input(
+            args, direct_key="pass", env_key="pass_env",
+            file_key="pass_file", tool_name="vaultwarden_update_ssh")
+
         updates = {}
         if args.get("user"):
             updates["username"] = str(args["user"])
-        if args.get("pass"):
-            updates["password"] = str(args["pass"])
-            get_redacting_filter().register_secret(str(args["pass"]))
+        if resolved_pass is not None:
+            updates["password"] = resolved_pass
+            redactor.register_secret(resolved_pass)
         if args.get("notes") is not None:
             updates["notes"] = str(args["notes"])
 
@@ -634,7 +1009,10 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
             auth._bw.create_attachment(session, file_path, item_id)
 
         log.info("Updated SSH key item '%s' (%s).", name, item_id)
-        return {"updated": True, "id": item_id, "name": name}
+        response = {"updated": True, "id": item_id, "name": name}
+        if pw_warning:
+            response["warning"] = pw_warning
+        return response
     return _guard(run)
 
 

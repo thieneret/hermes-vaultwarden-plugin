@@ -138,16 +138,16 @@ VW_MASTER_PASSWORD="your-master-password"
 | `vaultwarden_list` | List items — metadata only | ❌ |
 | `vaultwarden_search` | Search items by name/username/uri — metadata only | ❌ |
 | `vaultwarden_get_secret_ref` | Generate a single-use placeholder token | ❌ |
-| `vaultwarden_store` | Create a new vault item. Supports `generate=true` to auto-generate a password stored directly in the vault. | ✅ |
-| `vaultwarden_update` | Update an existing item. Supports `generate=true` to regenerate the password, stored directly in the vault. | ✅ |
+| `vaultwarden_store` | Create a new vault item. Supports `generate=true` to auto-generate a password stored directly in the vault; password can be supplied via `password_env` / `password_file` to keep it out of the LLM context. | ✅ |
+| `vaultwarden_update` | Update an existing item. Supports `generate=true` to regenerate the password, stored directly in the vault; password can be supplied via `password_env` / `password_file` to keep it out of the LLM context. | ✅ |
 | `vaultwarden_delete` | Delete an item (`confirm=true` required) | ✅ |
 
 ### SSH key management tools
 
 | Tool | Purpose | Requires `allow_write` |
 |------|---------|:---:|
-| `vaultwarden_store_ssh` | Store SSH key as login item + attachment (name must be unique) | ✅ |
-| `vaultwarden_update_ssh` | Update user/passphrase/key attachment | ✅ |
+| `vaultwarden_store_ssh` | Store SSH key as login item + attachment (name must be unique). Supports `generate=true` to generate a keypair internally and return the public key; passphrase via `pass_env` / `pass_file`. | ✅ |
+| `vaultwarden_update_ssh` | Update user/passphrase/key attachment. Supports `generate=true` for key rotation (`confirm=true` required); returns the new public key; passphrase via `pass_env` / `pass_file`. | ✅ |
 | `vaultwarden_delete_ssh` | Delete SSH key item (attachment included) | ✅ |
 | `vaultwarden_use_ssh` | Load SSH key into ssh-agent | ❌ |
 
@@ -197,6 +197,66 @@ Socket resolution order for `ssh_auth_sock`:
 
 If no agent is running on the resolved socket, one is started with `ssh-agent -a <socket>`. The passphrase is piped via stdin (never written to a temp file); the key uses an atomic temp file (`mkstemp`, `0600`) deleted in a `finally` block.
 
+### SSH key generation (`generate=true`)
+
+`vaultwarden_store_ssh` and `vaultwarden_update_ssh` accept `generate=true`, which makes the plugin generate the keypair internally — the user never types a passphrase or a key file path:
+
+1. A **32-character passphrase** is generated via the same `bw generate` path used by `vaultwarden_store` / `vaultwarden_update` `generate=true` (one consistent secret-generation mechanism across the plugin).
+2. An SSH keypair is generated with `ssh-keygen` — default `ed25519`, optional `rsa` via `key_type` / `rsa_bits` (default **4096** bits). The passphrase is delivered on **stdin**, never as a command-line argument (argv would leak it to `ps`).
+3. Post-generation safety verify: `ssh-keygen -yf <key>` with `stdin=DEVNULL` must FAIL — if it succeeds, the key is unencrypted and the operation aborts rather than storing an unprotected key.
+4. The private key is stored as a vault attachment and the passphrase as the item `password` field. Neither is ever returned.
+5. The response contains the **public key** and **fingerprint** (non-secret — paste the public key into `authorized_keys`).
+
+In generate mode, `pass` / `pass_env` / `pass_file` / `file` are forbidden (the plugin supplies them). `vaultwarden_update_ssh` + `generate=true` is a **key rotation** (destructive: replaces the existing keypair + passphrase) and therefore requires `confirm=true`, mirroring `vaultwarden_delete_ssh`.
+
+```
+# Generate a new ed25519 keypair
+vaultwarden_store_ssh(name="SSH - New", user="deploy", generate=true)
+-> {"created": true, "id": "...", "name": "SSH - New", "ssh_user": "deploy",
+    "key_type": "ed25519", "public_key": "ssh-ed25519 AAAA... SSH - New",
+    "fingerprint": "SHA256:...", "passphrase_generated": true}
+
+# Generate an RSA keypair (4096-bit default)
+vaultwarden_store_ssh(name="SSH - RSA", generate=true, key_type="rsa")
+
+# Rotate an existing key (destructive - confirm required)
+vaultwarden_update_ssh(name="SSH - New", generate=true, confirm=true)
+-> {"updated": true, ..., "public_key": "ssh-ed25519 AAAA...",
+    "fingerprint": "SHA256:...", "passphrase_rotated": true}
+```
+
+## Secret input channels
+
+Write tools that accept a secret (`vaultwarden_store` / `vaultwarden_update` via `password*`, `vaultwarden_store_ssh` / `vaultwarden_update_ssh` via `pass*`) support three **mutually exclusive** input sources:
+
+| Source | Parameter (store/update) | Parameter (ssh) | Notes |
+|--------|--------------------------|-----------------|-------|
+| Raw value | `password` | `pass` | Enters the LLM context and chat history — **not secure**. Emits a warning in BOTH the log and the tool response. |
+| Environment variable | `password_env` | `pass_env` | Name of an env var holding the secret, resolved from the Hermes process env (e.g. `~/.hermes/.env`). |
+| Owner-only file | `password_file` | `pass_file` | Path to a file holding the secret. Must be a regular file readable **only by the owner** (chmod 600) — permission violations are rejected before the file is read. |
+
+Rules:
+
+- **Conflicting sources are an error.** Providing more than one of the trio raises `ConfigError` (no silent precedence). In generate mode, supplying any secret/file parameter is also a `ConfigError`.
+- **Raw input triggers a dual-channel warning:** a value-free `log.warning` AND a `"warning"` field in the tool response. The response warning names the safer `*_env` / `*_file` alternatives and never contains the secret value itself — it is meant to be relayed to the user by the agent.
+- Env/file-resolved secrets never appear in the tool call arguments, keeping them out of the LLM context entirely.
+
+```
+# Password from an environment variable (set in ~/.hermes/.env)
+vaultwarden_store(name="GitHub account", username="octocat", password_env="GH_TOKEN")
+
+# Passphrase from an owner-only file (chmod 600)
+vaultwarden_store_ssh(name="SSH - Prod", user="deploy",
+                      pass_file="/run/secrets/ssh_pass", file="/home/u/.ssh/id_ed25519")
+
+# Raw password still works, but the response carries a warning
+vaultwarden_store(name="raw-test", username="u", password="hunter2")
+-> {"created": true, ..., "warning": "Direct secret input detected for 'password'
+    in vaultwarden_store. The value enters the LLM context and chat history,
+    which is not secure. Prefer 'password_env' (an environment variable) or
+    'password_file' (an owner-only file, chmod 600) instead."}
+```
+
 ## Security Architecture
 
 | Mechanism | Description |
@@ -235,7 +295,7 @@ vaultwarden/
 pytest vaultwarden/tests/ -q
 ```
 
-Current suite: **247 tests**.
+Current suite: **285 tests**.
 
 ## License
 

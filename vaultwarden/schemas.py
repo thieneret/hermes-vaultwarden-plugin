@@ -112,7 +112,8 @@ _GENERATE_PROPERTIES = {
         "description": (
             "Generate a password instead of using the password field. "
             "The generated password is stored directly in the vault and "
-            "never returned to the caller."),
+            "never returned to the caller. Mutually exclusive with "
+            "password/password_env/password_file."),
     },
     "generate_options": {
         "type": "object",
@@ -134,13 +135,85 @@ _GENERATE_PROPERTIES = {
     }
 }
 
+#: v0.4.0 (Feature 1): secret-input channel descriptions shared by the
+#: store/update password trio and the SSH passphrase trio.
+_PASSWORD_DIRECT_DESC = (
+    "Password. Passing it RAW here is NOT secure: the value enters the LLM "
+    "context and chat history, the plugin logs a warning AND returns a "
+    "'warning' field in the tool response (relay it to the user). Prefer "
+    "password_env or password_file. Mutually exclusive with "
+    "password_env/password_file."
+)
+_PASSWORD_ENV_DESC = (
+    "Name of an environment variable holding the password; mutually "
+    "exclusive with password/password_file."
+)
+_PASSWORD_FILE_DESC = (
+    "Path to a file holding the password; must be owner-readable only "
+    "(chmod 600); mutually exclusive with password/password_env."
+)
+_PASS_DIRECT_DESC = (
+    "SSH key passphrase. Passing it RAW here is NOT secure: the value "
+    "enters the LLM context and chat history, the plugin logs a warning AND "
+    "returns a 'warning' field in the tool response (relay it to the user). "
+    "Prefer pass_env or pass_file. Mutually exclusive with pass_env/"
+    "pass_file. Forbidden when generate=true."
+)
+_PASS_ENV_DESC = (
+    "Name of an environment variable holding the passphrase; mutually "
+    "exclusive with pass/pass_file. Forbidden when generate=true."
+)
+_PASS_FILE_DESC = (
+    "Path to a file holding the passphrase; must be owner-readable only "
+    "(chmod 600); mutually exclusive with pass/pass_env. Forbidden when "
+    "generate=true."
+)
+_SSH_GENERATE_PROPERTIES = {
+    "generate": {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            "Generate a new SSH keypair inside the plugin: a 32-char "
+            "passphrase is produced via the same `bw generate` path used by "
+            "store/update generate=true, the keypair via ssh-keygen "
+            "(passphrase delivered on stdin, never argv). The private key "
+            "is stored as an attachment and the passphrase as the item "
+            "password; ONLY the public key + fingerprint (non-secret) are "
+            "returned. In generate mode pass/pass_env/pass_file/file are "
+            "forbidden."),
+    },
+    "key_type": {
+        "type": "string",
+        "enum": ["ed25519", "rsa"],
+        "default": "ed25519",
+        "description": "SSH key type for generate=true. Default ed25519.",
+    },
+    "rsa_bits": {
+        "type": "integer",
+        "default": 4096,
+        "description": ("RSA key size in bits, used only when "
+                        "key_type='rsa'. Default 4096."),
+    },
+}
+
+
+def _secret_input_properties(direct_desc: str, env_desc: str,
+                             file_desc: str) -> dict:
+    """Shared builder for the raw/env/file secret-input channel trio."""
+    return {"direct": direct_desc, "env": env_desc, "file": file_desc}
+
+
 VAULTWARDEN_STORE = {
     "name": "vaultwarden_store",
     "description": ("Create a new vault item. Requires allow_write=true. "
                     "Secret values passed here go straight into bw via the "
                     "encode pipeline and are redacted from all logs. "
                     "Supports generate=true to auto-generate a password "
-                    "stored directly in the vault (never returned)."),
+                    "stored directly in the vault (never returned). "
+                    "Passwords can be supplied via password_env (environment "
+                    "variable name) or password_file (owner-only file, "
+                    "chmod 600) to keep them out of the LLM context; raw "
+                    "password input is allowed but returns a 'warning' field."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -149,7 +222,12 @@ VAULTWARDEN_STORE = {
             "type": {"type": "string", "enum": ITEM_TYPES, "default": "login"},
             "name": {"type": "string"},
             "username": {"type": "string"},
-            "password": {"type": "string"},
+            "password": {"type": "string",
+                         "description": _PASSWORD_DIRECT_DESC},
+            "password_env": {"type": "string",
+                             "description": _PASSWORD_ENV_DESC},
+            "password_file": {"type": "string",
+                              "description": _PASSWORD_FILE_DESC},
             "uri": {"type": "string", "description": "Login URI."},
             "notes": {"type": "string"},
             "folder_id": {"type": "string"},
@@ -177,14 +255,23 @@ VAULTWARDEN_UPDATE = {
     "description": ("Update an existing item via fetch-modify-save. Requires "
                     "allow_write=true. Omitted fields stay unchanged. "
                     "Supports generate=true to regenerate the password, "
-                    "stored directly in the vault (never returned)."),
+                    "stored directly in the vault (never returned). "
+                    "Passwords can be supplied via password_env (environment "
+                    "variable name) or password_file (owner-only file, "
+                    "chmod 600) to keep them out of the LLM context; raw "
+                    "password input is allowed but returns a 'warning' field."),
     "parameters": {
         "type": "object",
         "properties": {
             "item_id": {"type": "string"},
             "name": {"type": "string"},
             "username": {"type": "string"},
-            "password": {"type": "string"},
+            "password": {"type": "string",
+                         "description": _PASSWORD_DIRECT_DESC},
+            "password_env": {"type": "string",
+                             "description": _PASSWORD_ENV_DESC},
+            "password_file": {"type": "string",
+                              "description": _PASSWORD_FILE_DESC},
             "uri": {"type": "string"},
             "notes": {"type": "string"},
             "custom_fields": VAULTWARDEN_STORE["parameters"]["properties"]["custom_fields"],
@@ -217,24 +304,42 @@ VAULTWARDEN_STORE_SSH = {
         "Store an SSH private key in the vault as a login item with file "
         "attachment. The username holds the SSH user, the password holds "
         "the key passphrase, and the key file is stored as an attachment. "
-        "Requires allow_write=true. Name must be unique."),
+        "Requires allow_write=true. Name must be unique. "
+        "v0.4.0: supports generate=true — the plugin generates a 32-char "
+        "passphrase (same `bw generate` path as store/update) and an SSH "
+        "keypair via ssh-keygen (passphrase delivered on stdin), stores "
+        "both in the vault, and returns ONLY the public key + fingerprint. "
+        "In generate mode pass/pass_env/pass_file/file are forbidden. "
+        "Without generate, the passphrase can come from pass (raw — warns "
+        "in log AND response), pass_env, or pass_file (chmod 600)."),
     "parameters": {
         "type": "object",
         "properties": {
             "name": {"type": "string",
                      "description": "Unique item name (e.g. 'SSH - Production')."},
             "user": {"type": "string",
-                     "description": "SSH username (e.g. 'deploy', 'root')."},
+                     "description": ("SSH username (e.g. 'deploy', 'root'). "
+                                     "Optional when generate=true.")},
             "pass": {"type": "string",
-                     "description": "SSH key passphrase."},
+                     "description": _PASS_DIRECT_DESC},
+            "pass_env": {"type": "string",
+                         "description": _PASS_ENV_DESC},
+            "pass_file": {"type": "string",
+                          "description": _PASS_FILE_DESC},
             "file": {"type": "string",
-                     "description": "Absolute path to the SSH private key file."},
+                     "description": ("Absolute path to the SSH private key "
+                                     "file. Forbidden when generate=true.")},
             "folder_id": {"type": "string",
                           "description": "Optional folder UUID."},
             "notes": {"type": "string",
                       "description": "Optional description."},
+            **_SSH_GENERATE_PROPERTIES,
         },
-        "required": ["name", "user", "pass", "file"],
+        # v0.4.0: "user"/"pass"/"file" are no longer unconditionally
+        # required — generate=true supplies them internally, and the
+        # passphrase may arrive via pass_env/pass_file instead of raw pass.
+        # The handlers enforce the per-mode requirements at runtime.
+        "required": ["name"],
     },
 }
 
@@ -242,7 +347,14 @@ VAULTWARDEN_UPDATE_SSH = {
     "name": "vaultwarden_update_ssh",
     "description": (
         "Update an existing SSH key item. Can update user, passphrase, "
-        "and/or the key file attachment. Requires allow_write=true."),
+        "and/or the key file attachment. Requires allow_write=true. "
+        "v0.4.0: generate=true performs a destructive KEY ROTATION (new "
+        "keypair + new 32-char passphrase generated by the plugin, same "
+        "`bw generate` path as store/update) and REQUIRES confirm=true; it "
+        "returns only the new public key + fingerprint. In generate mode "
+        "pass/pass_env/pass_file/file are forbidden. Without generate, the "
+        "passphrase can come from pass (raw — warns in log AND response), "
+        "pass_env, or pass_file (chmod 600)."),
     "parameters": {
         "type": "object",
         "properties": {
@@ -251,11 +363,21 @@ VAULTWARDEN_UPDATE_SSH = {
             "user": {"type": "string",
                      "description": "New SSH username (optional)."},
             "pass": {"type": "string",
-                     "description": "New passphrase (optional)."},
+                     "description": _PASS_DIRECT_DESC},
+            "pass_env": {"type": "string",
+                         "description": _PASS_ENV_DESC},
+            "pass_file": {"type": "string",
+                          "description": _PASS_FILE_DESC},
             "file": {"type": "string",
-                     "description": "New SSH key file path (optional)."},
+                     "description": ("New SSH key file path (optional). "
+                                     "Forbidden when generate=true.")},
             "notes": {"type": "string",
                       "description": "New description (optional)."},
+            **_SSH_GENERATE_PROPERTIES,
+            "confirm": {"type": "boolean",
+                        "description": ("Must be true when generate=true — "
+                                        "key rotation is destructive and "
+                                        "requires explicit confirmation.")},
         },
         "required": ["name"],
     },

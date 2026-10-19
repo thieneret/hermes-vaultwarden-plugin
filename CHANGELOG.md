@@ -5,6 +5,34 @@ Author: **thieneret**
 
 ---
 
+## [0.4.0] - 2026-10-20
+
+### Features
+
+- **Secret input channels (store/update + ssh_store/ssh_update):** passwords
+  and SSH passphrases can now be supplied via an environment variable
+  (`password_env` / `pass_env`) or an owner-only file (`password_file` /
+  `pass_file`, validated chmod 600), keeping them out of the LLM context.
+  Conflicting sources are rejected; raw direct input still works but emits a
+  warning in BOTH the log and the tool response (the response `warning` field
+  is relayed to the user).
+- **SSH keypair generation (`ssh_store` / `ssh_update` + `generate=true`):**
+  the plugin generates a 32-char passphrase via the SAME `bw generate` path as
+  `store`/`update` `generate=true` (one consistent secret-generation
+  mechanism) and an SSH keypair (default `ed25519`, optional `rsa` via
+  `key_type`/`rsa_bits`, default 4096 bits) using `ssh-keygen` with the
+  passphrase delivered on stdin (never argv), followed by a post-generation
+  encryption verify. The private key and passphrase are stored in the vault;
+  only the public key (and fingerprint) is returned. `ssh_update` +
+  `generate=true` performs a key rotation and requires `confirm=true`.
+
+### Security
+
+- New primary controls documented in SECURITY.md (secret input channels, SSH
+  key generation with stdin passphrase + encryption verify, single
+  secret-generation path).
+- No tool-count change (12 tools). No breaking change to existing parameters.
+
 ## [0.3.9] - 2026-10-19
 
 ### Bugfix (VWP-12 regression — `bw generate` syntax)
