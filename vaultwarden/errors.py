@@ -137,6 +137,23 @@ class AgentError(VaultwardenError):
     suggestion = "Verify ssh-agent/ssh-add are installed and PATH is set."
 
 
+# ---------------------------------------------------- v0.3.8 error taxonomy
+class UnsupportedBwVersionError(VaultwardenError):
+    """Raised when the bw CLI version is below the minimum supported
+    threshold or cannot be parsed (VWP-11, fail-closed, no override)."""
+    code = "UNSUPPORTED_BW_VERSION"
+
+    def __init__(self, message: str, *, suggestion: str | None = None):
+        super().__init__(
+            message,
+            suggestion=suggestion or (
+                "Upgrade the Bitwarden CLI (bw) to version 2026.9.1 or "
+                "later. The plugin will not start with an unsupported "
+                "version."
+            ),
+        )
+
+
 def error_response(exc: Exception) -> dict:
     """Convert any exception into the standard, secret-free error dict."""
     if isinstance(exc, VaultwardenError):

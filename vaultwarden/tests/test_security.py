@@ -425,7 +425,8 @@ def test_appdata_dir_in_every_subprocess(fake_bw, tmp_path):
     from vaultwarden.bw_cli import BwCli
     appdata = tmp_path / "bw-state"
     appdata.mkdir(mode=0o700)
-    cli = BwCli(fake_bw, appdata)
+    # VWP-11: BwCli construction now triggers `bw --version`; the spy below
+    # is installed first so that subprocess call is audited too.
     cmds = [
         ["status"], ["config", "server", "https://v.example"],
         ["config", "get", "server"],
@@ -440,17 +441,22 @@ def test_appdata_dir_in_every_subprocess(fake_bw, tmp_path):
 
     def spy(cmd, **kw):
         if str(cmd[0]) == fake_bw:
+            # VWP-11: the `bw --version` startup check also goes through this
+            # spy; audit its env but do NOT count it as one of the cmds below.
+            is_version = list(cmd[1:]) == ["--version"]
             assert kw["env"]["BITWARDENCLI_APPDATA_DIR"] == str(appdata), cmd
             # and nothing else from the parent env leaked in:
             assert "VW_MASTER_PASSWORD" not in kw["env"]
             assert "VW_CLIENT_SECRET" not in kw["env"]
-            seen.append(tuple(cmd[1:2]))
+            if not is_version:
+                seen.append(tuple(cmd[1:2]))
         return real_run(cmd, **kw)
 
     import vaultwarden.bw_cli as mod
     orig = mod.subprocess.run
     mod.subprocess.run = spy
     try:
+        cli = BwCli(fake_bw, appdata)  # VWP-11: triggers bw --version here
         for c in cmds:
             try:
                 cli.run(c, env={"BW_CLIENTID": "user.x", "BW_CLIENTSECRET": "cs-secret",

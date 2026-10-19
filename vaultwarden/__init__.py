@@ -107,7 +107,15 @@ def register(ctx: Any) -> bool:
     # register() completes well within Hermes's 10s plugin-load timeout.
     try:
         config.validate()
-        bw = BwCli(bw_path, appdata_dir)
+        # v0.3.8 (VWP-10): wire the retry/backoff config options through.
+        # (The task spec pointed at auth.py, but the only production BwCli(...)
+        # constructor call lives here — auth.py receives the instance.)
+        bw = BwCli(
+            bw_path, appdata_dir,
+            max_retries=config.bw_max_retries,
+            backoff_base=config.bw_backoff_base,
+            max_delay=config.bw_max_delay,
+        )
         auth = AuthManager(bw, config,
                            client_secret=client_secret,
                            master_password=master_password)

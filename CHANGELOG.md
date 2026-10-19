@@ -5,6 +5,65 @@ Author: **thieneret**
 
 ---
 
+## [0.3.8] - 2026-10-19
+
+### Security & Reliability (audit finding VWP-11)
+
+- **VWP-11:** `bw` CLI version is now validated at plugin startup via
+  `BwCli._check_version()`. Fail-closed with NO override: unsupported or
+  unparseable versions raise `UnsupportedBwVersionError`, log the error,
+  and prevent the plugin from loading. Minimum version is hardcoded at
+  2026.9.1 (the version the plugin was developed and tested against);
+  it is not a configuration option.
+
+### Security & Reliability (audit findings VWP-09, VWP-10)
+
+- **VWP-09:** Error classification reorganized into source-category priority
+  (Node.js network codes → rate limit → bw CLI state → server API →
+  unknown) via `_classify_error()`. Marker lists expanded. `bw` exposes only
+  two exit codes (0/1), so marker matching remains the only viable approach,
+  now hardened by stability priority and anchored by the VWP-11 version
+  check. JSON parse failures fall back to raw string with a debug log
+  (`_parse_output()`) instead of raising `ParseError`; unknown errors emit
+  rich debug context (rc, category, redacted stderr snippet).
+- **VWP-10:** Network-error retry replaced with bounded exponential backoff
+  with additive jitter (`base * 2^attempt + uniform(0,1)`, capped at
+  `max_delay`). Retry is restricted to idempotent operations:
+  `login_apikey`, `unlock_passwordenv`, `create_attachment`, `delete_item`,
+  and `delete_attachment` are explicitly `retryable=False`, preventing
+  duplicate session keys, duplicate attachments, or false-negative delete
+  results. Rate-limit errors are raised immediately and never retried.
+  No third-party dependencies — stdlib `random` only.
+
+#### New configuration options
+
+| Option | Default | Description |
+|---|---|---|
+| `bw_max_retries` | `3` | Max retry attempts for idempotent `bw` calls on network errors |
+| `bw_backoff_base` | `1.0` | Base delay (seconds) for exponential backoff |
+| `bw_max_delay` | `10.0` | Maximum backoff delay cap (seconds) |
+
+#### Scope & documentation notes
+
+- Scope: `bw_cli.py` (markers, `_classify_error`, `_compute_backoff`,
+  `_parse_output`, `run()` rewrite, `__init__` +3 params, `retryable=False`),
+  `config.py` (3 options), `plugin.yaml` (3 schema entries), tests,
+  README.md (3 config rows + security row), and SECURITY.md (error
+  classification + retry safety subsections + dev rules).
+- __init__.py (BwCli construction site only; auth.py untouched): the
+  original spec assumed the `BwCli(...)` construction site was in `auth.py`;
+  it is actually in `__init__.py`. `AuthManager` receives an already-built
+  `BwCli` instance, so `auth.py` stays at zero diff and the 3 retry params
+  (`max_retries`, `backoff_base`, `max_delay`) are wired at the real
+  construction site.
+- Untouched files: `auth.py`, `errors.py`, `tools.py`, `hooks.py`,
+  `placeholders.py`.
+- README.md: config.yaml example, key settings table, and security
+  architecture row updated for the new retry options and structured error
+  classification.
+- SECURITY.md: added "Error Classification by Source (VWP-09)" and
+  "Retry Safety (VWP-10)" subsections plus new development rules.
+
 ## [0.3.7] - 2026-10-18
 
 ### Breaking Changes

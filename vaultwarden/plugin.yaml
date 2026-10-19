@@ -1,6 +1,6 @@
 # vaultwarden/plugin.yaml — v0.2.8
 name: vaultwarden
-version: 0.3.7
+version: 0.3.8
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key
@@ -78,6 +78,27 @@ config:
     description: >-
       Optional FULL path to the bw binary (e.g. /usr/local/bin/bw).
       A directory path alone is NOT sufficient. BW_CLI_PATH env overrides.
+  # v0.3.8 (VWP-10): retry / backoff for idempotent bw calls. NOTE: the
+  # minimum supported bw version is deliberately NOT configurable (VWP-11:
+  # fail-closed, no override).
+  bw_max_retries:
+    type: integer
+    default: 3
+    description: >-
+      Maximum retry attempts for idempotent bw calls on network errors.
+      Non-idempotent operations (login/unlock/create attachment/delete)
+      are never retried.
+  bw_backoff_base:
+    type: number
+    default: 1.0
+    description: >-
+      Base delay in seconds for exponential backoff between retries
+      (delay = base * 2^attempt + jitter).
+  bw_max_delay:
+    type: number
+    default: 10.0
+    description: >-
+      Upper cap in seconds for any single retry backoff delay.
   terminal_tool_names:
     type: array
     default: []
