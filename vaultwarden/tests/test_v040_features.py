@@ -13,7 +13,10 @@ private key/passphrase NEVER returned, rotation requires confirm=true.
 """
 import json
 import os
+import shutil
 import stat
+import subprocess
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -319,6 +322,199 @@ def test_gen_keypair_ssh_keygen_failure_raises():
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake_run):
         with pytest.raises(errors.VaultwardenError):
             _generate_ssh_keypair("ed25519", 4096, "c", "pp1234")
+
+
+def test_gen_keypair_askpass_script_unlinked_on_failure():
+    """keygen rc!=0 -> VaultwardenError AND the askpass script is gone."""
+    captured: dict = {}
+
+    def fake_run(cmd, **kw):
+        captured.update(kw.get("env") or {})
+        return MagicMock(returncode=1, stdout="", stderr="boom")
+
+    with patch("vaultwarden.tools.subprocess.run", side_effect=fake_run):
+        with pytest.raises(errors.VaultwardenError):
+            _generate_ssh_keypair("ed25519", 4096, "c", "pp1234")
+    assert not os.path.exists(captured["SSH_ASKPASS"])
+
+
+def test_gen_keypair_askpass_script_unlinked_when_verify_aborts():
+    """rc==0 on -yf (UNENCRYPTED) -> abort, askpass script still unlinked."""
+    fake = _kp_run_factory(unencrypted=True)
+    with patch("vaultwarden.tools.subprocess.run", side_effect=fake):
+        with pytest.raises(errors.VaultwardenError):
+            _generate_ssh_keypair("ed25519", 4096, "c", "pp1234")
+    env = fake.calls[0][1]["env"]
+    assert not os.path.exists(env["SSH_ASKPASS"])
+
+
+# ── v0.4.1 helpers: _make_askpass_script / _askpass_env ──────────────────
+
+def test_make_askpass_script_exists_mode_and_exact_body():
+    path = _make_askpass_script()
+    try:
+        assert os.path.isfile(path)
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o700
+        with open(path, encoding="utf-8") as f:
+            assert f.read() == _ASKPASS_SCRIPT_BODY
+    finally:
+        os.unlink(path)
+
+
+def test_make_askpass_script_body_carries_no_secret():
+    sentinel = "SUP3R-SECRETPASSPHRASE"
+    path = _make_askpass_script()
+    try:
+        with open(path, "rb") as f:
+            assert sentinel.encode() not in f.read()
+    finally:
+        os.unlink(path)
+
+
+def test_make_askpass_script_write_failure_leaves_no_orphan(monkeypatch):
+    monkeypatch.setattr(
+        "vaultwarden.tools.os.chmod",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("denied")),
+    )
+    with pytest.raises(OSError):
+        _make_askpass_script()
+    leftovers = [
+        p for p in os.listdir(tempfile.gettempdir())
+        if p.startswith("vw_askpass_")
+    ]
+    assert leftovers == []
+
+
+def test_askpass_env_keys_and_base_isolation():
+    monkeypatch_marker = "VWPARENTSECRET"
+    os.environ[monkeypatch_marker] = "leak-me"
+    passphrase = "the-passphrase-123"
+    try:
+        env = _askpass_env(passphrase)
+        try:
+            assert env["SSH_ASKPASS_REQUIRE"] == "force"
+            assert env["VW_SSH_PASS"] == passphrase
+            ap = env["SSH_ASKPASS"]
+            assert os.path.isfile(ap)
+            # built on _ssh_base_env: minimal allowlist only
+            assert set(env) <= {"PATH", "HOME", "LC_ALL",
+                                "SSH_ASKPASS_REQUIRE", "SSH_ASKPASS",
+                                "VW_SSH_PASS"}
+            assert monkeypatch_marker not in env
+        finally:
+            os.unlink(ap)
+    finally:
+        os.environ.pop(monkeypatch_marker, None)
+
+
+def test_askpass_env_drops_falsy_extras():
+    env = _askpass_env("pp", extra={"SSH_AUTH_SOCK": "", "KEEP": "yes"})
+    try:
+        assert "SSH_AUTH_SOCK" not in env
+        assert env["KEEP"] == "yes"
+    finally:
+        os.unlink(env["SSH_ASKPASS"])
+
+
+# ── functional askpass proof (fake ssh-keygen, no real binary) ───────────
+
+_FAKE_KEYGEN_DELIVERS = """#!/bin/sh
+# Fake ssh-keygen: proves the SSH_ASKPASS channel truly delivers.
+if echo "$*" | grep -q -- '-yf'; then
+    # verify: succeeds (rc 0) only if the key file lacks ENCRYPTED marker
+    for f in "$@"; do
+        if [ -f "$f" ] && grep -q 'ENCRYPTED' "$f"; then
+            exit 1   # encrypted -> verify correctly FAILS (expected)
+        fi
+    done
+    exit 0           # unencrypted -> verify succeeds (must abort)
+fi
+if echo "$*" | grep -q -- '-t'; then
+    # main generation: read the passphrase through $SSH_ASKPASS
+    got=$("$SSH_ASKPASS")
+    if [ "$got" != "$EXPECT_PASS" ]; then
+        echo "askpass delivered wrong value" >&2
+        exit 1
+    fi
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "-f" ]; then
+            printf 'PRIVATE:ENCRYPTED\\n' > "$2"
+            printf 'ssh-ed25519 AAAAC3 fake pub\\n' > "$2.pub"
+            exit 0
+        fi
+        shift
+    done
+    exit 2
+fi
+exit 0
+"""
+
+_FAKE_KEYGEN_IGNORES_ASKPASS = """#!/bin/sh
+# Fake ssh-keygen that IGNORES the askpass channel: writes an
+# "unencrypted" key regardless — the -yf verify must catch this.
+while [ $# -gt 0 ]; do
+    if [ "$1" = "-f" ]; then
+        printf 'PRIVATE:PLAIN\\n' > "$2"
+        printf 'ssh-ed25519 AAAAC3 fake pub\\n' > "$2.pub"
+    fi
+    shift
+done
+exit 0
+"""
+
+
+def _run_keypair_with_fake_keygen(script_body: str, passphrase: str):
+    """Patch subprocess.run to exec a fake ssh-keygen via PATH.
+
+    The fake reads EXPECT_PASS from its own environment (the minimal
+    _ssh_base_env() never inherits parent vars) — so we inject it via
+    the patched run's env, exactly as the askpass passphrase itself is
+    injected via _askpass_env().
+    """
+    bindir = tempfile.mkdtemp(prefix="vw_fakekeygen_")
+    fake = os.path.join(bindir, "ssh-keygen")
+    with open(fake, "w", encoding="utf-8") as f:
+        f.write(script_body)
+    os.chmod(fake, 0o700)
+
+    real_run = subprocess.run
+
+    def patched_run(cmd, **kw):
+        if cmd and cmd[0] == "ssh-keygen":
+            env = dict(kw.get("env") or {})
+            env["PATH"] = bindir + ":" + env.get("PATH", "")
+            env["EXPECT_PASS"] = passphrase
+            kw = {**kw, "env": env}
+        return real_run(cmd, **kw)
+
+    try:
+        with patch("vaultwarden.tools.subprocess.run", side_effect=patched_run):
+            return _generate_ssh_keypair(
+                "ed25519", 4096, "comment", passphrase)
+    finally:
+        shutil.rmtree(bindir, ignore_errors=True)
+
+
+def test_functional_askpass_delivers_passphrase_to_keygen():
+    """The helper script really echoes VW_SSH_PASS to the child process."""
+    passphrase = "func-askpass-S3cret!"
+    tmpdir, key_path, public_key, fp = _run_keypair_with_fake_keygen(
+        _FAKE_KEYGEN_DELIVERS, passphrase)
+    try:
+        with open(key_path, encoding="utf-8") as f:
+            assert "ENCRYPTED" in f.read()
+        assert public_key.startswith("ssh-ed25519 ")
+        assert fp != ""
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_functional_askpass_empty_delivery_aborts_via_verify():
+    """Fake keygen ignoring askpass -> unencrypted key -> verify aborts."""
+    with pytest.raises(errors.VaultwardenError) as exc_info:
+        _run_keypair_with_fake_keygen(
+            _FAKE_KEYGEN_IGNORES_ASKPASS, "pp12345")
+    assert "UNENCRYPTED" in exc_info.value.message
 
 
 # ── single generation path (decision 1) ──────────────────────────────────

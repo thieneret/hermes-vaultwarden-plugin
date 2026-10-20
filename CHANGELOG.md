@@ -5,6 +5,42 @@ Author: **thieneret**
 
 ---
 
+## [0.4.1] - 2026-10-21
+
+### Bugfix (v0.4.0 regression — SSH keypair generation prompted the user)
+
+- **`generate=true` no longer prompts for the passphrase.**
+  `_generate_ssh_keypair()` delivered the passphrase via
+  `subprocess.run(input=...)`, but OpenSSH's `ssh-keygen` reads passphrases
+  through `read_passphrase()`, which never consumes stdin and prompts
+  `/dev/tty` when a tty is present. The piped data was ignored and the user
+  was asked. Delivery now uses the proven v0.3.4 `SSH_ASKPASS` mechanism:
+  a helper script whose body is only `echo "$VW_SSH_PASS"` runs with
+  `SSH_ASKPASS_REQUIRE=force`, the passphrase travels in the subprocess
+  environment only (never a file, never `-N` argv), and `stdin` is
+  `/dev/null` so a tty fallback or hang is impossible. Verified against
+  OpenSSH 10.0p2 (`SSH_ASKPASS_REQUIRE` needs >= 8.4).
+- **Encryption verify retained as the safety net.** `ssh-keygen -yf` with
+  `stdin=DEVNULL` must FAIL after generation; if the askpass channel yields an
+  empty passphrase the key would be unencrypted, and the operation now aborts
+  instead of storing an unprotected key in the vault.
+- **Deduplication:** the askpass helper script + env construction is now a
+  single module-level implementation (`_make_askpass_script()` /
+  `_askpass_env()`) shared by `h_use_ssh` and `_generate_ssh_keypair`, so a
+  future askpass fix lands in exactly one place. `h_use_ssh` behavior is
+  otherwise unchanged; its `HOME` fallback is normalized from `"/"` to
+  `_ssh_base_env()`'s `Path.home()` (strictly better: the old fallback broke
+  `~` expansion).
+- **Documentation:** README/SECURITY no longer claim stdin passphrase
+  delivery.
+- **Manifest:** removed the stale version header comment from the first line
+  of `plugin.yaml` (missed by the v0.3.2 header cleanup); the `version:` key
+  is unchanged in role and now reads `0.4.1`.
+
+No schema, tool-count (12), or response-shape change.
+
+---
+
 ## [0.4.0] - 2026-10-20
 
 ### Features
