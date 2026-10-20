@@ -143,24 +143,84 @@ def test_store_ssh_rejects_duplicate_name():
 # ── Passphrase never in temp file ────────────────────────────────────────
 
 def test_use_ssh_passphrase_via_askpass_env_only():
-    """v0.3.4: passphrase delivered via SSH_ASKPASS env var, never a file.
+    """v0.3.4/v0.4.1: passphrase delivered via SSH_ASKPASS env var, never a file.
 
     The askpass script contains ONLY `echo "$VW_SSH_PASS"` — no secret
     content. The broken stdin-pipe approach (`input=passphrase`) must be
-    gone; ssh-add runs with stdin=DEVNULL instead.
+    gone; ssh-add runs with stdin=DEVNULL instead. Since v0.4.1 the script
+    + env construction is delegated to the shared helpers
+    (_askpass_env / _make_askpass_script).
     """
     import inspect
 
     from vaultwarden import tools
     source = inspect.getsource(tools.h_use_ssh)
     assert "input=passphrase" not in source
-    assert "SSH_ASKPASS_REQUIRE" in source
-    assert 'SSH_ASKPASS' in source
-    assert "VW_SSH_PASS" in source
+    assert "_askpass_env(" in source          # shared single implementation
+    assert 'env["SSH_ASKPASS"]' in source     # path read for finally-cleanup
     assert "stdin=subprocess.DEVNULL" in source
     assert "askpass_path" in source
     assert "passphrase_file" not in source
     assert "pass_file" not in source
+
+
+def test_use_ssh_env_keyset_and_cleanup(monkeypatch, tmp_path):
+    """h_use_ssh regression: exact env key set, DEVNULL stdin, cleanup.
+
+    The env passed to ssh-add must contain exactly PATH, HOME, LC_ALL,
+    SSH_AUTH_SOCK, SSH_ASKPASS_REQUIRE, SSH_ASKPASS, VW_SSH_PASS; stdin is
+    DEVNULL; both the key file and the askpass script are gone afterwards;
+    the script body still contains no secret.
+    """
+    import subprocess as sp
+    from unittest.mock import MagicMock
+
+    from vaultwarden import tools
+    from vaultwarden.placeholders import PlaceholderRegistry
+    from vaultwarden.tests.conftest import make_config
+
+    sentinel = "SENTINEL-PASSPHRASE-9f3a"
+    item = {"id": "i1", "name": "SSH - X", "login": {"username": "deploy"}}
+    auth = MagicMock()
+    auth.search_items.return_value = [item]
+
+    def get_ssh_key(item_id, key_path):
+        with open(key_path, "w", encoding="utf-8") as f:
+            f.write("-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n")
+        return key_path, sentinel
+
+    auth.get_ssh_key.side_effect = get_ssh_key
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((list(cmd), kw))
+        return MagicMock(returncode=0, stdout="256 SHA256:fp comment (ed25519)\n",
+                         stderr="")
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(tools, "_resolve_socket_path",
+                        lambda p: ("/tmp/fake.sock", False))
+    registry = PlaceholderRegistry()
+    cfg = make_config()
+    handler = {s["name"]: h for s, h in
+               tools.get_tools(auth, cfg, registry)}["vaultwarden_use_ssh"]
+    res_json = handler({"name": "SSH - X"})
+    import json as _json
+    res = _json.loads(res_json) if isinstance(res_json, str) else res_json
+    assert res["loaded"] is True
+
+    add_call = next(c for c in calls if c[0][0] == "ssh-add")
+    env = add_call[1]["env"]
+    assert set(env) == {"PATH", "HOME", "LC_ALL", "SSH_AUTH_SOCK",
+                        "SSH_ASKPASS_REQUIRE", "SSH_ASKPASS", "VW_SSH_PASS"}
+    assert env["SSH_ASKPASS_REQUIRE"] == "force"
+    assert env["VW_SSH_PASS"] == sentinel
+    assert add_call[1]["stdin"] is sp.DEVNULL
+    assert "input" not in add_call[1]
+    # askpass script removed in finally; body carried no secret while alive
+    assert not os.path.exists(env["SSH_ASKPASS"])
+    # key temp file removed too
+    assert not os.path.exists(add_call[0][1])
 
 
 # ── plugin.yaml provides_tools ───────────────────────────────────────────

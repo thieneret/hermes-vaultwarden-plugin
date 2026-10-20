@@ -5,13 +5,15 @@ dual-channel warning (log + response field) on raw direct input, strict
 owner-only file permission validation, conflicts rejected as ConfigError.
 
 Feature 2 (_generate_ssh_keypair + generate=true on store_ssh/update_ssh):
-passphrase delivered to ssh-keygen via STDIN (never -N argv), post-generation
-encryption verify aborts on an unencrypted key, single secret-generation path
+passphrase delivered to ssh-keygen via the SSH_ASKPASS mechanism (never
+stdin, never -N argv — v0.4.1 hotfix), post-generation encryption verify
+aborts on an unencrypted key, single secret-generation path
 (_generate_password -> `bw generate`), public key + fingerprint returned,
 private key/passphrase NEVER returned, rotation requires confirm=true.
 """
 import json
 import os
+import stat
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,8 +23,11 @@ from vaultwarden.auth import AuthManager, AuthState
 from vaultwarden.placeholders import PlaceholderRegistry
 from vaultwarden.tests.conftest import make_config
 from vaultwarden.tools import (
+    _ASKPASS_SCRIPT_BODY,
     _DIRECT_SECRET_WARNING,
+    _askpass_env,
     _generate_ssh_keypair,
+    _make_askpass_script,
     _resolve_secret_input,
 )
 
@@ -244,7 +249,10 @@ def _kp_run_factory(unencrypted=False, pub="ssh-ed25519 AAAAC3 public comment"):
     return fake_run
 
 
-def test_gen_keypair_passphrase_via_stdin_not_argv():
+def test_gen_keypair_passphrase_via_askpass_not_stdin_or_argv():
+    """v0.4.1: keygen passphrase via SSH_ASKPASS env; stdin is DEVNULL."""
+    import subprocess as _sp
+
     fake = _kp_run_factory()
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake):
         tmpdir, key_path, public_key, fp = _generate_ssh_keypair(
@@ -253,11 +261,16 @@ def test_gen_keypair_passphrase_via_stdin_not_argv():
         gen_cmd, gen_kw = fake.calls[0]
         dash_n = "-" + "N"  # argv passphrase flag is prohibited
         assert dash_n not in gen_cmd  # passphrase never delivered via argv
-        assert b"the-passphrase-123\nthe-passphrase-123\n" == gen_kw["input"]
-        assert gen_kw["input"] is not None               # stdin delivery
+        assert "input" not in gen_kw                 # NO stdin delivery
+        assert gen_kw["stdin"] is _sp.DEVNULL        # tty fallback impossible
+        env = gen_kw["env"]
+        assert env["SSH_ASKPASS_REQUIRE"] == "force"
+        assert env["VW_SSH_PASS"] == "the-passphrase-123"
+        # askpass script removed on the success path
+        assert not os.path.exists(env["SSH_ASKPASS"])
         assert "-yf" in " ".join(fake.calls[1][0])       # verify call made
-        import subprocess as _sp
-        assert fake.calls[1][1]["stdin"] == _sp.DEVNULL
+        assert fake.calls[1][1]["stdin"] is _sp.DEVNULL
+        assert fake.calls[2][1]["stdin"] is _sp.DEVNULL  # fingerprint too
         assert public_key == "ssh-ed25519 AAAAC3 public comment"
         assert fp == "SHA256:abc123fp"
         assert os.path.isdir(tmpdir)                     # caller owns cleanup
