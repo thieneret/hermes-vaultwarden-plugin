@@ -53,6 +53,55 @@ def _ssh_base_env(extra: dict | None = None) -> dict:
     return env
 
 
+_ASKPASS_SCRIPT_BODY = '#!/bin/sh\necho "$VW_SSH_PASS"\n'
+_ASKPASS_ENV_VAR = "VW_SSH_PASS"
+
+
+def _make_askpass_script() -> str:
+    """Create the SSH_ASKPASS helper script and return its path.
+
+    The script body contains NO secret material — it only echoes the
+    VW_SSH_PASS environment variable, which the caller sets on the
+    subprocess. Created via mkstemp (atomic, owner-only) and chmod 0700
+    so ssh-keygen/ssh-add will execute it.
+
+    Caller is responsible for os.unlink() in a finally block.
+    """
+    fd, path = tempfile.mkstemp(suffix=".sh", prefix="vw_askpass_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(_ASKPASS_SCRIPT_BODY)
+        os.chmod(path, 0o700)
+    except BaseException:
+        # never leave a half-written helper behind
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _askpass_env(passphrase: str, extra: dict | None = None) -> dict:
+    """Build the isolated subprocess env for askpass-based passphrase delivery.
+
+    Forces the SSH_ASKPASS channel (supported: OpenSSH >= 8.4; verified
+    10.0p2) so neither ssh-add nor ssh-keygen can fall back to /dev/tty.
+    The passphrase travels as an environment variable ONLY.
+
+    Returns the env dict; the caller must read ``env["SSH_ASKPASS"]`` and
+    unlink the helper script in a ``finally`` block.
+    """
+    env = {
+        "SSH_ASKPASS_REQUIRE": "force",
+        "SSH_ASKPASS": _make_askpass_script(),
+        _ASKPASS_ENV_VAR: passphrase,
+    }
+    if extra:
+        env.update({k: v for k, v in extra.items() if v})
+    return _ssh_base_env(env)
+
+
 def _generate_password(auth: AuthManager, options: dict) -> str:
     """Generate a password/passphrase via `bw generate`.
 
@@ -177,59 +226,72 @@ def _resolve_secret_input(
 def _generate_ssh_keypair(
     key_type: str, rsa_bits: int, comment: str, passphrase: str,
 ) -> tuple[str, str, str, str]:
-    """Generate an SSH keypair in a temp dir; passphrase via STDIN (never argv).
+    """Generate an SSH keypair in a temp dir; passphrase via SSH_ASKPASS.
 
-    v0.4.0 (Feature 2): returns (tmpdir, private_key_path, public_key_str,
-    fingerprint). Caller owns tmpdir cleanup (shutil.rmtree in finally) and
-    is responsible for registering `passphrase` with RedactingFilter before
-    calling and forgetting it after. The passphrase is a PARAMETER — this
-    helper never generates secrets (single generation path: the caller uses
-    _generate_password / `bw generate`).
+    ssh-keygen reads passphrases through read_passphrase(), which NEVER reads
+    stdin — with a tty present it prompts the user on /dev/tty. Delivery is
+    therefore via the SSH_ASKPASS helper (script echoes an env var; the secret
+    is never in a file or argv) with SSH_ASKPASS_REQUIRE=force, and stdin is
+    DEVNULL so a tty fallback or hang is impossible.
 
-    Safety: after generation, verify the private key is actually encrypted by
-    attempting `ssh-keygen -yf` with stdin=DEVNULL; success means UNENCRYPTED
-    (passphrase delivery failed) -> abort.
+    Returns (tmpdir, private_key_path, public_key_str, fingerprint).
+    Caller owns tmpdir cleanup and RedactingFilter register/forget for
+    `passphrase`.
+
+    Safety: after generation, `ssh-keygen -yf` with stdin=DEVNULL must FAIL.
+    Success means the key is UNENCRYPTED (the askpass channel yielded an empty
+    passphrase) -> abort; never store an unprotected key.
     """
     tmpdir = tempfile.mkdtemp(prefix="vw_sshgen_")
     os.chmod(tmpdir, 0o700)
     key_path = os.path.join(tmpdir, "key")
-    cmd = ["ssh-keygen", "-t", key_type, "-f", key_path, "-C", comment]
-    if key_type == "rsa":
-        cmd += ["-b", str(rsa_bits)]
-    stdin_data = f"{passphrase}\n{passphrase}\n".encode("utf-8")
-    proc = subprocess.run(
-        cmd, env=_ssh_base_env(), input=stdin_data,
-        capture_output=True, timeout=30,
-    )
-    if proc.returncode != 0:
-        raise errors.VaultwardenError(
-            f"ssh-keygen failed (exit {proc.returncode})",
-            suggestion="Check ssh-keygen availability and key_type.",
+    env = _askpass_env(passphrase)
+    askpass_path = env["SSH_ASKPASS"]
+    try:
+        cmd = ["ssh-keygen", "-t", key_type, "-f", key_path, "-C", comment]
+        if key_type == "rsa":
+            cmd += ["-b", str(rsa_bits)]
+        proc = subprocess.run(
+            cmd, env=env, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=30,
         )
-    # SAFETY VERIFY: an unencrypted key means stdin passphrase delivery failed.
-    verify = subprocess.run(
-        ["ssh-keygen", "-yf", key_path], env=_ssh_base_env(),
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
-    )
-    if verify.returncode == 0:
-        raise errors.VaultwardenError(
-            "ssh-keygen produced an UNENCRYPTED private key (passphrase "
-            "delivery failed); aborting to avoid storing an unprotected key.",
-            suggestion="Report this; verify ssh-keygen stdin passphrase handling.",
+        if proc.returncode != 0:
+            raise errors.VaultwardenError(
+                f"ssh-keygen failed (exit {proc.returncode})",
+                suggestion="Check ssh-keygen availability and key_type.",
+            )
+        # SAFETY VERIFY — see docstring.
+        verify = subprocess.run(
+            ["ssh-keygen", "-yf", key_path], env=_ssh_base_env(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=10,
         )
-    pub_path = key_path + ".pub"
-    with open(pub_path, "r", encoding="utf-8") as f:
-        public_key = f.read().strip()
-    fp_proc = subprocess.run(
-        ["ssh-keygen", "-lf", pub_path], env=_ssh_base_env(),
-        capture_output=True, text=True, timeout=10,
-    )
-    fingerprint = "unknown"
-    if fp_proc.returncode == 0 and fp_proc.stdout:
-        parts = fp_proc.stdout.strip().split()
-        if len(parts) >= 2:
-            fingerprint = parts[1]
-    return tmpdir, key_path, public_key, fingerprint
+        if verify.returncode == 0:
+            raise errors.VaultwardenError(
+                "ssh-keygen produced an UNENCRYPTED private key (askpass "
+                "delivery failed); aborting to avoid storing an unprotected "
+                "key.",
+                suggestion="Report this; verify SSH_ASKPASS handling.",
+            )
+        pub_path = key_path + ".pub"
+        with open(pub_path, "r", encoding="utf-8") as f:
+            public_key = f.read().strip()
+        fp_proc = subprocess.run(
+            ["ssh-keygen", "-lf", pub_path], env=_ssh_base_env(),
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=10,
+        )
+        fingerprint = "unknown"
+        if fp_proc.returncode == 0 and fp_proc.stdout:
+            parts = fp_proc.stdout.strip().split()
+            if len(parts) >= 2:
+                fingerprint = parts[1]
+        return tmpdir, key_path, public_key, fingerprint
+    finally:
+        try:
+            os.unlink(askpass_path)
+        except OSError:
+            pass
 
 
 def _item_type_name(item: dict) -> str:
@@ -883,9 +945,9 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
     the existing keypair + passphrase) that REQUIRES confirm=true, mirroring
     vaultwarden_delete_ssh. The new passphrase comes from the same
     _generate_password (`bw generate`) path; the keypair from
-    _generate_ssh_keypair (stdin passphrase delivery). Only the public key +
-    fingerprint are returned. In generate mode pass/pass_env/pass_file/file
-    are forbidden. Without generate, the passphrase is resolved via
+    _generate_ssh_keypair (SSH_ASKPASS passphrase delivery). Only the public
+    key + fingerprint are returned. In generate mode pass/pass_env/pass_file/
+    file are forbidden. Without generate, the passphrase is resolved via
     _resolve_secret_input (pass / pass_env / pass_file) with a dual-channel
     warning on raw input.
     """
@@ -1101,26 +1163,15 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
             except OSError:
                 pass
 
-            # Create askpass script: contains ONLY the echo command,
-            # no secret content. Passphrase delivered via env var.
-            fd_ap, askpass_path = tempfile.mkstemp(
-                suffix=".sh", prefix="vw_askpass_")
-            with os.fdopen(fd_ap, "w") as f:
-                f.write('#!/bin/sh\necho "$VW_SSH_PASS"\n')
-            os.chmod(askpass_path, 0o700)
-
-            # Passphrase delivery via SSH_ASKPASS mechanism.
+            # Passphrase delivery via the SSH_ASKPASS mechanism (shared
+            # single implementation: _askpass_env / _make_askpass_script).
             # The askpass script contains ONLY `echo "$VW_SSH_PASS"` —
             # no secret content in the file. The passphrase is passed
             # via environment variable to the subprocess only.
-            # VWP-08: env built via _ssh_base_env() — minimal allowlist,
+            # VWP-08: env built on _ssh_base_env() — minimal allowlist,
             # parent environment NEVER inherited.
-            env = _ssh_base_env({
-                "SSH_AUTH_SOCK": sock,
-                "SSH_ASKPASS_REQUIRE": "force",
-                "SSH_ASKPASS": askpass_path,
-                "VW_SSH_PASS": passphrase,
-            })
+            env = _askpass_env(passphrase, extra={"SSH_AUTH_SOCK": sock})
+            askpass_path = env["SSH_ASKPASS"]
             proc = subprocess.run(
                 ["ssh-add", key_path],
                 env=env,

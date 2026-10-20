@@ -1,8 +1,29 @@
 """Unit tests: tool handlers — metadata-only outputs, gating, CRUD, generation."""
 from __future__ import annotations
 
+import json
 import os
 import re
+from unittest.mock import patch
+
+import pytest
+
+from vaultwarden import errors
+from vaultwarden.auth import AuthManager
+from vaultwarden.placeholders import PlaceholderRegistry
+from vaultwarden.tests.conftest import _dict_tools as _conftest_dict_tools
+from vaultwarden.tools import _DIRECT_SECRET_WARNING, _resolve_secret_input
+
+
+def _fake_auth(write_auth_manager):
+    """Alias to the shared write-enabled fake-bw AuthManager fixture."""
+    return write_auth_manager
+
+
+def _channel_tools(auth):
+    """Handler dict (JSON-parsed) for the given auth manager."""
+    return _dict_tools(_conftest_dict_tools(auth, auth._config,
+                                            PlaceholderRegistry()))
 
 TOKEN_RE = re.compile(r"^__VW_SECRET_[0-9a-f]{12}__$")
 
@@ -206,7 +227,6 @@ def test_error_envelope_format(tools_by_name):
 def test_direct_retrieval_escape_hatch_removed(bw_cli, registry):
     """v0.3.7 (VWP-14): no code path returns a raw secret — even if the
     legacy setting key is present in the config section."""
-    from vaultwarden.auth import AuthManager
     from vaultwarden.tests.conftest import make_config
     from vaultwarden.tools import get_tools
     cfg = make_config(section={"allow_direct_secret_retrieval": True})
@@ -305,7 +325,6 @@ def test_store_generate_uses_flag_syntax(monkeypatch):
     vaultwarden_store(generate=true)."""
     import json as _json
 
-    from vaultwarden.auth import AuthManager
     from vaultwarden.placeholders import PlaceholderRegistry
     from vaultwarden.tests.conftest import make_config
     from vaultwarden.tools import get_tools
@@ -482,7 +501,6 @@ def test_list_folder_id_uses_folderid_flag(bw_cli, appdata, monkeypatch):
     """vaultwarden_list(folder_id=...) must invoke `bw list items --folderid abc`."""
     import json as _json
 
-    from vaultwarden.auth import AuthManager
     from vaultwarden.placeholders import PlaceholderRegistry
     from vaultwarden.tests.conftest import make_config
     from vaultwarden.tools import get_tools
@@ -532,7 +550,6 @@ def test_delete_permanent_with_confirm(write_tools_by_name):
 def test_search_uses_native_search_flag(bw_cli, monkeypatch):
     import json as _json
 
-    from vaultwarden.auth import AuthManager
     from vaultwarden.placeholders import PlaceholderRegistry
     from vaultwarden.tests.conftest import make_config
     from vaultwarden.tools import get_tools
@@ -599,3 +616,229 @@ def test_apply_updates_has_no_explicit_nulls():
     assert "passwordRevisionDate" not in login
     assert login["uris"][0] == {"uri": "https://example.com"}
     assert "match" not in login["uris"][0]
+
+
+# ── _resolve_secret_input: unit ────────────────────────────────────────────────────────────────
+
+def test_rsi_direct_returns_value_and_warning():
+    secret = "raw-secret-value-XYZ"
+    with patch("vaultwarden.tools.log.warning") as mock_warn:
+        val, warning = _resolve_secret_input(
+            {"password": secret}, direct_key="password",
+            env_key="password_env", file_key="password_file",
+            tool_name="vaultwarden_store")
+    assert val == secret
+    assert warning is not None
+    # dual channel: log.warning fired AND non-secret advisory returned
+    mock_warn.assert_called_once()
+    assert secret not in warning
+    assert "password_env" in warning and "password_file" in warning
+
+
+def test_rsi_env_set(monkeypatch):
+    monkeypatch.setenv("VW_TEST_PW", "from-env")
+    val, warning = _resolve_secret_input(
+        {"password_env": "VW_TEST_PW"}, direct_key="password",
+        env_key="password_env", file_key="password_file",
+        tool_name="vaultwarden_store")
+    assert val == "from-env"
+    assert warning is None
+
+
+def test_rsi_env_unset(monkeypatch):
+    monkeypatch.delenv("VW_MISSING_VAR", raising=False)
+    with pytest.raises(errors.ConfigError):
+        _resolve_secret_input(
+            {"password_env": "VW_MISSING_VAR"}, direct_key="password",
+            env_key="password_env", file_key="password_file",
+            tool_name="vaultwarden_store")
+
+
+def test_rsi_file_good_mode(tmp_path):
+    f = tmp_path / "secret.txt"
+    f.write_text("  file-secret\n")
+    f.chmod(0o600)
+    val, warning = _resolve_secret_input(
+        {"password_file": str(f)}, direct_key="password",
+        env_key="password_env", file_key="password_file",
+        tool_name="vaultwarden_store")
+    assert val == "file-secret"
+    assert warning is None
+
+
+def test_rsi_file_bad_mode_group_readable(tmp_path):
+    f = tmp_path / "secret.txt"
+    f.write_text("nope")
+    f.chmod(0o644)
+    with pytest.raises(errors.ConfigError) as exc_info:
+        _resolve_secret_input(
+            {"password_file": str(f)}, direct_key="password",
+            env_key="password_env", file_key="password_file",
+            tool_name="vaultwarden_store")
+    assert "readable only by the owner" in exc_info.value.message
+
+
+def test_rsi_file_owner_unreadable(tmp_path):
+    f = tmp_path / "secret.txt"
+    f.write_text("nope")
+    f.chmod(0o600)          # create readable, then strip owner read
+    f.chmod(0o200)
+    with pytest.raises(errors.ConfigError) as exc_info:
+        _resolve_secret_input(
+            {"password_file": str(f)}, direct_key="password",
+            env_key="password_env", file_key="password_file",
+            tool_name="vaultwarden_store")
+    assert "not readable by the owner" in exc_info.value.message
+
+
+def test_rsi_file_missing(tmp_path):
+    with pytest.raises(errors.NotFoundError):
+        _resolve_secret_input(
+            {"password_file": str(tmp_path / "nope.txt")},
+            direct_key="password", env_key="password_env",
+            file_key="password_file", tool_name="vaultwarden_store")
+
+
+def test_rsi_file_empty(tmp_path):
+    f = tmp_path / "secret.txt"
+    f.write_text("   \n")
+    f.chmod(0o600)
+    with pytest.raises(errors.ConfigError) as exc_info:
+        _resolve_secret_input(
+            {"password_file": str(f)}, direct_key="password",
+            env_key="password_env", file_key="password_file",
+            tool_name="vaultwarden_store")
+    assert "is empty" in exc_info.value.message
+
+
+def test_rsi_conflict_two_sources():
+    with pytest.raises(errors.ConfigError) as exc_info:
+        _resolve_secret_input(
+            {"password": "x", "password_env": "Y"}, direct_key="password",
+            env_key="password_env", file_key="password_file",
+            tool_name="vaultwarden_store")
+    assert "provide only ONE of" in exc_info.value.message
+
+
+def test_rsi_none_provided():
+    val, warning = _resolve_secret_input(
+        {}, direct_key="password", env_key="password_env",
+        file_key="password_file", tool_name="vaultwarden_store")
+    assert val is None and warning is None
+
+
+# ── h_store / h_update secret-input channel wiring ────────────────────────────────────────────────
+
+
+
+def test_store_password_env_resolved(write_auth_manager):
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    captured: dict = {}
+    orig_create = auth.create_item
+
+    def _create(item):
+        captured["item"] = item
+        return orig_create(item)
+    auth.create_item = _create                           # type: ignore[attr-defined]
+    with patch.dict(os.environ, {"GH_TOKEN": "gh-secret-xyz"}):
+        res = tools["vaultwarden_store"](
+            {"type": "login", "name": "env-test", "username": "u",
+             "password_env": "GH_TOKEN"})
+    assert res["created"] is True
+    assert "warning" not in res
+    assert captured["item"]["login"]["password"] == "gh-secret-xyz"
+    assert "gh-secret-xyz" not in json.dumps(res)
+
+def test_store_password_file_resolved(write_auth_manager, tmp_path):
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    captured: dict = {}
+    orig_create = auth.create_item
+
+    def _create(item):
+        captured["item"] = item
+        return orig_create(item)
+    auth.create_item = _create                           # type: ignore[attr-defined]
+    f = tmp_path / "pw.txt"
+    f.write_text("file-pw\n")
+    f.chmod(0o600)
+    res = tools["vaultwarden_store"](
+        {"type": "login", "name": "file-test", "username": "u",
+         "password_file": str(f)})
+    assert res["created"] is True
+    assert captured["item"]["login"]["password"] == "file-pw"
+
+def test_store_raw_password_response_warning(write_auth_manager):
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    with patch("vaultwarden.tools.log.warning") as mock_warn:
+        res = tools["vaultwarden_store"](
+            {"type": "login", "name": "raw-test", "username": "u",
+             "password": "x-raw-secret"})
+    mock_warn.assert_called_once()
+    assert "warning" in res
+    assert "x-raw-secret" not in json.dumps(res)
+    assert "password_env" in res["warning"]
+
+def test_store_password_conflict(write_auth_manager):
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    res = tools["vaultwarden_store"](
+        {"type": "login", "name": "c", "username": "u",
+         "password": "p", "password_env": "E"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "provide only ONE of" in res["error"]
+
+def test_store_generate_conflicts_with_password_channels(write_auth_manager):
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    for k in ("password", "password_env", "password_file"):
+        res = tools["vaultwarden_store"](
+            {"type": "login", "name": "g", "generate": True, k: "x"})
+        assert res["error_code"] == "CONFIG_ERROR", k
+        assert "generate=true conflicts" in res["error"]
+
+def test_update_generate_conflicts_with_password_channels(write_auth_manager):
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    for k in ("password", "password_env", "password_file"):
+        res = tools["vaultwarden_update"](
+            {"item_id": "i", "generate": True, k: "x"})
+        assert res["error_code"] == "CONFIG_ERROR", k
+
+def test_update_password_env_resolved(write_auth_manager):
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    captured: dict = {}
+    orig_edit = auth.edit_item
+
+    def _edit(item):
+        captured["item"] = item
+        return orig_edit(item)
+    auth.edit_item = _edit                               # type: ignore[attr-defined]
+    with patch.dict(os.environ, {"VW_UPD_PW": "upd-env-pw"}):
+        res = tools["vaultwarden_update"](
+            {"item_id": "aaaa1111-0000-0000-0000-000000000001",
+             "password_env": "VW_UPD_PW"})
+    assert res["updated"] is True
+    assert captured["item"]["login"]["password"] == "upd-env-pw"
+
+def test_update_raw_password_warning(write_auth_manager):
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    with patch("vaultwarden.tools.log.warning") as mock_warn:
+        res = tools["vaultwarden_update"](
+            {"item_id": "aaaa1111-0000-0000-0000-000000000001",
+             "password": "raw-upd-secret"})
+    mock_warn.assert_called_once()
+    assert "warning" in res
+    assert "raw-upd-secret" not in json.dumps(res)
+
+def test_direct_warning_template_has_no_value_slot():
+    # The template only interpolates parameter NAMES, never values.
+    for slot in ("{key!r}", "{tool}", "{env_key!r}", "{file_key!r}"):
+        assert slot in _DIRECT_SECRET_WARNING
+    assert "{}" not in _DIRECT_SECRET_WARNING.replace("{key!r}", "") \
+        .replace("{tool}", "").replace("{env_key!r}", "") \
+        .replace("{file_key!r}", "")

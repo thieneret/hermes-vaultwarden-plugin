@@ -31,7 +31,7 @@ Secure secrets management for Hermes Agent via Vaultwarden. Provides safe access
 | Hermes Agent | Host platform (plugin API) |
 | Bitwarden CLI (`bw`) | Vault operations (login, sync, CRUD). **Minimum version: 2026.9.1** (enforced at startup; plugin refuses to load below this) |
 | Vaultwarden server | Backend (any Bitwarden-compatible instance) |
-| OpenSSH ≥ 7.2 | SSH features (`ssh-add`, `ssh-agent`) — stdin passphrase fallback |
+| OpenSSH ≥ 8.4 | SSH features (`ssh-add`, `ssh-keygen`) — `SSH_ASKPASS_REQUIRE=force` passphrase delivery (verified: 10.0p2) |
 
 ## Installation
 
@@ -195,14 +195,14 @@ Socket resolution order for `ssh_auth_sock`:
 2. `$SSH_AUTH_SOCK` (if set)
 3. Fresh `ssh-agent` (if neither)
 
-If no agent is running on the resolved socket, one is started with `ssh-agent -a <socket>`. The passphrase is piped via stdin (never written to a temp file); the key uses an atomic temp file (`mkstemp`, `0600`) deleted in a `finally` block.
+If no agent is running on the resolved socket, one is started with `ssh-agent -a <socket>`. The passphrase is delivered via the `SSH_ASKPASS` mechanism (see Security Architecture below) — never via stdin, argv, or a file; the key uses an atomic temp file (`mkstemp`, `0600`) deleted in a `finally` block.
 
 ### SSH key generation (`generate=true`)
 
 `vaultwarden_store_ssh` and `vaultwarden_update_ssh` accept `generate=true`, which makes the plugin generate the keypair internally — the user never types a passphrase or a key file path:
 
 1. A **32-character passphrase** is generated via the same `bw generate` path used by `vaultwarden_store` / `vaultwarden_update` `generate=true` (one consistent secret-generation mechanism across the plugin).
-2. An SSH keypair is generated with `ssh-keygen` — default `ed25519`, optional `rsa` via `key_type` / `rsa_bits` (default **4096** bits). The passphrase is delivered on **stdin**, never as a command-line argument (argv would leak it to `ps`).
+2. An SSH keypair is generated with `ssh-keygen` — default `ed25519`, optional `rsa` via `key_type` / `rsa_bits` (default **4096** bits). The passphrase is delivered the same way as for `ssh-add`: via the **`SSH_ASKPASS` mechanism** (env var only — never stdin, which `ssh-keygen` does not read for passphrases, and never `-N` argv, which would leak it to `ps`).
 3. Post-generation safety verify: `ssh-keygen -yf <key>` with `stdin=DEVNULL` must FAIL — if it succeeds, the key is unencrypted and the operation aborts rather than storing an unprotected key.
 4. The private key is stored as a vault attachment and the passphrase as the item `password` field. Neither is ever returned.
 5. The response contains the **public key** and **fingerprint** (non-secret — paste the public key into `authorized_keys`).
@@ -265,7 +265,7 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | Subprocess env isolation | All `bw` calls run with a minimal, controlled environment |
 | Session key in memory only | Bitwarden session key is never written to disk |
 | RedactingFilter | All secrets registered; redacted from logs and errors |
-| SSH passphrase via stdin | Delivered through `subprocess.run(input=...)`, never a temp file |
+| SSH passphrase delivery | Via the `SSH_ASKPASS` mechanism: a temporarily generated helper script whose body is only `echo "$VW_SSH_PASS"` (no secret material) runs as the askpass program with `SSH_ASKPASS_REQUIRE=force`; the passphrase itself is passed to the subprocess **environment only** (never a file, never argv), and `stdin` is `/dev/null` so `ssh-keygen` / `ssh-add` can never prompt on a tty. Requires OpenSSH >= 8.4 (verified: 10.0p2). The helper script is removed in a `finally` block. |
 | SSH key temp file | `tempfile.mkstemp()` (atomic), `0600` perms, deleted in `finally` |
 | Fail-closed auth | Authentication failures never fall back silently |
 | bw version enforcement | `bw --version` checked at startup against a hardcoded minimum (2026.9.1); plugin refuses to load if below or unparseable — no override |
@@ -295,7 +295,9 @@ vaultwarden/
 pytest vaultwarden/tests/ -q
 ```
 
-Current suite: **285 tests**.
+Current suite: **298 tests** (functional files only — test filenames and
+markers must never embed a plugin version; enforced by
+`test_no_version_coupling.py`).
 
 ## License
 
