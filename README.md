@@ -295,7 +295,9 @@ vaultwarden/
 pytest vaultwarden/tests/ -q
 ```
 
-Current suite: **295 tests**.
+Current suite: **298 tests** (functional files only — test filenames and
+markers must never embed a plugin version; enforced by
+`test_no_version_coupling.py`).
 
 ## License
 
