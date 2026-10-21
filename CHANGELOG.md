@@ -5,6 +5,31 @@ Author: **thieneret**
 
 ---
 
+## [0.4.2] - 2026-10-22
+
+### Bugfix
+
+- **`generate=true` no longer hangs on interactive (dashboard) sessions.**
+  The post-generation safety verify `ssh-keygen -yf <key>` (run without askpass
+  to confirm the key is encrypted) fell back to a `/dev/tty` passphrase prompt
+  wherever a controlling tty exists, hanging until the 10s timeout. On headless
+  sessions (Matrix) `/dev/tty` is unavailable, so it exited non-zero and worked
+  by accident. All passphrase-handling SSH subprocesses (`ssh-keygen`
+  generate/verify/fingerprint, `ssh-add`) now run with `start_new_session=True`,
+  detaching the child from any controlling terminal so a tty fallback or hang is
+  impossible. The verify logic itself is unchanged.
+
+### Refinement
+
+- **Raw-secret response warning is now an imperative instruction.** The
+  `"warning"` field returned when a raw secret is passed directly to
+  `store`/`update`/`store_ssh`/`update_ssh` now explicitly directs the agent to
+  warn the user that direct secret input is insecure and to recommend the
+  `*_env`/`*_file` channels. Still value-free; raw input is still accepted
+  (accept-and-warn behavior unchanged).
+
+No schema, tool-count (12), or response-shape change.
+
 ## [0.4.1] - 2026-10-21
 
 ### Bugfix (v0.4.0 regression — SSH keypair generation prompted the user)
