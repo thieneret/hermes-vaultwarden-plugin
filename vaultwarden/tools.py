@@ -138,10 +138,12 @@ def _generate_password(auth: AuthManager, options: dict) -> str:
 #: secret was passed directly in the tool call. NEVER interpolates the
 #: secret value itself — only parameter names.
 _DIRECT_SECRET_WARNING = (
-    "Direct secret input detected for {key!r} in {tool}. The value enters the "
-    "LLM context and chat history, which is not secure. Prefer {env_key!r} "
-    "(an environment variable) or {file_key!r} (an owner-only file, chmod 600) "
-    "instead."
+    "AGENT INSTRUCTION: A raw secret was supplied directly via {key!r} in "
+    "{tool}. This value has entered your context window and the chat history, "
+    "which is NOT secure. You MUST warn the user about this now: tell them "
+    "direct secret input is insecure, and recommend providing it via "
+    "{env_key!r} (an environment variable) or {file_key!r} (an owner-only "
+    "file, chmod 600) instead. Do NOT repeat the secret value in your reply."
 )
 
 
@@ -234,6 +236,12 @@ def _generate_ssh_keypair(
     is never in a file or argv) with SSH_ASKPASS_REQUIRE=force, and stdin is
     DEVNULL so a tty fallback or hang is impossible.
 
+    v0.4.2: every subprocess here runs with start_new_session=True, detaching
+    the child from any controlling terminal. Without a controlling tty the
+    child cannot open /dev/tty, so ssh-keygen can NEVER fall back to an
+    interactive passphrase prompt (which hung interactive/dashboard sessions
+    until the timeout). This is defense-in-depth on top of askpass delivery.
+
     Returns (tmpdir, private_key_path, public_key_str, fingerprint).
     Caller owns tmpdir cleanup and RedactingFilter register/forget for
     `passphrase`.
@@ -254,6 +262,7 @@ def _generate_ssh_keypair(
         proc = subprocess.run(
             cmd, env=env, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=30,
+            start_new_session=True,   # detach from controlling tty
         )
         if proc.returncode != 0:
             raise errors.VaultwardenError(
@@ -261,10 +270,15 @@ def _generate_ssh_keypair(
                 suggestion="Check ssh-keygen availability and key_type.",
             )
         # SAFETY VERIFY — see docstring.
+        # v0.4.2: start_new_session=True is the critical fix here — without a
+        # controlling tty, -yf on an encrypted key fails fast instead of
+        # hanging on a /dev/tty passphrase prompt (interactive sessions).
         verify = subprocess.run(
             ["ssh-keygen", "-yf", key_path], env=_ssh_base_env(),
             stdin=subprocess.DEVNULL, capture_output=True, text=True,
             timeout=10,
+            start_new_session=True,   # detach from controlling tty: no
+                                      # /dev/tty prompt
         )
         if verify.returncode == 0:
             raise errors.VaultwardenError(
@@ -280,6 +294,7 @@ def _generate_ssh_keypair(
             ["ssh-keygen", "-lf", pub_path], env=_ssh_base_env(),
             stdin=subprocess.DEVNULL, capture_output=True, text=True,
             timeout=10,
+            start_new_session=True,   # detach from controlling tty
         )
         fingerprint = "unknown"
         if fp_proc.returncode == 0 and fp_proc.stdout:
@@ -1177,6 +1192,8 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
                 env=env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True, text=True, timeout=30,
+                start_new_session=True,   # detach from controlling tty:
+                                          # no /dev/tty passphrase prompt
             )
             if proc.returncode != 0:
                 stderr = (proc.stderr or "").strip()

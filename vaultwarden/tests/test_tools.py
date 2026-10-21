@@ -777,9 +777,16 @@ def test_store_raw_password_response_warning(write_auth_manager):
             {"type": "login", "name": "raw-test", "username": "u",
              "password": "x-raw-secret"})
     mock_warn.assert_called_once()
+    assert res["created"] is True          # raw input still ACCEPTED
     assert "warning" in res
     assert "x-raw-secret" not in json.dumps(res)
     assert "password_env" in res["warning"]
+    # v0.4.2: the response warning is an imperative instruction to the agent
+    assert "MUST warn the user" in res["warning"]
+    expected = _DIRECT_SECRET_WARNING.format(
+        key="password", tool="vaultwarden_store",
+        env_key="password_env", file_key="password_file")
+    assert res["warning"] == expected
 
 def test_store_password_conflict(write_auth_manager):
     auth = _fake_auth(write_auth_manager)
@@ -842,3 +849,18 @@ def test_direct_warning_template_has_no_value_slot():
     assert "{}" not in _DIRECT_SECRET_WARNING.replace("{key!r}", "") \
         .replace("{tool}", "").replace("{env_key!r}", "") \
         .replace("{file_key!r}", "")
+
+
+def test_direct_warning_is_imperative_and_value_free():
+    """v0.4.2: the warning is an explicit instruction for the agent to warn."""
+    formatted = _DIRECT_SECRET_WARNING.format(
+        key="password", tool="vaultwarden_store",
+        env_key="password_env", file_key="password_file")
+    # imperative directive present
+    assert "MUST warn the user" in formatted
+    assert "AGENT INSTRUCTION" in formatted
+    # recommends the safe channels
+    assert "password_env" in formatted and "password_file" in formatted
+    # value-free: no leftover interpolation slots after .format()
+    for token in ("{key", "{tool", "{env_key", "{file_key", "{}"):
+        assert token not in formatted

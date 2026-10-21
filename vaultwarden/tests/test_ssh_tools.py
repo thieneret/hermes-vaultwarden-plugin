@@ -229,6 +229,9 @@ def test_use_ssh_env_keyset_and_cleanup(monkeypatch, tmp_path):
     assert env["VW_SSH_PASS"] == sentinel
     assert add_call[1]["stdin"] is sp.DEVNULL
     assert "input" not in add_call[1]
+    # v0.4.2: passphrase-handling ssh-add detaches from the controlling tty
+    # so a /dev/tty passphrase prompt (interactive sessions) is impossible.
+    assert add_call[1].get("start_new_session") is True
     # askpass script removed in finally; body carried no secret while alive
     assert not os.path.exists(env["SSH_ASKPASS"])
     # key temp file removed too
@@ -343,6 +346,57 @@ def test_gen_keypair_passphrase_via_askpass_not_stdin_or_argv():
     finally:
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_gen_keypair_all_calls_start_new_session():
+    """v0.4.2 regression: passphrase-handling calls detach from the tty.
+
+    The -yf safety verify runs WITHOUT askpass; on an encrypted key it needs
+    the passphrase and would fall back to a /dev/tty prompt wherever a
+    controlling tty exists (dashboard sessions hung until the 10s timeout).
+    All three subprocess.run calls in _generate_ssh_keypair (generate, -yf
+    verify, -lf fingerprint) must pass start_new_session=True so the child
+    has no controlling terminal and can never prompt or hang. The verify
+    LOGIC stays unchanged: rc==0 -> unencrypted -> abort; rc!=0 -> proceed.
+    """
+    fake = _kp_run_factory()
+    with patch("vaultwarden.tools.subprocess.run", side_effect=fake):
+        tmpdir, _, _, _ = _generate_ssh_keypair(
+            "ed25519", 4096, "comment", "pp1234")
+    try:
+        assert len(fake.calls) == 3
+        for cmd, kw in fake.calls:
+            assert kw.get("start_new_session") is True, \
+                f"missing start_new_session on {cmd[:2]}"
+        # critical fix lives on the -yf verify call specifically
+        verify_kw = next(kw for cmd, kw in fake.calls if cmd[:2] ==
+                         ["ssh-keygen", "-yf"])
+        assert verify_kw["start_new_session"] is True
+        assert "input" not in verify_kw              # no stdin delivery
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_gen_keypair_verify_rc_nonzero_proceeds_rc_zero_aborts():
+    """v0.4.2: verify logic unchanged — rc!=0 proceeds, rc==0 aborts."""
+    # Encrypted key: -yf fails (rc=1) -> flow proceeds normally.
+    fake_ok = _kp_run_factory(unencrypted=False)
+    with patch("vaultwarden.tools.subprocess.run", side_effect=fake_ok):
+        tmpdir, _, public_key, fp = _generate_ssh_keypair(
+            "ed25519", 4096, "c", "pp1234")
+    try:
+        assert public_key and fp == "SHA256:abc123fp"
+    finally:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # Unencrypted key: -yf succeeds (rc=0) -> abort, never store.
+    fake_bad = _kp_run_factory(unencrypted=True)
+    with patch("vaultwarden.tools.subprocess.run", side_effect=fake_bad):
+        with pytest.raises(errors.VaultwardenError) as exc_info:
+            _generate_ssh_keypair("ed25519", 4096, "c", "pp1234")
+    assert "UNENCRYPTED" in exc_info.value.message
 
 
 def test_gen_keypair_rsa_adds_bits_default_4096():
@@ -758,10 +812,12 @@ def test_store_ssh_upload_raw_pass_dual_warning(tmp_path):
             {"name": "SSH - Up", "user": "deploy", "file": str(key),
              "pass": "raw-pass-123"})
     mock_warn.assert_called_once()
+    assert res["created"] is True          # raw input still ACCEPTED
     assert "warning" in res
     assert "raw-pass-123" not in json.dumps(res)
     assert "pass_env" in res["warning"] and "pass_file" in res["warning"]
-    assert res["created"] is True
+    # v0.4.2: imperative instruction to the agent; response shape unchanged
+    assert "MUST warn the user" in res["warning"]
 
 
 def test_store_ssh_upload_pass_env(tmp_path, monkeypatch):
