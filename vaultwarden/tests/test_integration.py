@@ -7,6 +7,8 @@ import logging
 import re
 import threading
 
+import pytest
+
 import vaultwarden
 from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
 
@@ -401,3 +403,46 @@ def test_plugin_yaml_version_matches_pyproject():
     assert plugin_version.group(1) == pyproject_version.group(1), (
         f"Version mismatch: plugin.yaml={plugin_version.group(1)}, "
         f"pyproject.toml={pyproject_version.group(1)}")
+
+
+# ---------------------------------------------------------------------------
+# VWP-03 (v0.4.3): middleware registration is FAIL-CLOSED
+# ---------------------------------------------------------------------------
+
+
+def test_register_raises_when_middleware_registration_fails(monkeypatch, tmp_path, fake_bw):
+    """If ctx.register_middleware raises, register() must propagate the
+    exception — the plugin MUST NOT load without placeholder injection."""
+    ok, _ = _register_ok(monkeypatch, tmp_path, fake_bw)   # sanity: works normally
+    assert ok is True
+
+    def _boom(kind, fn):
+        raise RuntimeError("Hermes API mismatch")
+
+    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
+    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
+    monkeypatch.setenv("BW_CLI_PATH", fake_bw)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
+    ctx.register_middleware = _boom
+    with pytest.raises(RuntimeError, match="Hermes API mismatch"):
+        vaultwarden.register(ctx)
+
+
+def test_register_raises_when_middleware_registration_returns_false(monkeypatch, tmp_path, fake_bw):
+    """A False return (instead of an exception) must also abort loading."""
+    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
+    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
+    monkeypatch.setenv("BW_CLI_PATH", fake_bw)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
+    ctx.register_middleware = lambda kind, fn: False
+    with pytest.raises(RuntimeError, match="fail-closed"):
+        vaultwarden.register(ctx)
+
+
+def test_register_succeeds_when_middleware_registration_works(monkeypatch, tmp_path, fake_bw):
+    """Happy path: successful registration loads the plugin with middleware."""
+    ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
+    assert ok is True
+    assert [k for k, _ in ctx.middleware] == ["tool_request"]

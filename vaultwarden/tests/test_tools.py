@@ -11,8 +11,13 @@ import pytest
 from vaultwarden import errors
 from vaultwarden.auth import AuthManager
 from vaultwarden.placeholders import PlaceholderRegistry
-from vaultwarden.tests.conftest import _dict_tools as _conftest_dict_tools
-from vaultwarden.tools import _DIRECT_SECRET_WARNING, _resolve_secret_input
+from vaultwarden.tests.conftest import (
+    _dict_tools as _conftest_dict_tools,
+)
+from vaultwarden.tests.conftest import (
+    make_config as _conftest_make_config,
+)
+from vaultwarden.tools import _DIRECT_SECRET_WARNING, _metadata, _resolve_secret_input
 
 
 def _fake_auth(write_auth_manager):
@@ -864,3 +869,94 @@ def test_direct_warning_is_imperative_and_value_free():
     # value-free: no leftover interpolation slots after .format()
     for token in ("{key", "{tool", "{env_key", "{file_key", "{}"):
         assert token not in formatted
+
+
+# ---------------------------------------------------------------------
+# VWP-13 (v0.4.3): opt-in metadata masking for list/search responses
+# ---------------------------------------------------------------------
+
+_MASK_ITEM = {
+    "id": "x",
+    "name": "Test",
+    "type": 1,
+    "folderId": "f1",
+    "login": {"username": "secret_user",
+              "uris": [{"uri": "http://internal.local"}]},
+}
+
+
+def test_metadata_mask_true_masks_username_uris_not_name():
+    """_metadata(item, mask=True) -> username/uris '***', name never masked."""
+    masked = _metadata(_MASK_ITEM, mask=True)
+    assert masked["username"] == "***"
+    assert masked["uris"] == ["***"]
+    assert masked["name"] == "Test"          # primary identifier: NEVER masked
+    assert masked["id"] == "x"               # id/type/folder_id never masked
+    assert masked["type"] == "login"
+    assert masked["folder_id"] == "f1"
+
+
+def test_metadata_mask_false_returns_full_values():
+    unmasked = _metadata(_MASK_ITEM, mask=False)
+    assert unmasked["username"] == "secret_user"
+    assert unmasked["uris"] == ["http://internal.local"]
+    assert unmasked["name"] == "Test"
+
+
+def test_metadata_no_mask_arg_defaults_to_unmasked():
+    """Backward compat: _metadata(item) behaves exactly like mask=False."""
+    assert _metadata(_MASK_ITEM) == _metadata(_MASK_ITEM, mask=False)
+
+
+def test_metadata_mask_never_leaks_secret_fields():
+    blob = str(_metadata(_MASK_ITEM, mask=True))
+    assert "sup3r" not in blob and "password" not in _metadata(_MASK_ITEM, mask=True)
+
+
+def _masked_auth(bw_cli, registry, masking: bool) -> AuthManager:
+    cfg = _conftest_make_config(section={"metadata_masking": masking})
+    mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret",
+                      master_password="mp-secret")
+    mgr.ensure_authenticated()
+    return mgr
+
+
+def test_list_masking_enabled_masks_username_uris(bw_cli, registry):
+    auth = _masked_auth(bw_cli, registry, True)
+    tools = _dict_tools(_conftest_dict_tools(auth, auth._config, registry))
+    res = tools["vaultwarden_list"]({})
+    pg = next(i for i in res["items"] if i["name"] == "Postgres prod")
+    assert pg["username"] == "***"
+    assert pg["uris"] == ["***"]
+    assert pg["name"] == "Postgres prod"     # name NEVER masked
+    assert pg["id"].startswith("aaaa")
+
+
+def test_list_masking_default_off_returns_full_metadata(bw_cli, registry):
+    auth = _masked_auth(bw_cli, registry, False)
+    tools = _dict_tools(_conftest_dict_tools(auth, auth._config, registry))
+    res = tools["vaultwarden_list"]({})
+    pg = next(i for i in res["items"] if i["name"] == "Postgres prod")
+    assert pg["username"] == "dbadmin"
+    assert pg["uris"] == ["postgres://db.internal:5432"]
+
+
+def test_search_masking_enabled(bw_cli, registry):
+    auth = _masked_auth(bw_cli, registry, True)
+    tools = _dict_tools(_conftest_dict_tools(auth, auth._config, registry))
+    res = tools["vaultwarden_search"]({"query": "grafana"})
+    assert res["count"] >= 1
+    m = res["matches"][0]
+    assert m["name"] == "Grafana"            # name never masked
+    assert m["username"] == "***"
+    assert m["uris"] == ["***"]
+
+
+def test_get_secret_ref_not_affected_by_masking(bw_cli, registry):
+    """VWP-13 scope: masking applies ONLY to list/search, not other tools."""
+    auth = _masked_auth(bw_cli, registry, True)
+    tools = _dict_tools(_conftest_dict_tools(auth, auth._config, registry))
+    res = tools["vaultwarden_get_secret_ref"](
+        {"item_id": "Postgres prod", "field": "password"})
+    assert TOKEN_RE.match(res["placeholder"])
+    assert "sup3r-s3cret-pg!" not in str(res)

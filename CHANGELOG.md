@@ -5,6 +5,37 @@ Author: **thieneret**
 
 ---
 
+## [0.4.3] - 2026-10-22
+
+### Security (audit findings VWP-13, VWP-03)
+
+- **VWP-03 (HIGH): Middleware fail-closed.** If the placeholder-injection
+  middleware fails to register, the plugin now refuses to load (propagates
+  the exception from `register()`). Previously it logged a warning and
+  continued without placeholder injection, which could expose raw secrets
+  in terminal commands. This is consistent with the existing fail-closed
+  bw version check and fail-closed auth.
+- **VWP-13 (MEDIUM): Metadata masking (opt-in).** New `metadata_masking`
+  config option (default `false`). When enabled, `vaultwarden_list` and
+  `vaultwarden_search` mask `username` and `uris` with `***`. `name`,
+  `id`, `type`, `folder_id` are never masked. Default OFF preserves the
+  current search/list usability.
+
+### New Config Options
+
+| Option | Default | Purpose |
+|---|---|---|
+| `metadata_masking` | `false` | Mask `username`/`uris` in list/search responses |
+
+### Documentation
+
+- **README.md:** metadata masking + middleware fail-closed documented in
+  Key settings and Security Architecture.
+- **SECURITY.md:** Two new primary controls, two new threat vectors,
+  development rules updated.
+
+No tool count change (12 tools). No breaking change to tool API.
+
 ## [0.4.2] - 2026-10-22
 
 ### Bugfix

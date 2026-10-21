@@ -317,3 +317,26 @@ class TestRetryBackoffConfig:
         assert "allow_untested_bw_version" not in _DEFAULTS
         assert not hasattr(PluginConfig, "min_bw_version")
         assert not hasattr(PluginConfig, "allow_untested_bw_version")
+
+
+class TestMetadataMaskingConfig:
+    """VWP-13 (v0.4.3): metadata_masking config option."""
+
+    def test_default_is_false(self):
+        from vaultwarden.tests.conftest import make_config
+        assert make_config().metadata_masking is False
+
+    def test_parses_true(self):
+        from vaultwarden.tests.conftest import make_config
+        cfg = make_config(section={"metadata_masking": True})
+        assert cfg.metadata_masking is True
+
+    def test_parses_string_true_false(self):
+        from vaultwarden.tests.conftest import make_config
+        assert make_config(section={"metadata_masking": "true"}).metadata_masking is True
+        assert make_config(section={"metadata_masking": "false"}).metadata_masking is False
+
+    def test_in_defaults_registry(self):
+        from vaultwarden.config import _DEFAULTS
+        assert "metadata_masking" in _DEFAULTS
+        assert _DEFAULTS["metadata_masking"] is False
