@@ -609,7 +609,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                     item_id = created.get("id") or ""
                     entry = registry.create(item_id, "password")
                     result["password_generated"] = True
-                    result["password_placeholder"] = entry.token
+                    result["password_placeholder"] = f"${entry.token}"
                     result["placeholder_ttl_seconds"] = registry.ttl_seconds
 
                 if pw_warning:
@@ -693,7 +693,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 if generated_pw is not None:
                     entry = registry.create(item_id, "password")
                     result["password_generated"] = True
-                    result["password_placeholder"] = entry.token
+                    result["password_placeholder"] = f"${entry.token}"
                     result["placeholder_ttl_seconds"] = registry.ttl_seconds
 
                 if pw_warning:

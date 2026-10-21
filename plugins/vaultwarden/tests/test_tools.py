@@ -179,7 +179,9 @@ def test_store_generate_true(write_tools_by_name, appdata, registry):
         "generate": True, "generate_options": {"length": 24}})
     assert res["created"] is True and res["id"] == "new-item-id-0001"
     assert res["password_generated"] is True
-    assert TOKEN_RE.match(res["password_placeholder"])
+    # VWP-04 (v0.4.4): user-facing placeholder carries a '$' prefix.
+    assert res["password_placeholder"].startswith("$")
+    assert TOKEN_RE.match(res["password_placeholder"][1:])
     assert res["placeholder_ttl_seconds"] == 300
     # The raw generated password must NEVER appear in the response...
     blob = _json.dumps(res)
@@ -189,10 +191,11 @@ def test_store_generate_true(write_tools_by_name, appdata, registry):
     with open(appdata / "fake_items.json") as f:
         stored = _json.load(f)["new-item-id-0001"]
     assert stored["login"]["password"] == FAKE_GEN_PW
-    # Placeholder registered for later command-time injection.
+    # Placeholder registered for later command-time injection (registry form:
+    # no '$' prefix — VWP-04 adds the prefix only to the user-facing string).
     snap = registry.snapshot()
-    assert res["password_placeholder"] in snap
-    assert snap[res["password_placeholder"]]["field"] == "password"
+    assert res["password_placeholder"].lstrip("$") in snap
+    assert snap[res["password_placeholder"].lstrip("$")]["field"] == "password"
 
 
 def test_update_generate_true(write_tools_by_name, appdata, registry):
@@ -208,7 +211,9 @@ def test_update_generate_true(write_tools_by_name, appdata, registry):
         "generate_options": {"mode": "passphrase", "words": 4, "separator": "-"}})
     assert upd["updated"] is True
     assert upd["password_generated"] is True
-    assert TOKEN_RE.match(upd["password_placeholder"])
+    # VWP-04 (v0.4.4): '$'-prefixed user-facing placeholder.
+    assert upd["password_placeholder"].startswith("$")
+    assert TOKEN_RE.match(upd["password_placeholder"][1:])
     assert upd["placeholder_ttl_seconds"] == 300
     blob = _json.dumps(upd)
     assert FAKE_GEN_PW not in blob      # raw value never returned
@@ -217,7 +222,7 @@ def test_update_generate_true(write_tools_by_name, appdata, registry):
         stored = _json.load(f)["new-item-id-0001"]
     assert stored["login"]["password"] == FAKE_GEN_PW
     snap = registry.snapshot()
-    assert snap[upd["password_placeholder"]]["field"] == "password"
+    assert snap[upd["password_placeholder"].lstrip("$")]["field"] == "password"
 
 
 def test_store_without_generate_has_no_placeholder_fields(write_tools_by_name):
