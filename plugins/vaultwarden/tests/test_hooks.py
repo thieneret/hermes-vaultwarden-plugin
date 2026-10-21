@@ -158,6 +158,8 @@ def test_secret_registered_with_redacting_filter(mw, registry):
 # ------------------------------------------------------------- post hook
 def test_post_hook_redacts_secret_from_output(mw, post, registry):
     ref, _sfx = ref_for(registry)
+    # NOTE: task_id must MATCH between middleware and post hook — the
+    # per-task injected-secret store is keyed by it (v0.1.4 FAIL-6).
     mw("terminal", {"command": f"echo \"{ref}\""}, task_id="x")
     leaked = {"output": "Zs: sup3r-s3cret-pg! done"}
     post("terminal", {}, leaked, task_id="x")

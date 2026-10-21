@@ -12,7 +12,8 @@ import pytest
 import vaultwarden
 from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
 
-TOKEN_RE = re.compile(r"__VW_SECRET_[0-9a-f]{12}__")
+# VWP-04: user-facing placeholder references carry a '$' prefix.
+TOKEN_RE = re.compile(r"\$__VW_SECRET_[0-9a-f]{12}__")
 
 
 def _dict_tools(raw):
@@ -133,8 +134,6 @@ def test_placeholder_e2e_llm_style_flow(monkeypatch, tmp_path, fake_bw):
     # the stale reference stays untouched (expands to empty at shell level).
     again = mw("terminal", {"command": f"echo \"{token}\""})
     assert again is None
-    pending = [e for errs in _PENDING_ERRORS_FOR_TEST.values() for e in errs] \
-        if False else None  # noqa: placeholder — errors checked below
     from vaultwarden.hooks import _PENDING_ERRORS as _PE
     assert any(e["error_code"] == "PLACEHOLDER_ERROR"
                for errs in _PE.values() for e in errs)
@@ -404,9 +403,15 @@ def test_plugin_yaml_version_matches_pyproject():
     plugin_version = re.search(r"^version:\s*([^\s]+)", plugin_content, re.M)
     assert plugin_version, "version: field not found in plugin.yaml"
 
-    # Find pyproject.toml
-    pyproject = pkg_dir.parent / "pyproject.toml"
-    assert pyproject.exists(), f"pyproject.toml not found at {pyproject}"
+    # Find pyproject.toml (repo root: plugins/vaultwarden/ -> plugins/ -> root;
+    # legacy layout: vaultwarden/ -> repo root)
+    pyproject = None
+    for parent in pkg_dir.parents:
+        candidate = parent / "pyproject.toml"
+        if candidate.exists():
+            pyproject = candidate
+            break
+    assert pyproject is not None, "pyproject.toml not found in any parent dir"
     pyproject_content = pyproject.read_text(encoding="utf-8")
     pyproject_version = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_content, re.M)
     assert pyproject_version, "version field not found in pyproject.toml"
