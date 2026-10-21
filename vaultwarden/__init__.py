@@ -154,11 +154,22 @@ def register(ctx: Any) -> bool:
     log.info("Registered %d vaultwarden_* tools.", registered)
 
     # middleware + hooks (chain-safe resolver is NOT pre_tool_call)
-    try:
-        ctx.register_middleware("tool_request", make_placeholder_resolver(auth, registry, config))
-        log.info("Placeholder resolver middleware registered")
-    except AttributeError:
-        log.warning("Context lacks register_middleware; placeholder injection OFF.")
+    # VWP-03 (v0.4.3): FAIL-CLOSED. If the placeholder-injection middleware
+    # cannot be registered, the plugin MUST NOT load — operating without it
+    # would leave placeholder tokens unresolved in terminal commands and
+    # expose raw secrets. Any exception from register_middleware propagates
+    # out of register(); do NOT wrap this call in a swallowing try/except.
+    log.info("vaultwarden: registering placeholder-injection middleware (fail-closed)")
+    result = ctx.register_middleware(
+        "tool_request", make_placeholder_resolver(auth, registry, config))
+    if result is False:
+        # Some contexts signal failure with a False return instead of raising.
+        raise RuntimeError(
+            "vaultwarden plugin: middleware registration failed. "
+            "Refusing to load without placeholder injection (fail-closed). "
+            "Check Hermes plugin API compatibility."
+        )
+    log.info("Placeholder resolver middleware registered")
     try:
         ctx.register_hook("post_tool_call", make_post_cleanup_hook(auth, registry, config))
         ctx.register_hook("on_session_end", make_session_end_hook(auth, registry))

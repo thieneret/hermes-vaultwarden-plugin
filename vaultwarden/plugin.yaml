@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 0.4.2
+version: 0.4.3
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key
@@ -111,3 +111,12 @@ config:
     description: >-
       Argument keys scanned for the command string in terminal tools.
       Empty list uses built-in defaults (command, cmd, input, script, code).
+  # VWP-13 (v0.4.3): opt-in metadata masking for list/search responses.
+  metadata_masking:
+    type: boolean
+    default: false
+    description: >-
+      When true, vaultwarden_list and vaultwarden_search mask 'username'
+      and 'uris' with '***'. 'name', 'id', 'type', 'folder_id' are never
+      masked (needed for item identification). Default OFF preserves
+      search/list usability.

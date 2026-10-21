@@ -62,6 +62,8 @@ _DEFAULTS: dict[str, Any] = {
     "bw_max_delay": 10.0,
     "terminal_tool_names": [],
     "terminal_command_keys": [],
+    # VWP-13 (v0.4.3): metadata masking for list/search responses (opt-in).
+    "metadata_masking": False,
 }
 
 
@@ -193,6 +195,12 @@ class PluginConfig:
     @property
     def allow_startup_secret_injection(self) -> bool:
         return _as_bool(self._raw("allow_startup_secret_injection"))
+
+    # VWP-13 (v0.4.3): when True, vaultwarden_list / vaultwarden_search mask
+    # `username` and `uris` with "***". Default OFF preserves usability.
+    @property
+    def metadata_masking(self) -> bool:
+        return _as_bool(self._raw("metadata_masking"))
 
     # v0.3.7 (VWP-14): allow_direct_secret_retrieval property removed —
     # direct secret retrieval no longer exists anywhere in the plugin.
