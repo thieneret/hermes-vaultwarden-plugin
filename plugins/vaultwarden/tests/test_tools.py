@@ -31,6 +31,8 @@ def _channel_tools(auth):
                                             PlaceholderRegistry()))
 
 TOKEN_RE = re.compile(r"^__VW_SECRET_[0-9a-f]{12}__$")
+# VWP-04 (v0.4.4): user-facing placeholder references are '$'-prefixed.
+PLACEHOLDER_REF_RE = re.compile(r"^\$__VW_SECRET_[0-9a-f]{12}__$")
 
 
 def _dict_tools(raw):
@@ -94,7 +96,10 @@ def test_search_tool(tools_by_name):
 def test_get_secret_ref_returns_placeholder_not_secret(tools_by_name, registry):
     res = tools_by_name["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    assert TOKEN_RE.match(res["placeholder"])
+    # VWP-04 (v0.4.4): user-facing placeholder carries a '$' prefix...
+    assert PLACEHOLDER_REF_RE.match(res["placeholder"])
+    # ...while the registry itself keeps the bare token form.
+    assert TOKEN_RE.match(res["placeholder"][1:])
     assert res["ttl_seconds"] == 300
     assert "sup3r-s3cret-pg!" not in str(res)
     # v0.3.7 (VWP-14): direct retrieval escape hatch removed — a raw value
@@ -107,8 +112,8 @@ def test_get_secret_ref_custom_field(tools_by_name, registry):
     res = tools_by_name["vaultwarden_get_secret_ref"](
         {"item_id": "aaaa1111-0000-0000-0000-000000000001",
          "field": "password", "custom_field_name": "api_key"})
-    assert TOKEN_RE.match(res["placeholder"])
-    snap = registry.snapshot()[res["placeholder"]]
+    assert PLACEHOLDER_REF_RE.match(res["placeholder"])
+    snap = registry.snapshot()[res["placeholder"][1:]]   # registry form: no $
     assert snap["field"] == "custom:api_key"   # resolved via custom field
     assert "custom-key-value" not in str(res)  # value never returned
 
@@ -243,7 +248,7 @@ def test_direct_retrieval_escape_hatch_removed(bw_cli, registry):
     tools = _dict_tools({s["name"]: h for s, h in get_tools(mgr, cfg, registry)})
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    assert TOKEN_RE.match(res["placeholder"])
+    assert PLACEHOLDER_REF_RE.match(res["placeholder"])   # VWP-04: $-prefixed
     assert "direct_value" not in res
     assert "sup3r-s3cret-pg!" not in str(res)
 
@@ -958,5 +963,5 @@ def test_get_secret_ref_not_affected_by_masking(bw_cli, registry):
     tools = _dict_tools(_conftest_dict_tools(auth, auth._config, registry))
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    assert TOKEN_RE.match(res["placeholder"])
+    assert PLACEHOLDER_REF_RE.match(res["placeholder"])   # VWP-04: $-prefixed
     assert "sup3r-s3cret-pg!" not in str(res)

@@ -522,10 +522,16 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             entry = registry.create(item.get("id") or item_id,
                                     f"custom:{custom}" if custom else field_name)
             result: dict[str, Any] = {
-                "placeholder": entry.token,
+                # VWP-04 (v0.4.4): user-facing placeholder carries a '$' prefix
+                # so the agent inserts it as a shell variable reference; the
+                # registry itself still stores the bare '__VW_SECRET_x__' token.
+                "placeholder": f"${entry.token}",
                 "ttl_seconds": registry.ttl_seconds,
-                "usage": ("Insert this exact token into a terminal command; it is "
-                          "replaced with the real value at execution time (single use)."),
+                "usage": ("Insert this exact placeholder into a terminal command "
+                          "INSIDE DOUBLE QUOTES (or unquoted) — never single quotes, "
+                          "which prevent shell expansion. The middleware injects the "
+                          "real value into the command's env at execution time and "
+                          "rewrites the reference to $VW_TOKEN_x (single use)."),
             }
             # VWP-14 (v0.3.7): the allow_direct_secret_retrieval escape hatch
             # was removed — `value` stays in local memory only and NEVER

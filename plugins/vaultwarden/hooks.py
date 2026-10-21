@@ -1,39 +1,65 @@
-"""Terminal hook handlers (plan §7): chain-safe `tool_request` middleware +
+"""Terminal hook handlers (plan §7): env-injecting `tool_request` middleware +
 `post_tool_call` cleanup/redaction.
 
+VWP-04 (v0.4.4) — BREAKING CHANGE, env injection instead of string rewrite:
+the middleware no longer substitutes the raw secret into the command string.
+User-facing placeholders are written ``$__VW_SECRET_<12 hex>__`` inside
+DOUBLE-QUOTED (or unquoted) command strings so the shell expands them. The
+middleware resolves each placeholder via the single-use registry and:
+
+- injects the real secret into the terminal tool's ``env`` parameter as
+  ``VW_TOKEN_<suffix>`` (env dict ONLY — never the command string), and
+- rewrites the reference ``$__VW_SECRET_<suffix>__`` -> ``$VW_TOKEN_<suffix>``.
+
+The shell then expands ``$VW_TOKEN_<suffix>`` at execution time, so the raw
+secret never appears in the command string, argv, shell history or ``ps``
+output. Single quotes PREVENT shell expansion and therefore break injection —
+documented in the skill, README and SECURITY.md.
+
 Middleware chain safety rules (CRITICAL):
-- return None when the tool is not "terminal";
-- return None when the command contains NO "__VW_SECRET_" substring;
+- only act on terminal-ish tools; every other tool's args pass through
+  UNCHANGED (return the original object untouched);
+- do nothing when the scanned arg keys contain NO "$__VW_SECRET_" substring;
 - only return modified args when placeholders were found AND resolved;
 - never modify args unless an actual change was made.
 
-Resolution failures are FAIL-CLOSED: the placeholder token is replaced with a
-safe invalid sentinel so the raw secret can never reach the shell, and the
-error is recorded for post_tool_call to surface to the agent (never an empty
-string silently injected).
+Resolution failures stay FAIL-CLOSED: an unknown/expired/already-used
+placeholder is left EXACTLY as-is in the command (a dangling ``$__VW_...``
+reference expands to an empty string at shell level, so no raw secret can
+ever reach the shell), and the error is recorded for post_tool_call to
+surface to the agent (never an empty string silently injected).
 """
 from __future__ import annotations
 
+import re
 import threading
 from collections.abc import MutableMapping
 from typing import Any, Callable
 
 from . import errors
 from .auth import AuthManager
-from .placeholders import PlaceholderRegistry
-from .security import (
-    escape_for_context,
-    get_logger,
-    get_redacting_filter,
-    looks_like_url_context,
-    placeholder_tokens,
-    url_escape,
-)
+from .placeholders import TOKEN_PREFIX, TOKEN_SUFFIX, PlaceholderRegistry
+from .security import get_logger, get_redacting_filter
 from .tools import _field_value
 
 log = get_logger("hooks")
 
-INVALID_SENTINEL = "__VW_PLACEHOLDER_INVALID__"
+# Placeholder as it appears in a command string: $__VW_SECRET_<token>__
+_VW_SECRET_CMD_RE = re.compile(r"\$__VW_SECRET_([0-9a-f]{12})__")
+
+
+def _env_var_for(token_suffix: str) -> str:
+    """Map a placeholder token suffix to a valid shell env var name.
+
+    e.g. 'a1b2c3d4e5f6' -> 'VW_TOKEN_a1b2c3d4e5f6'
+    """
+    return f"VW_TOKEN_{token_suffix}"
+
+
+def _registry_token(token_suffix: str) -> str:
+    """Rebuild the registry-form token '__VW_SECRET_<suffix>__' (no $)."""
+    return f"{TOKEN_PREFIX}{token_suffix}{TOKEN_SUFFIX}"
+
 
 # terminal-ish arg keys we scan across backends (Local/Docker/SSH/Modal/
 # Daytona/Singularity/Vercel Sandbox all pass the command string here).
@@ -46,15 +72,21 @@ _DEFAULT_TERMINAL_TOOLS = {
 _DEFAULT_COMMAND_KEYS = ("command", "cmd", "input", "script", "code")
 
 
-def _resolve_one(token: str, command: str, auth: AuthManager,
-                 registry: PlaceholderRegistry,
-                 task_id: str = "") -> tuple[str, dict | None]:
-    """Return (replacement, error_dict|None). Replacement is context-escaped."""
+def _resolve_one_env(suffix: str, auth: AuthManager,
+                     registry: PlaceholderRegistry,
+                     task_id: str = "") -> tuple[str | None, dict | None]:
+    """Consume one placeholder; return (secret_value, error_dict|None).
+
+    Fail-closed: unknown/expired/already-used tokens (or vault fetch errors)
+    yield ``(None, error)`` — the caller leaves the reference untouched, so a
+    stale or forged placeholder can NEVER cause a secret to be injected.
+    """
+    token = _registry_token(suffix)
     try:
         entry = registry.consume(token)
     except errors.PlaceholderError as exc:
         log.warning("Placeholder %s: %s", token, exc.message)
-        return INVALID_SENTINEL, exc.to_dict()
+        return None, exc.to_dict()
     try:
         item = auth.get_item(entry.item_id)
         if entry.field_name.startswith("custom:"):
@@ -66,37 +98,24 @@ def _resolve_one(token: str, command: str, auth: AuthManager,
                 f"Referenced field '{entry.field_name}' is now empty.")
     except errors.VaultwardenError as exc:
         log.error("Secret fetch failed for %s (%s)", token, exc.code)
-        return INVALID_SENTINEL, exc.to_dict()
+        return None, exc.to_dict()
     # Register the value so it gets scrubbed from any log line / output echo.
     get_redacting_filter().register_secret(value)
     # v0.1.4 (FAIL-6): also record the plaintext per-task so post_tool_call can
     # redact it from this specific tool call's output even when the global
     # filter state was reset by another component in between.
     record_task_secret(task_id, value)
-    if looks_like_url_context(command, token):
-        escaped = url_escape(value)
-    else:
-        escaped = escape_for_context(value, command, token)
-    return escaped, None
-
-
-def resolve_all_placeholders(command: str, auth: AuthManager,
-                             registry: PlaceholderRegistry,
-                             task_id: str = "") -> tuple[str, list[dict]]:
-    """Replace every token in *command*; returns (new_command, errors)."""
-    errors_out: list[dict] = []
-    for token in placeholder_tokens(command):
-        replacement, err = _resolve_one(token, command, auth, registry, task_id)
-        if err:
-            errors_out.append(err)
-        command = command.replace(token, replacement)
-    return command, errors_out
+    return value, None
 
 
 def make_placeholder_resolver(auth: AuthManager,
                               registry: PlaceholderRegistry,
                               config: Any = None) -> Callable[..., Any]:
-    """Build the `tool_request` middleware callback for ctx.register_middleware."""
+    """Build the `tool_request` middleware callback for ctx.register_middleware.
+
+    VWP-04: env-injection variant — secrets go into the terminal tool's
+    ``env`` argument; the command only gains a ``$VW_TOKEN_x`` reference.
+    """
 
     terminal_tools = set(getattr(config, "terminal_tool_names", None) or _DEFAULT_TERMINAL_TOOLS)
     command_keys = tuple(getattr(config, "terminal_command_keys", None) or _DEFAULT_COMMAND_KEYS)
@@ -110,31 +129,41 @@ def make_placeholder_resolver(auth: AuthManager,
         if not isinstance(args, dict):
             return None
         key = next((k for k in command_keys
-                    if isinstance(args.get(k), str) and "__VW_SECRET_" in args[k]), None)
+                    if isinstance(args.get(k), str) and "$__VW_SECRET_" in args[k]), None)
         if key is None:
             return None  # nothing to do — DO NOT touch other plugins' args
-        command = args[key]
-        modified, errs = resolve_all_placeholders(command, auth, registry, task_id)
-        if errs:
-            # stash for post_tool_call surfacing; fail-closed sentinel already applied
-            # v0.2.2 (BUGFIX): task-scoped + lock-protected store so parallel
-            # tool calls cannot clear each other's pending errors.
-            with _PENDING_LOCK:
-                _PENDING_ERRORS.setdefault(task_id or "", []).extend(errs)
-        if modified != command:
-            new_args = {**args, key: modified}
-            for extra_key in command_keys:
-                if extra_key != key and isinstance(args.get(extra_key), str) \
-                        and "__VW_SECRET_" in args[extra_key]:
-                    new_val, more = resolve_all_placeholders(
-                        args[extra_key], auth, registry, task_id)
+
+        env = dict(args.get("env") or {})
+        changed = dict(args)
+        resolved_count = 0
+
+        for cmd_key in command_keys:
+            command = changed.get(cmd_key)
+            if not isinstance(command, str) or "$__VW_SECRET_" not in command:
+                continue
+            new_command = command
+            for m in _VW_SECRET_CMD_RE.finditer(command):
+                suffix = m.group(1)
+                value, err = _resolve_one_env(suffix, auth, registry, task_id)
+                if err:
                     with _PENDING_LOCK:
-                        _PENDING_ERRORS.setdefault(task_id or "", []).extend(more)
-                    new_args[extra_key] = new_val
-            log.debug("Rewrote terminal args (%d placeholder(s)).",
-                      len(placeholder_tokens(command)))
-            return {"args": new_args}
-        return None
+                        _PENDING_ERRORS.setdefault(task_id or "", []).append(err)
+                    # fail closed: leave the reference untouched — the shell
+                    # expands it to an empty string; no secret is ever injected.
+                    continue
+                var = _env_var_for(suffix)
+                env[var] = value           # real secret -> subprocess env ONLY
+                new_command = new_command.replace(m.group(0), f"${var}")
+                resolved_count += 1
+            if new_command != command:
+                changed[cmd_key] = new_command
+
+        if not resolved_count:
+            return None
+
+        changed["env"] = env
+        log.debug("Injected terminal env var(s) for %d placeholder(s).", resolved_count)
+        return {"args": changed}
 
     return vaultwarden_resolve_placeholders
 
@@ -149,12 +178,12 @@ _PENDING_LOCK = threading.Lock()
 # Per-task injected-secret store (v0.1.4, FAIL-6).
 #
 # When the middleware resolves a placeholder it knows the plaintext secret
-# value that is about to enter the shell. We keep that value ONLY for the
-# duration of the tool call (keyed by task_id) so the post_tool_call hook can
-# scrub it out of whatever the command echoed back — without ever registering
-# vault item values in the global RedactingFilter (which would redact them
-# from unrelated text forever and could collide with benign strings).
-# The store is short-lived, memory-only and never logged.
+# value that is about to enter the subprocess environment. We keep that value
+# ONLY for the duration of the tool call (keyed by task_id) so the
+# post_tool_call hook can scrub it out of whatever the command echoed back —
+# without ever registering vault item values in the global RedactingFilter
+# (which would redact them from unrelated text forever and could collide with
+# benign strings). The store is short-lived, memory-only and never logged.
 _INJECTED_SECRETS: dict[str, list[str]] = {}
 _INJECTED_LOCK = threading.Lock()
 
@@ -185,7 +214,7 @@ def _redact_in_result(result: Any) -> Any:
     session keys and explicitly tracked write payloads — vault-stored item
     fields are deliberately NOT registered globally (they could collide with
     unrelated text). For post_tool_call leak protection we therefore also
-    redact every secret this plugin just INJECTED into a terminal command:
+    redact every secret this plugin just INJECTED into a terminal call:
     ``hooks`` records the resolved values per task in _INJECTED_SECRETS and
     they are scrubbed from the matching task's output here, then forgotten.
     """
