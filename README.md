@@ -203,7 +203,7 @@ If no agent is running on the resolved socket, one is started with `ssh-agent -a
 
 1. A **32-character passphrase** is generated via the same `bw generate` path used by `vaultwarden_store` / `vaultwarden_update` `generate=true` (one consistent secret-generation mechanism across the plugin).
 2. An SSH keypair is generated with `ssh-keygen` — default `ed25519`, optional `rsa` via `key_type` / `rsa_bits` (default **4096** bits). The passphrase is delivered the same way as for `ssh-add`: via the **`SSH_ASKPASS` mechanism** (env var only — never stdin, which `ssh-keygen` does not read for passphrases, and never `-N` argv, which would leak it to `ps`).
-3. Post-generation safety verify: `ssh-keygen -yf <key>` with `stdin=DEVNULL` must FAIL — if it succeeds, the key is unencrypted and the operation aborts rather than storing an unprotected key.
+3. Post-generation safety verify: `ssh-keygen -yf <key>` with `stdin=DEVNULL` must FAIL — if it succeeds, the key is unencrypted and the operation aborts rather than storing an unprotected key. The generation, `-yf` verify, fingerprint, and `ssh-add` subprocesses all run with `start_new_session=True`, detaching them from any controlling terminal so they can never fall back to a `/dev/tty` passphrase prompt on interactive (dashboard) sessions.
 4. The private key is stored as a vault attachment and the passphrase as the item `password` field. Neither is ever returned.
 5. The response contains the **public key** and **fingerprint** (non-secret — paste the public key into `authorized_keys`).
 
@@ -238,7 +238,7 @@ Write tools that accept a secret (`vaultwarden_store` / `vaultwarden_update` via
 Rules:
 
 - **Conflicting sources are an error.** Providing more than one of the trio raises `ConfigError` (no silent precedence). In generate mode, supplying any secret/file parameter is also a `ConfigError`.
-- **Raw input triggers a dual-channel warning:** a value-free `log.warning` AND a `"warning"` field in the tool response. The response warning names the safer `*_env` / `*_file` alternatives and never contains the secret value itself — it is meant to be relayed to the user by the agent.
+- **Raw input triggers a dual-channel warning:** a value-free `log.warning` AND a `"warning"` field in the tool response. The response warning is an **imperative instruction directing the agent to warn the user** that direct secret input is insecure and to recommend the safer `*_env` / `*_file` channels; it never contains the secret value itself. Raw input is still accepted (accept-and-warn).
 - Env/file-resolved secrets never appear in the tool call arguments, keeping them out of the LLM context entirely.
 
 ```
@@ -251,10 +251,12 @@ vaultwarden_store_ssh(name="SSH - Prod", user="deploy",
 
 # Raw password still works, but the response carries a warning
 vaultwarden_store(name="raw-test", username="u", password="hunter2")
--> {"created": true, ..., "warning": "Direct secret input detected for 'password'
-    in vaultwarden_store. The value enters the LLM context and chat history,
-    which is not secure. Prefer 'password_env' (an environment variable) or
-    'password_file' (an owner-only file, chmod 600) instead."}
+-> {"created": true, ..., "warning": "AGENT INSTRUCTION: A raw secret was
+    supplied directly via 'password' in vaultwarden_store. ... You MUST warn
+    the user about this now: tell them direct secret input is insecure, and
+    recommend providing it via 'password_env' (an environment variable) or
+    'password_file' (an owner-only file, chmod 600) instead. Do NOT repeat
+    the secret value in your reply."}
 ```
 
 ## Security Architecture
@@ -265,7 +267,7 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | Subprocess env isolation | All `bw` calls run with a minimal, controlled environment |
 | Session key in memory only | Bitwarden session key is never written to disk |
 | RedactingFilter | All secrets registered; redacted from logs and errors |
-| SSH passphrase delivery | Via the `SSH_ASKPASS` mechanism: a temporarily generated helper script whose body is only `echo "$VW_SSH_PASS"` (no secret material) runs as the askpass program with `SSH_ASKPASS_REQUIRE=force`; the passphrase itself is passed to the subprocess **environment only** (never a file, never argv), and `stdin` is `/dev/null` so `ssh-keygen` / `ssh-add` can never prompt on a tty. Requires OpenSSH >= 8.4 (verified: 10.0p2). The helper script is removed in a `finally` block. |
+| SSH passphrase delivery | Via the `SSH_ASKPASS` mechanism: a temporarily generated helper script whose body is only `echo "$VW_SSH_PASS"` (no secret material) runs as the askpass program with `SSH_ASKPASS_REQUIRE=force`; the passphrase itself is passed to the subprocess **environment only** (never a file, never argv), and `stdin` is `/dev/null` so `ssh-keygen` / `ssh-add` can never prompt on a tty. All passphrase-handling subprocesses (`ssh-keygen` generate/verify/fingerprint, `ssh-add`) additionally run with `start_new_session=True`, detaching them from any controlling terminal so a `/dev/tty` fallback or hang is impossible even on interactive (dashboard) sessions. Requires OpenSSH >= 8.4 (verified: 10.0p2). The helper script is removed in a `finally` block. |
 | SSH key temp file | `tempfile.mkstemp()` (atomic), `0600` perms, deleted in `finally` |
 | Fail-closed auth | Authentication failures never fall back silently |
 | bw version enforcement | `bw --version` checked at startup against a hardcoded minimum (2026.9.1); plugin refuses to load if below or unparseable — no override |
@@ -295,7 +297,7 @@ vaultwarden/
 pytest vaultwarden/tests/ -q
 ```
 
-Current suite: **298 tests** (functional files only — test filenames and
+Current suite: **301 tests** (functional files only — test filenames and
 markers must never embed a plugin version; enforced by
 `test_no_version_coupling.py`).
 
