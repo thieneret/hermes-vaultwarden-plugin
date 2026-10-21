@@ -5,6 +5,37 @@ Author: **thieneret**
 
 ---
 
+## [0.4.4] - 2026-10-22
+
+### Breaking Change (VWP-04 — env-injected placeholders)
+
+- **BREAKING, no backward compat:** secrets are now injected into the
+  `terminal` tool's `env` parameter via a Hermes `tool_request` middleware,
+  instead of rewriting the command string with the secret. Placeholders are
+  user-facing as `$__VW_SECRET_x__` and MUST be placed inside double quotes
+  (or unquoted) so the shell expands them. The middleware rewrites the
+  reference to `$VW_TOKEN_x` and injects the real secret as
+  `VW_TOKEN_x` in the env. The raw secret no longer appears in the command
+  string, argv, shell history, or logs.
+- `vaultwarden_get_secret_ref` now returns the placeholder with a `$` prefix.
+- The old bare `__VW_SECRET_x__` string-substitution path is REMOVED (no
+  backward compatibility).
+
+### Repo reorganization
+
+- Moved `vaultwarden/` → `plugins/vaultwarden/` (git mv, history preserved).
+- Removed the misplaced root `conftest.py`; the authoritative conftest is
+  `plugins/vaultwarden/tests/conftest.py`.
+
+### Skill
+
+- Added the `vaultwarden-usage` skill at
+  `skills/devops/vaultwarden-usage/` (SKILL.md v2.0.0 + references:
+  examples.md, troubleshooting.md, architecture.md) describing the
+  env-injection workflow.
+
+No tool-count change (12 tools). No schema change.
+
 ## [0.4.3] - 2026-10-22
 
 ### Security (audit findings VWP-13, VWP-03)
