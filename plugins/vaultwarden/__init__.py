@@ -6,9 +6,11 @@ Pipeline: .env (bootstrap secrets, loaded by Hermes secret_scope) ->
 plugin-private memory -> isolated bw subprocesses with
 BITWARDENCLI_APPDATA_DIR pointing at this plugin's .bw-data.
 
-The LLM only ever sees metadata and single-use placeholder tokens; the
-tool_request middleware resolves them into terminal commands right before
-execution and post_tool_call cleans up + redacts.
+The LLM only ever sees metadata and single-use placeholder tokens written as
+$__VW_SECRET_x__ (v0.4.4, VWP-04); the tool_request middleware injects the
+real secret into the terminal call's env parameter as a VW_TOKEN_x variable
+and rewrites the command to reference it — the secret never enters the
+command string; post_tool_call cleans up + redacts.
 """
 from __future__ import annotations
 
@@ -153,23 +155,24 @@ def register(ctx: Any) -> bool:
             registered += 1
     log.info("Registered %d vaultwarden_* tools.", registered)
 
-    # middleware + hooks (chain-safe resolver is NOT pre_tool_call)
-    # VWP-03 (v0.4.3): FAIL-CLOSED. If the placeholder-injection middleware
-    # cannot be registered, the plugin MUST NOT load — operating without it
-    # would leave placeholder tokens unresolved in terminal commands and
-    # expose raw secrets. Any exception from register_middleware propagates
-    # out of register(); do NOT wrap this call in a swallowing try/except.
-    log.info("vaultwarden: registering placeholder-injection middleware (fail-closed)")
+    # middleware + hooks (chain-safe env injector is NOT pre_tool_call)
+    # VWP-03 (v0.4.3) FAIL-CLOSED retained in v0.4.4: if the VWP-04
+    # env-injection middleware cannot be registered, the plugin MUST NOT
+    # load — operating without it would leave $__VW_SECRET_x__ references
+    # unresolved in terminal commands (empty expansions / broken auth flows).
+    # Any exception from register_middleware propagates out of register();
+    # do NOT wrap this call in a swallowing try/except.
+    log.info("vaultwarden: registering env-injection middleware (fail-closed)")
     result = ctx.register_middleware(
         "tool_request", make_placeholder_resolver(auth, registry, config))
     if result is False:
         # Some contexts signal failure with a False return instead of raising.
         raise RuntimeError(
             "vaultwarden plugin: middleware registration failed. "
-            "Refusing to load without placeholder injection (fail-closed). "
+            "Refusing to load without secret env injection (fail-closed). "
             "Check Hermes plugin API compatibility."
         )
-    log.info("Placeholder resolver middleware registered")
+    log.info("Env-injection middleware registered")
     try:
         ctx.register_hook("post_tool_call", make_post_cleanup_hook(auth, registry, config))
         ctx.register_hook("on_session_end", make_session_end_hook(auth, registry))

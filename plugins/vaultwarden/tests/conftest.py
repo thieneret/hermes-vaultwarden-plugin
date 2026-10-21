@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from vaultwarden.auth import AuthManager  # noqa: E402
 from vaultwarden.config import PluginConfig, load_config  # noqa: E402
@@ -282,6 +282,26 @@ def make_config(**overrides) -> PluginConfig:
     env = {**BASE_ENV, **overrides.pop("env", {})}
     cfg = load_config(SettingsContext(section), env=env)
     return cfg
+
+
+@pytest.fixture(autouse=True)
+def _isolate_shared_redactor():
+    """Reset the global RedactingFilter secret set between tests.
+
+    v0.4.4 (VWP-04): the env-injection middleware registers every resolved
+    secret with the shared filter; without this reset, a test that injects a
+    vault password (e.g. 'sup3r-s3cret-pg!') leaks redaction state into later
+    tests whose fixtures expect an un-redacted baseline.
+    """
+    from vaultwarden.security import get_redacting_filter
+
+    redactor = get_redacting_filter()
+    with redactor._lock:
+        saved = set(redactor._secrets)
+    yield
+    with redactor._lock:
+        redactor._secrets.clear()
+        redactor._secrets.update(saved)
 
 
 @pytest.fixture()

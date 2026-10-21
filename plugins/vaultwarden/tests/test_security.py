@@ -255,15 +255,21 @@ def test_resolver_uses_default_expanded_terminal_tools():
 
     auth = MagicMock()
     registry = MagicMock()
+    # VWP-04: consume() raising -> resolution fails closed and the error is
+    # recorded in _PENDING_ERRORS (the gate itself must still be passed).
+    from vaultwarden import errors as vw_errors
+    registry.consume.side_effect = vw_errors.PlaceholderError("mocked")
     mw = make_placeholder_resolver(auth, registry, config=None)
     # foreign tool still ignored
-    assert mw("file_read", {"command": "__VW_SECRET_x__"}, task_id="t") is None
+    assert mw("file_read", {"command": "$__VW_SECRET_x__"}, task_id="t") is None
     # new default exec-ish tool passes the gate (registry lookup mocked to fail
-    # closed, but the important part is it does NOT return None at the gate)
-    out = mw("exec", {"command": "echo __VW_SECRET_deadbeefcafe__"}, task_id="t-cfg")
-    assert out is not None
+    # closed, but the important part is the error IS recorded at the gate)
+    out = mw("exec", {"command": "echo $__VW_SECRET_deadbeefcafe__"}, task_id="t-cfg")
+    assert out is None                       # nothing resolved -> args untouched
     from vaultwarden.hooks import _PENDING_ERRORS, _PENDING_LOCK
     with _PENDING_LOCK:
+        assert any(e["error_code"] == "PLACEHOLDER_ERROR"
+                   for e in _PENDING_ERRORS.get("t-cfg", []))
         _PENDING_ERRORS.pop("t-cfg", None)
 
 
@@ -271,22 +277,26 @@ def test_resolver_honours_custom_terminal_tool_names():
     """BUGFIX: config-provided tool names REPLACE the defaults."""
     from unittest.mock import MagicMock
 
+    from vaultwarden import errors as vw_errors
     from vaultwarden.hooks import make_placeholder_resolver
 
     auth = MagicMock()
     registry = MagicMock()
+    registry.consume.side_effect = vw_errors.PlaceholderError("mocked")
     cfg = MagicMock()
     cfg.terminal_tool_names = ["my_custom_shell"]
     cfg.terminal_command_keys = ["payload"]
     mw = make_placeholder_resolver(auth, registry, config=cfg)
     # default name "terminal" is NO LONGER handled when config overrides
-    assert mw("terminal", {"command": "__VW_SECRET_x__"}, task_id="t") is None
-    # custom name + custom key ARE handled
-    out = mw("my_custom_shell", {"payload": "echo __VW_SECRET_deadbeefcafe__"},
+    assert mw("terminal", {"command": "$__VW_SECRET_x__"}, task_id="t") is None
+    # custom name + custom key ARE handled (gate passed -> error recorded)
+    out = mw("my_custom_shell", {"payload": "echo $__VW_SECRET_deadbeefcafe__"},
              task_id="t-custom")
-    assert out is not None
+    assert out is None                       # nothing resolved -> args untouched
     from vaultwarden.hooks import _PENDING_ERRORS, _PENDING_LOCK
     with _PENDING_LOCK:
+        assert any(e["error_code"] == "PLACEHOLDER_ERROR"
+                   for e in _PENDING_ERRORS.get("t-custom", []))
         _PENDING_ERRORS.pop("t-custom", None)
 
 
@@ -532,12 +542,16 @@ def test_middleware_chain_safety_other_plugin_last_word(fake_bw, tmp_path, regis
     step = other_plugin_mw("terminal", base)
     assert step["args"] == {"command": "ls -la", "timeout": 45}
 
-    # --- call WITH placeholder: ours runs last and preserves other fields.
+    # --- call WITH $-placeholder (VWP-04): ours runs last, injects env and
+    # preserves the other plugin's fields; secret NEVER enters the command.
     entry = registry.create("Postgres prod", "password")
-    mid = other_plugin_mw("terminal", {"command": f"echo {entry.token}"})
+    mid = other_plugin_mw("terminal", {"command": f"echo ${entry.token}"})
     final = ours("terminal", mid["args"])
     assert final["args"]["timeout"] == 45          # other plugin's edit kept
-    assert "sup3r-s3cret-pg!" in final["args"]["command"]
+    suffix = entry.token[12:-2]
+    assert final["args"]["env"][f"VW_TOKEN_{suffix}"] == "sup3r-s3cret-pg!"
+    assert "sup3r-s3cret-pg!" not in final["args"]["command"]
+    assert f"$VW_TOKEN_{suffix}" in final["args"]["command"]
 
 
 def test_register_cleanup_removes_bootstrap_env(monkeypatch, tmp_path, fake_bw):

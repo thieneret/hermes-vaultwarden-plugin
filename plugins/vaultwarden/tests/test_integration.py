@@ -12,7 +12,8 @@ import pytest
 import vaultwarden
 from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
 
-TOKEN_RE = re.compile(r"__VW_SECRET_[0-9a-f]{12}__")
+# VWP-04: user-facing placeholder references carry a '$' prefix.
+TOKEN_RE = re.compile(r"\$__VW_SECRET_[0-9a-f]{12}__")
 
 
 def _dict_tools(raw):
@@ -108,26 +109,35 @@ def test_placeholder_e2e_llm_style_flow(monkeypatch, tmp_path, fake_bw):
     # LLM asks for a reference, never the secret:
     ref = tools["vaultwarden_get_secret_ref"](
         {"item_id": "aaaa1111-0000-0000-0000-000000000001", "field": "password"})
-    token = ref["placeholder"]
+    token = ref["placeholder"]                 # VWP-04: '$'-prefixed reference
     assert TOKEN_RE.match(token)
     assert "sup3r-s3cret-pg!" not in str(ref)
 
-    # LLM composes a terminal command with the placeholder:
-    llm_args = {"command": f"PGPASSWORD={token} psql -h db.internal -U dbadmin -c 'SELECT 1'"}
+    # LLM composes a terminal command with the placeholder DOUBLE-QUOTED so
+    # the shell can expand the injected VW_TOKEN variable (VWP-04 rule):
+    llm_args = {"command": f"psql -h db.internal -U dbadmin -c \"SELECT '{token}'\""}
     rewritten = mw("terminal", dict(llm_args))
     assert rewritten is not None
     executed = rewritten["args"]["command"]
-    assert token not in executed and "sup3r-s3cret-pg!" in executed
+    env = rewritten["args"]["env"]
+    suffix = token[13:-2]                      # strip $__VW_SECRET_ ... __
+    assert env[f"VW_TOKEN_{suffix}"] == "sup3r-s3cret-pg!"   # secret -> env ONLY
+    assert token not in executed and "sup3r-s3cret-pg!" not in executed
+    assert f"$VW_TOKEN_{suffix}" in executed
 
     # execution result may echo the secret -> post hook redacts it:
     result = {"output": "psql ran with sup3r-s3cret-pg! visible"}
     post("terminal", rewritten["args"], result, task_id="task-1")
     assert "sup3r-s3cret-pg!" not in result["output"]
 
-    # replay of the same placeholder now fails closed:
-    again = mw("terminal", {"command": f"echo {token}"})
-    assert "__VW_PLACEHOLDER_INVALID__" in again["args"]["command"]
-    assert "sup3r-s3cret-pg!" not in again["args"]["command"]
+    # replay of the same placeholder now fails closed: nothing is injected,
+    # the stale reference stays untouched (expands to empty at shell level).
+    again = mw("terminal", {"command": f"echo \"{token}\""})
+    assert again is None
+    from vaultwarden.hooks import _PENDING_ERRORS as _PE
+    assert any(e["error_code"] == "PLACEHOLDER_ERROR"
+               for errs in _PE.values() for e in errs)
+    _PE.clear()
 
 
 def test_crud_cycle_integration(monkeypatch, tmp_path, fake_bw):
@@ -393,9 +403,15 @@ def test_plugin_yaml_version_matches_pyproject():
     plugin_version = re.search(r"^version:\s*([^\s]+)", plugin_content, re.M)
     assert plugin_version, "version: field not found in plugin.yaml"
 
-    # Find pyproject.toml
-    pyproject = pkg_dir.parent / "pyproject.toml"
-    assert pyproject.exists(), f"pyproject.toml not found at {pyproject}"
+    # Find pyproject.toml (repo root: plugins/vaultwarden/ -> plugins/ -> root;
+    # legacy layout: vaultwarden/ -> repo root)
+    pyproject = None
+    for parent in pkg_dir.parents:
+        candidate = parent / "pyproject.toml"
+        if candidate.exists():
+            pyproject = candidate
+            break
+    assert pyproject is not None, "pyproject.toml not found in any parent dir"
     pyproject_content = pyproject.read_text(encoding="utf-8")
     pyproject_version = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_content, re.M)
     assert pyproject_version, "version field not found in pyproject.toml"
