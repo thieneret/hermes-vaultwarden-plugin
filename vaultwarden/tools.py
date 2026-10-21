@@ -317,16 +317,21 @@ def _item_type_name(item: dict) -> str:
     return str(t or "login")
 
 
-def _metadata(item: dict) -> dict:
-    """Safe metadata projection — NEVER includes password/totp/notes values."""
+def _metadata(item: dict, mask: bool = False) -> dict:
+    """Safe metadata projection — NEVER includes password/totp/notes values.
+
+    VWP-13 (v0.4.3): when mask=True, `username` and `uris` are replaced with
+    '***'. `name`, `id`, `type`, `folder_id` are never masked (needed for
+    item identification). Masking is applied ONLY in h_list()/h_search().
+    """
     login = item.get("login") or {}
     uris = [u.get("uri") for u in (login.get("uris") or []) if u.get("uri")]
     out = {
         "id": item.get("id"),
         "name": item.get("name"),
         "type": _item_type_name(item),
-        "username": login.get("username"),
-        "uris": uris,
+        "username": "***" if mask and login.get("username") else login.get("username"),
+        "uris": ["***"] if mask and uris else uris,
         "folder_id": item.get("folderId"),
     }
     return {k: v for k, v in out.items() if v not in (None, [], "")}
@@ -455,7 +460,8 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             if want_type:
                 items = [i for i in items if _item_type_name(i) == want_type]
             limit = int(args.get("limit") or 100)
-            projected = [_metadata(i) for i in items[:limit]]
+            # VWP-13: config-driven metadata masking (username/uris -> '***')
+            projected = [_metadata(i, mask=config.metadata_masking) for i in items[:limit]]
             return {"items": projected, "total": len(items),
                     "returned": len(projected)}
         return _guard(run)
@@ -480,10 +486,12 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 items = auth.list_items(None)
             q = query.lower()
             matches = []
+            # VWP-13: config-driven metadata masking (username/uris -> '***').
+            mask = config.metadata_masking
             for it in items:
                 if want_type and _item_type_name(it) != want_type:
                     continue
-                meta = _metadata(it)
+                meta = _metadata(it, mask=mask)
                 haystacks = []
                 if field in (None, "name"):
                     haystacks.append(str(meta.get("name") or "").lower())

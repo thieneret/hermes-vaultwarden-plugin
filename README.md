@@ -101,6 +101,7 @@ plugins:
         placeholder_ttl_seconds: 300
         max_placeholders: 50
         bw_cli_path: "/path/to/bw"
+        metadata_masking: false
         bw_max_retries: 3
         bw_backoff_base: 1.0
         bw_max_delay: 10.0
@@ -126,6 +127,7 @@ VW_MASTER_PASSWORD="your-master-password"
 | `bw_max_retries` | Max retry attempts for idempotent `bw` calls on network errors. Default: `3` |
 | `bw_backoff_base` | Base delay (seconds) for exponential backoff. Default: `1.0` |
 | `bw_max_delay` | Maximum delay cap (seconds). Default: `10.0` |
+| `metadata_masking` | When `true`, `vaultwarden_list` and `vaultwarden_search` mask `username` and `uris` with `***`. `name` is never masked. Default: `false` |
 
 ## Tools
 
@@ -272,6 +274,8 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | Fail-closed auth | Authentication failures never fall back silently |
 | bw version enforcement | `bw --version` checked at startup against a hardcoded minimum (2026.9.1); plugin refuses to load if below or unparseable — no override |
 | Structured error classification | Errors classified by source stability (Node.js codes → rate limit → bw state → server API); retry only on idempotent network errors with exponential backoff + jitter |
+| Metadata masking (opt-in) | `metadata_masking=true` masks `username`/`uris` in list/search responses; `name` never masked. Default OFF preserves search usability |
+| Middleware fail-closed | If placeholder-injection middleware cannot be registered, the plugin refuses to load. No silent fallback without secret protection |
 
 ## Development
 
@@ -297,7 +301,7 @@ vaultwarden/
 pytest vaultwarden/tests/ -q
 ```
 
-Current suite: **301 tests** (functional files only — test filenames and
+Current suite: **316 tests** (functional files only — test filenames and
 markers must never embed a plugin version; enforced by
 `test_no_version_coupling.py`).
 
