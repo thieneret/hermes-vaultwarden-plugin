@@ -41,6 +41,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from collections.abc import MutableMapping
 from typing import Any, Callable
 
@@ -86,6 +87,34 @@ def _secrets_dir() -> str:
     os.makedirs(d, mode=0o700, exist_ok=True)
     os.chmod(d, 0o700)
     return d
+
+
+def _cleanup_stale_secrets():
+    """Remove temp files older than the placeholder TTL (300s).
+
+    Handles files left behind by a previous SIGKILL/SIGTERM where the
+    middleware's finally block did not run. The TTL matches the placeholder
+    registry TTL — any file older than that is stale and should be removed.
+
+    Called at plugin startup (in register()) to ensure stale files are
+    cleaned up even if the previous process crashed.
+    """
+    try:
+        secrets_dir = _secrets_dir()
+    except OSError:
+        return  # cannot create/access the dir, skip cleanup
+
+    if not os.path.isdir(secrets_dir):
+        return
+
+    cutoff = time.time() - 300  # placeholder TTL (5 minutes)
+    for entry in os.scandir(secrets_dir):
+        try:
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                os.unlink(entry.path)
+                log.info("cleaned stale secret file: %s", entry.name)
+        except OSError:
+            pass  # best-effort cleanup
 
 
 def _inject_one(token: str, auth: AuthManager, registry: PlaceholderRegistry,

@@ -313,9 +313,11 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **320 tests** (functional files only — test filenames and
+Current suite: **335 tests** (functional files only — test filenames and
 markers must never embed a plugin version; enforced by
-`test_no_version_coupling.py`).
+`test_no_version_coupling.py`). Includes positive-control suites for
+concurrency (VWP-18), subprocess env isolation (VWP-19), and crash recovery
+(VWP-20).
 
 ## License
 

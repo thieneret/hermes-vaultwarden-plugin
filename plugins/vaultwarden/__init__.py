@@ -20,7 +20,12 @@ from typing import Any
 from .auth import AuthManager, ensure_appdata_dir
 from .bw_cli import BwCli, find_bw_binary
 from .config import PluginConfig, load_config
-from .hooks import make_placeholder_resolver, make_post_cleanup_hook, make_session_end_hook
+from .hooks import (
+    _cleanup_stale_secrets,
+    make_placeholder_resolver,
+    make_post_cleanup_hook,
+    make_session_end_hook,
+)
 from .placeholders import PlaceholderRegistry
 from .security import get_logger
 from .tools import get_tools
@@ -73,6 +78,10 @@ def register(ctx: Any) -> bool:
     if not config.enabled:
         log.warning("Vaultwarden plugin load FAILED: plugin disabled (enabled=false)")
         return False
+
+    # VWP-20 (v0.4.5): cleanup stale temp files from previous crashed runs
+    # (SIGKILL/SIGTERM where the middleware's finally block did not run).
+    _cleanup_stale_secrets()
 
     log.info("Vaultwarden plugin enabled, checking prerequisites...")
 
