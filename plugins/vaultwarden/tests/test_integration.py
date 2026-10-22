@@ -393,9 +393,17 @@ def test_plugin_yaml_version_matches_pyproject():
     plugin_version = re.search(r"^version:\s*([^\s]+)", plugin_content, re.M)
     assert plugin_version, "version: field not found in plugin.yaml"
 
-    # Find pyproject.toml
-    pyproject = pkg_dir.parent / "pyproject.toml"
-    assert pyproject.exists(), f"pyproject.toml not found at {pyproject}"
+    # Find pyproject.toml at the repo root. Repo reorganization (v0.4.4
+    # step 1) moved the plugin from vaultwarden/ to plugins/vaultwarden/,
+    # so a fixed parent depth is no longer reliable — walk up from the
+    # package dir until a pyproject.toml shows up.
+    pyproject = next(
+        (c for c in (pkg_dir.parent, *pkg_dir.parents)
+         if (c / "pyproject.toml").exists()),
+        None,
+    )
+    assert pyproject is not None, "pyproject.toml not found in any parent dir"
+    pyproject = pyproject / "pyproject.toml"
     pyproject_content = pyproject.read_text(encoding="utf-8")
     pyproject_version = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_content, re.M)
     assert pyproject_version, "version field not found in pyproject.toml"

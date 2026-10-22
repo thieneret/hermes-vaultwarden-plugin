@@ -47,7 +47,7 @@ Secure secrets management for Hermes Agent via Vaultwarden. Provides safe access
 Copy the plugin directory into your Hermes plugins folder:
 
 ```bash
-cp -r vaultwarden ~/.hermes/plugins/vaultwarden
+cp -r plugins/vaultwarden ~/.hermes/plugins/vaultwarden
 ```
 
 Then configure `~/.hermes/config.yaml` (see Configuration section)
@@ -280,8 +280,9 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 ## Development
 
 ```
-vaultwarden/
+plugins/vaultwarden/
 ├── __init__.py      # Plugin registration (register(ctx))
+├── plugin.yaml      # Plugin manifest (name, version, tools)
 ├── config.py        # Settings load, env resolution, config fallback
 ├── auth.py          # AuthManager: state machine, session, recovery
 ├── bw_cli.py        # BwCli: subprocess wrapper, base64 encoding, attachments
@@ -295,10 +296,13 @@ vaultwarden/
 └── tests/           # pytest suite
 ```
 
+The companion coding-agent skill `vaultwarden-usage` lives at
+`skills/devops/vaultwarden-usage/` in this repository.
+
 ### Running tests
 
 ```bash
-pytest vaultwarden/tests/ -q
+pytest plugins/vaultwarden/tests/ -q
 ```
 
 Current suite: **316 tests** (functional files only — test filenames and

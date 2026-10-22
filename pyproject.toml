@@ -42,19 +42,19 @@ Homepage = "https://github.com/thieneret/hermes-vaultwarden-plugin"
 Repository = "https://github.com/thieneret/hermes-vaultwarden-plugin"
 
 [tool.hatch.build.targets.wheel]
-packages = ["vaultwarden"]
+packages = ["plugins/vaultwarden"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "vaultwarden",
-    "plugin.yaml",
+    "plugins/vaultwarden",
+    "plugins/vaultwarden/plugin.yaml",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["vaultwarden/tests"]
+testpaths = ["plugins/vaultwarden/tests"]
 addopts = "-p no:libtmux"
 
 [tool.ruff]
