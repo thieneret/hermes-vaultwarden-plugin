@@ -32,8 +32,8 @@ jobs:
 
       - name: Run tests
         run: |
-          uv run pytest plugins/vaultwarden/tests/ -v --tb=short
+          uv run pytest vaultwarden/tests/ -v --tb=short
 
       - name: Lint with ruff
         run: |
-          uv run ruff check plugins/vaultwarden/
+          uv run ruff check vaultwarden/
