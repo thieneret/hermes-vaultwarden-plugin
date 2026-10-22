@@ -127,10 +127,11 @@ def test_placeholder_e2e_llm_style_flow(monkeypatch, tmp_path, fake_bw):
     assert "$(<" in executed                   # ...by a file substitution
     assert "sup3r-s3cret-pg!" not in executed  # secret NEVER in the command
 
-    # execution result may echo the secret -> post hook redacts it:
+    # execution result may echo the secret -> post hook redacts it in place:
     result = {"output": "psql ran with sup3r-s3cret-pg! visible"}
-    post("terminal", {"command": executed}, result, task_id="task-1")
-    assert "sup3r-s3cret-pg!" not in result["output"]
+    returned = post("terminal", {"command": executed}, result, task_id="task-1")
+    observed = returned if isinstance(returned, dict) else result
+    assert "sup3r-s3cret-pg!" not in observed["output"]
 
     # replay of the same placeholder is left verbatim (fail-safe $ expansion):
     again_seen: list[str] = []

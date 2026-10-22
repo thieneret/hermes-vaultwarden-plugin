@@ -93,19 +93,18 @@ def _inject_one(token: str, auth: AuthManager, registry: PlaceholderRegistry,
                 task_id: str = "") -> str | None:
     """Resolve one placeholder suffix; return the temp-file path or None.
 
-    None means "leave the reference verbatim" (fail-safe `$` expansion):
-    expired / unknown / already-used tokens, or items whose field went empty.
-    The real secret is ONLY ever written to the returned temp file
-    (mkstemp: atomic, O_EXCL, chmod 600) — never into the command string.
+    The middleware has ALREADY consumed the token (single-use marking happens
+    up-front in ``vaultwarden_inject_secrets``), so here we only read the
+    registry entry and fetch the field value. None means "leave the reference
+    verbatim" (fail-safe `$` expansion): expired / unknown / already-used
+    tokens, or items whose field went empty. The real secret is ONLY ever
+    written to the returned temp file (mkstemp: atomic, O_EXCL, chmod 600) —
+    never into the command string.
     """
     placeholder = f"__VW_SECRET_{token}__"   # registry form (no $)
-    try:
-        entry = registry.consume(placeholder)
-    except errors.PlaceholderError as exc:
-        log.warning("Placeholder %s: %s", placeholder, exc.message)
-        with _PENDING_LOCK:
-            _PENDING_ERRORS.setdefault(task_id or "", []).append(exc.to_dict())
-        return None
+    entry = registry.peek(placeholder)
+    if entry is None:
+        return None  # unknown/expired/already-used — error recorded upstream
     try:
         item = auth.get_item(entry.item_id)
         if entry.field_name.startswith("custom:"):
@@ -182,6 +181,22 @@ def make_placeholder_resolver(auth: AuthManager,
             # Legacy tool_request-style probe (no wrapper available): report
             # whether injection WOULD happen, without consuming anything.
             return {"args": args}
+
+        # VWP-04 single-use semantics: every $__VW_SECRET_ reference that
+        # reaches the middleware is CONSUMED — even if it later turns out to
+        # be expired/unknown/already-used or its vault field went empty (that
+        # reference stays verbatim as a fail-safe `$` expansion). Marking the
+        # tokens used up-front makes replay detection deterministic.
+        with _PENDING_LOCK:
+            task_errors = _PENDING_ERRORS.setdefault(task_id or "", [])
+        for key in targets:
+            for m in _VW_SECRET_CMD_RE.finditer(args[key]):
+                placeholder = f"__VW_SECRET_{m.group(1)}__"  # registry form
+                try:
+                    registry.consume(placeholder)
+                except errors.PlaceholderError as exc:
+                    log.warning("Placeholder %s: %s", placeholder, exc.message)
+                    task_errors.append(exc.to_dict())
 
         secrets_dir = _secrets_dir()
         temp_files: list[str] = []
