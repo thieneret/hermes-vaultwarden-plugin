@@ -40,6 +40,10 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 | Middleware fail-closed | If the Hermes placeholder-injection middleware (the v0.4.4 `tool_execution` file-injection middleware) fails to register, `register()` propagates the exception and the plugin does NOT load. This prevents operating without secret injection, which would expose raw secrets in terminal commands. Consistent with the fail-closed bw version check and fail-closed auth. |
 | Metadata masking (opt-in) | When `metadata_masking=true`, `username` and `uris` are replaced with `***` in `list`/`search` responses. `name`, `id`, `type` are never masked. Default OFF preserves search/list usability while offering a privacy mode for environments where metadata is sensitive. |
 
+### File-injected placeholder injection (VWP-04) — crash recovery (VWP-20)
+
+**Platform-dependent risk:** On native Linux with systemd, `$XDG_RUNTIME_DIR` is typically a tmpfs (RAM-backed), so temp files do not hit physical disk and are cleared on logout/reboot. In Docker containers or on Windows, `$XDG_RUNTIME_DIR` may be backed by persistent storage (overlay filesystem or NTFS), so temp files may persist on disk after a crash (SIGKILL/SIGTERM). The plugin mitigates this with startup cleanup: on each launch, it removes any temp files older than the placeholder TTL (5 minutes), ensuring that files left behind by a previous crash are deleted.
+
 ### Error Classification by Source (VWP-09)
 
 `bw` errors are detected via string-marker matching (the CLI exposes only two

@@ -5,6 +5,29 @@ Author: **thieneret**
 
 ---
 
+## [0.4.5] - 2026-10-22
+
+### Security (audit findings VWP-18, VWP-19, VWP-20)
+
+- **VWP-18 (Concurrency):** Added concurrency tests for placeholder generation
+  and consumption. Validates that the single-use placeholder registry is
+  thread-safe and that race conditions (e.g. two threads consuming the same
+  placeholder) are handled correctly.
+- **VWP-19 (Env Isolation):** Added subprocess environment isolation tests.
+  Validates that `bw` and SSH subprocesses run in an isolated environment that
+  does not leak sensitive variables from the parent process.
+- **VWP-20 (Crash Recovery):** Added startup cleanup of stale temp files left
+  behind by SIGKILL/SIGTERM (where the `finally` block did not run). On plugin
+  startup, any temp files older than the placeholder TTL (5 minutes) are
+  removed. Added test coverage for `KeyboardInterrupt` cleanup (which does
+  trigger the `finally` block). Updated SECURITY.md with a note about
+  platform-dependent risk (tmpfs on native Linux vs. persistent storage in
+  Docker/Windows).
+
+No tool-count change (12 tools). No schema change. No breaking change.
+
+---
+
 ## [0.4.4] - 2026-10-22
 
 ### Breaking Change (VWP-04 — file-injected placeholders)
