@@ -522,16 +522,10 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             entry = registry.create(item.get("id") or item_id,
                                     f"custom:{custom}" if custom else field_name)
             result: dict[str, Any] = {
-                # VWP-04 (v0.4.4): user-facing placeholder carries a '$' prefix
-                # so the agent inserts it as a shell variable reference; the
-                # registry itself still stores the bare '__VW_SECRET_x__' token.
-                "placeholder": f"${entry.token}",
+                "placeholder": entry.token,
                 "ttl_seconds": registry.ttl_seconds,
-                "usage": ("Insert this exact placeholder into a terminal command "
-                          "INSIDE DOUBLE QUOTES (or unquoted) — never single quotes, "
-                          "which prevent shell expansion. The middleware injects the "
-                          "real value into the command's env at execution time and "
-                          "rewrites the reference to $VW_TOKEN_x (single use)."),
+                "usage": ("Insert this exact token into a terminal command; it is "
+                          "replaced with the real value at execution time (single use)."),
             }
             # VWP-14 (v0.3.7): the allow_direct_secret_retrieval escape hatch
             # was removed — `value` stays in local memory only and NEVER
@@ -609,7 +603,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                     item_id = created.get("id") or ""
                     entry = registry.create(item_id, "password")
                     result["password_generated"] = True
-                    result["password_placeholder"] = f"${entry.token}"
+                    result["password_placeholder"] = entry.token
                     result["placeholder_ttl_seconds"] = registry.ttl_seconds
 
                 if pw_warning:
@@ -693,7 +687,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 if generated_pw is not None:
                     entry = registry.create(item_id, "password")
                     result["password_generated"] = True
-                    result["password_placeholder"] = f"${entry.token}"
+                    result["password_placeholder"] = entry.token
                     result["placeholder_ttl_seconds"] = registry.ttl_seconds
 
                 if pw_warning:

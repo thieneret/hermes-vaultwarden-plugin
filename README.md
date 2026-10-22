@@ -159,19 +159,13 @@ Raw secrets are never exposed to the agent. Instead:
 
 ```
 1. vaultwarden_search(query="github")              → metadata only
-2. vaultwarden_get_secret_ref(item_id, field)      → $__VW_SECRET_xxxx__
-3. terminal(command="curl -H "Bearer $__VW_SECRET_xxxx__" ...")
-   ↑ tool_request middleware injects the real secret into the terminal
-     call's `env` (as VW_TOKEN_xxxx) and rewrites the reference to
-     $VW_TOKEN_xxxx; the shell expands it at execution time
+2. vaultwarden_get_secret_ref(item_id, field)      → __VW_SECRET_xxxx__
+3. terminal(command="curl -H 'Bearer __VW_SECRET_xxxx__' ...")
+   ↑ middleware substitutes the real secret at execution time
 ```
 
 - Placeholders are **single-use** and expire after `placeholder_ttl_seconds`
-- The real secret is injected into the subprocess `env` only at the moment of
-  command execution — it never appears in the command string, argv, shell
-  history, or logs (v0.4.4 env-injection; replaces the old string substitution)
-- The placeholder reference MUST be inside double quotes (or unquoted) so the
-  shell expands it; single quotes prevent expansion and break injection
+- The real secret is injected only at the moment of command execution
 - Every secret is registered with a redacting filter so it cannot leak into logs
 
 ## SSH Key Management
@@ -272,7 +266,6 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | Mechanism | Description |
 |-----------|-------------|
 | Placeholder injection | Secrets never enter the context window |
-| Env-injected placeholder injection | v0.4.4: the `tool_request` middleware injects the real secret into the `terminal` tool's `env` parameter as `VW_TOKEN_x`; the command string only ever references `$VW_TOKEN_x`. The raw secret never appears in the command, argv, shell history, or logs |
 | Subprocess env isolation | All `bw` calls run with a minimal, controlled environment |
 | Session key in memory only | Bitwarden session key is never written to disk |
 | RedactingFilter | All secrets registered; redacted from logs and errors |
@@ -287,7 +280,7 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 ## Development
 
 ```
-plugins/vaultwarden/
+vaultwarden/
 ├── __init__.py      # Plugin registration (register(ctx))
 ├── config.py        # Settings load, env resolution, config fallback
 ├── auth.py          # AuthManager: state machine, session, recovery
@@ -300,17 +293,15 @@ plugins/vaultwarden/
 ├── errors.py        # Error taxonomy
 ├── secret_source.py # Optional SecretSource adapter
 └── tests/           # pytest suite
-
-skills/devops/vaultwarden-usage/   # vaultwarden-usage skill (SKILL.md + references)
 ```
 
 ### Running tests
 
 ```bash
-pytest plugins/vaultwarden/tests/ -q
+pytest vaultwarden/tests/ -q
 ```
 
-Current suite: **317 tests** (functional files only — test filenames and
+Current suite: **316 tests** (functional files only — test filenames and
 markers must never embed a plugin version; enforced by
 `test_no_version_coupling.py`).
 

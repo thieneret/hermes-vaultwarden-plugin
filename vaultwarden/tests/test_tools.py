@@ -31,8 +31,6 @@ def _channel_tools(auth):
                                             PlaceholderRegistry()))
 
 TOKEN_RE = re.compile(r"^__VW_SECRET_[0-9a-f]{12}__$")
-# VWP-04 (v0.4.4): user-facing placeholder references are '$'-prefixed.
-PLACEHOLDER_REF_RE = re.compile(r"^\$__VW_SECRET_[0-9a-f]{12}__$")
 
 
 def _dict_tools(raw):
@@ -96,10 +94,7 @@ def test_search_tool(tools_by_name):
 def test_get_secret_ref_returns_placeholder_not_secret(tools_by_name, registry):
     res = tools_by_name["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    # VWP-04 (v0.4.4): user-facing placeholder carries a '$' prefix...
-    assert PLACEHOLDER_REF_RE.match(res["placeholder"])
-    # ...while the registry itself keeps the bare token form.
-    assert TOKEN_RE.match(res["placeholder"][1:])
+    assert TOKEN_RE.match(res["placeholder"])
     assert res["ttl_seconds"] == 300
     assert "sup3r-s3cret-pg!" not in str(res)
     # v0.3.7 (VWP-14): direct retrieval escape hatch removed — a raw value
@@ -112,8 +107,8 @@ def test_get_secret_ref_custom_field(tools_by_name, registry):
     res = tools_by_name["vaultwarden_get_secret_ref"](
         {"item_id": "aaaa1111-0000-0000-0000-000000000001",
          "field": "password", "custom_field_name": "api_key"})
-    assert PLACEHOLDER_REF_RE.match(res["placeholder"])
-    snap = registry.snapshot()[res["placeholder"][1:]]   # registry form: no $
+    assert TOKEN_RE.match(res["placeholder"])
+    snap = registry.snapshot()[res["placeholder"]]
     assert snap["field"] == "custom:api_key"   # resolved via custom field
     assert "custom-key-value" not in str(res)  # value never returned
 
@@ -179,9 +174,7 @@ def test_store_generate_true(write_tools_by_name, appdata, registry):
         "generate": True, "generate_options": {"length": 24}})
     assert res["created"] is True and res["id"] == "new-item-id-0001"
     assert res["password_generated"] is True
-    # VWP-04 (v0.4.4): user-facing placeholder carries a '$' prefix.
-    assert res["password_placeholder"].startswith("$")
-    assert TOKEN_RE.match(res["password_placeholder"][1:])
+    assert TOKEN_RE.match(res["password_placeholder"])
     assert res["placeholder_ttl_seconds"] == 300
     # The raw generated password must NEVER appear in the response...
     blob = _json.dumps(res)
@@ -191,11 +184,10 @@ def test_store_generate_true(write_tools_by_name, appdata, registry):
     with open(appdata / "fake_items.json") as f:
         stored = _json.load(f)["new-item-id-0001"]
     assert stored["login"]["password"] == FAKE_GEN_PW
-    # Placeholder registered for later command-time injection (registry form:
-    # no '$' prefix — VWP-04 adds the prefix only to the user-facing string).
+    # Placeholder registered for later command-time injection.
     snap = registry.snapshot()
-    assert res["password_placeholder"].lstrip("$") in snap
-    assert snap[res["password_placeholder"].lstrip("$")]["field"] == "password"
+    assert res["password_placeholder"] in snap
+    assert snap[res["password_placeholder"]]["field"] == "password"
 
 
 def test_update_generate_true(write_tools_by_name, appdata, registry):
@@ -211,9 +203,7 @@ def test_update_generate_true(write_tools_by_name, appdata, registry):
         "generate_options": {"mode": "passphrase", "words": 4, "separator": "-"}})
     assert upd["updated"] is True
     assert upd["password_generated"] is True
-    # VWP-04 (v0.4.4): '$'-prefixed user-facing placeholder.
-    assert upd["password_placeholder"].startswith("$")
-    assert TOKEN_RE.match(upd["password_placeholder"][1:])
+    assert TOKEN_RE.match(upd["password_placeholder"])
     assert upd["placeholder_ttl_seconds"] == 300
     blob = _json.dumps(upd)
     assert FAKE_GEN_PW not in blob      # raw value never returned
@@ -222,7 +212,7 @@ def test_update_generate_true(write_tools_by_name, appdata, registry):
         stored = _json.load(f)["new-item-id-0001"]
     assert stored["login"]["password"] == FAKE_GEN_PW
     snap = registry.snapshot()
-    assert snap[upd["password_placeholder"].lstrip("$")]["field"] == "password"
+    assert snap[upd["password_placeholder"]]["field"] == "password"
 
 
 def test_store_without_generate_has_no_placeholder_fields(write_tools_by_name):
@@ -253,7 +243,7 @@ def test_direct_retrieval_escape_hatch_removed(bw_cli, registry):
     tools = _dict_tools({s["name"]: h for s, h in get_tools(mgr, cfg, registry)})
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    assert PLACEHOLDER_REF_RE.match(res["placeholder"])   # VWP-04: $-prefixed
+    assert TOKEN_RE.match(res["placeholder"])
     assert "direct_value" not in res
     assert "sup3r-s3cret-pg!" not in str(res)
 
@@ -968,5 +958,5 @@ def test_get_secret_ref_not_affected_by_masking(bw_cli, registry):
     tools = _dict_tools(_conftest_dict_tools(auth, auth._config, registry))
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    assert PLACEHOLDER_REF_RE.match(res["placeholder"])   # VWP-04: $-prefixed
+    assert TOKEN_RE.match(res["placeholder"])
     assert "sup3r-s3cret-pg!" not in str(res)

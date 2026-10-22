@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-vaultwarden-plugin"
-version = "0.4.4"
+version = "0.4.3"
 description = "Vaultwarden secrets management and SSH key integration for Hermes Agent."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -42,11 +42,11 @@ Homepage = "https://github.com/thieneret/hermes-vaultwarden-plugin"
 Repository = "https://github.com/thieneret/hermes-vaultwarden-plugin"
 
 [tool.hatch.build.targets.wheel]
-packages = ["plugins/vaultwarden"]
+packages = ["vaultwarden"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "plugins/vaultwarden",
+    "vaultwarden",
     "plugin.yaml",
     "README.md",
     "CHANGELOG.md",
@@ -54,7 +54,7 @@ include = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["plugins/vaultwarden/tests"]
+testpaths = ["vaultwarden/tests"]
 addopts = "-p no:libtmux"
 
 [tool.ruff]
