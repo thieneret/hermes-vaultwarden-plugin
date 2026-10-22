@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 0.4.3
+version: 0.4.4
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key

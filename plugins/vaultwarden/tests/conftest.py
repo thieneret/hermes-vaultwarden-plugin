@@ -9,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+# Repo reorganization (v0.4.4 step 1): the plugin now lives at
+# plugins/vaultwarden/, so the repo root is THREE levels up from this file
+# (tests -> vaultwarden -> plugins -> root). The previous parents[2] value
+# pointed at plugins/ and silently relied on the deleted root conftest.py
+# to make `import vaultwarden` work.
+_ROOT = Path(__file__).resolve().parents[3]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from vaultwarden.auth import AuthManager  # noqa: E402
 from vaultwarden.config import PluginConfig, load_config  # noqa: E402

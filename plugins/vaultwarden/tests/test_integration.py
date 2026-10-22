@@ -57,7 +57,7 @@ def test_register_full_flow_and_tool_count(monkeypatch, tmp_path, fake_bw):
         "vaultwarden_delete_ssh", "vaultwarden_use_ssh"}
     assert all(t["toolset"] == "vaultwarden" for t in ctx.tools)
     assert all(t["check_fn"]() for t in ctx.tools)
-    assert [k for k, _ in ctx.middleware] == ["tool_request"]
+    assert [k for k, _ in ctx.middleware] == ["tool_execution"]
     hook_kinds = [k for k, _ in ctx.hooks]
     assert hook_kinds == ["post_tool_call", "on_session_end"]
     assert ctx.secret_sources == []          # disabled by default
@@ -102,32 +102,44 @@ def test_startup_secret_injection_registers_source(monkeypatch, tmp_path, fake_b
 def test_placeholder_e2e_llm_style_flow(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
-    mw = dict(ctx.middleware)["tool_request"]
+    mw = dict(ctx.middleware)["tool_execution"]
     post = dict(ctx.hooks)["post_tool_call"]
 
     # LLM asks for a reference, never the secret:
     ref = tools["vaultwarden_get_secret_ref"](
         {"item_id": "aaaa1111-0000-0000-0000-000000000001", "field": "password"})
     token = ref["placeholder"]
-    assert TOKEN_RE.match(token)
+    assert token.startswith("$")               # VWP-04: $ prefix (user-facing)
+    assert TOKEN_RE.match(token[1:])           # registry form stays bare
     assert "sup3r-s3cret-pg!" not in str(ref)
 
-    # LLM composes a terminal command with the placeholder:
-    llm_args = {"command": f"PGPASSWORD={token} psql -h db.internal -U dbadmin -c 'SELECT 1'"}
-    rewritten = mw("terminal", dict(llm_args))
-    assert rewritten is not None
-    executed = rewritten["args"]["command"]
-    assert token not in executed and "sup3r-s3cret-pg!" in executed
+    seen: list[str] = []
 
-    # execution result may echo the secret -> post hook redacts it:
+    def next_call(a):
+        seen.append(a["command"])
+        return {"output": "ran"}
+
+    # LLM composes a terminal command with the DOUBLE-QUOTED placeholder:
+    llm_args = {"command": f"PGPASSWORD=\"{token}\" psql -h db.internal -U dbadmin -c 'SELECT 1'"}
+    mw("terminal", dict(llm_args), dict(llm_args), next_call, task_id="task-1")
+    executed = seen[0]
+    assert token not in executed               # reference replaced...
+    assert "$(<" in executed                   # ...by a file substitution
+    assert "sup3r-s3cret-pg!" not in executed  # secret NEVER in the command
+
+    # execution result may echo the secret -> post hook redacts it in place:
     result = {"output": "psql ran with sup3r-s3cret-pg! visible"}
-    post("terminal", rewritten["args"], result, task_id="task-1")
-    assert "sup3r-s3cret-pg!" not in result["output"]
+    returned = post("terminal", {"command": executed}, result, task_id="task-1")
+    observed = returned if isinstance(returned, dict) else result
+    assert "sup3r-s3cret-pg!" not in observed["output"]
 
-    # replay of the same placeholder now fails closed:
-    again = mw("terminal", {"command": f"echo {token}"})
-    assert "__VW_PLACEHOLDER_INVALID__" in again["args"]["command"]
-    assert "sup3r-s3cret-pg!" not in again["args"]["command"]
+    # replay of the same placeholder is left verbatim (fail-safe $ expansion):
+    again_seen: list[str] = []
+    mw("terminal", {"command": f"echo \"{token}\""}, None,
+       lambda a: again_seen.append(a["command"]))
+    assert token in again_seen[0]
+    assert "$(<" not in again_seen[0]
+    assert "sup3r-s3cret-pg!" not in again_seen[0]
 
 
 def test_crud_cycle_integration(monkeypatch, tmp_path, fake_bw):
@@ -205,11 +217,11 @@ def test_logs_never_contain_bootstrap_secrets(monkeypatch, tmp_path, fake_bw, ca
     tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     tools["vaultwarden_list"]({})
     tools["vaultwarden_get_secret_ref"]({"item_id": "Postgres prod", "field": "password"})
-    mw = dict(ctx.middleware)["tool_request"]
+    mw = dict(ctx.middleware)["tool_execution"]
     tok = [t for t in __import__("re").findall(
         r"__VW_SECRET_[0-9a-f]{12}__",
         str(vaultwarden.PLUGIN_STATE["registry"].snapshot()))][0]
-    mw("terminal", {"command": f"run --pw {tok}"})
+    mw("terminal", {"command": f"run --pw \"${tok}\""}, None, lambda a: "ran")
     blob = " ".join(r.getMessage() for r in caplog.records) + caplog.text
     assert "cs-secret" not in blob
     assert "mp-secret" not in blob
@@ -393,9 +405,17 @@ def test_plugin_yaml_version_matches_pyproject():
     plugin_version = re.search(r"^version:\s*([^\s]+)", plugin_content, re.M)
     assert plugin_version, "version: field not found in plugin.yaml"
 
-    # Find pyproject.toml
-    pyproject = pkg_dir.parent / "pyproject.toml"
-    assert pyproject.exists(), f"pyproject.toml not found at {pyproject}"
+    # Find pyproject.toml at the repo root. Repo reorganization (v0.4.4
+    # step 1) moved the plugin from vaultwarden/ to plugins/vaultwarden/,
+    # so a fixed parent depth is no longer reliable — walk up from the
+    # package dir until a pyproject.toml shows up.
+    pyproject = next(
+        (c for c in (pkg_dir.parent, *pkg_dir.parents)
+         if (c / "pyproject.toml").exists()),
+        None,
+    )
+    assert pyproject is not None, "pyproject.toml not found in any parent dir"
+    pyproject = pyproject / "pyproject.toml"
     pyproject_content = pyproject.read_text(encoding="utf-8")
     pyproject_version = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_content, re.M)
     assert pyproject_version, "version field not found in pyproject.toml"
@@ -445,4 +465,4 @@ def test_register_succeeds_when_middleware_registration_works(monkeypatch, tmp_p
     """Happy path: successful registration loads the plugin with middleware."""
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     assert ok is True
-    assert [k for k, _ in ctx.middleware] == ["tool_request"]
+    assert [k for k, _ in ctx.middleware] == ["tool_execution"]

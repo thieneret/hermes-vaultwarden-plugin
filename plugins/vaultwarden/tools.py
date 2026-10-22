@@ -522,10 +522,16 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             entry = registry.create(item.get("id") or item_id,
                                     f"custom:{custom}" if custom else field_name)
             result: dict[str, Any] = {
-                "placeholder": entry.token,
+                "placeholder": f"${entry.token}",
                 "ttl_seconds": registry.ttl_seconds,
-                "usage": ("Insert this exact token into a terminal command; it is "
-                          "replaced with the real value at execution time (single use)."),
+                "usage": ("Insert this exact reference into a terminal command "
+                          "INSIDE DOUBLE QUOTES (or unquoted — never inside "
+                          "single quotes). At execution time the middleware "
+                          "writes the real secret to a temp file and rewrites "
+                          "the reference to $(< path) so the shell reads it; "
+                          "the secret itself never appears in the command, "
+                          "argv, history or logs. Single use, expires after "
+                          f"{registry.ttl_seconds}s."),
             }
             # VWP-14 (v0.3.7): the allow_direct_secret_retrieval escape hatch
             # was removed — `value` stays in local memory only and NEVER

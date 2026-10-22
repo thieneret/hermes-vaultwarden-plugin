@@ -47,7 +47,7 @@ Secure secrets management for Hermes Agent via Vaultwarden. Provides safe access
 Copy the plugin directory into your Hermes plugins folder:
 
 ```bash
-cp -r vaultwarden ~/.hermes/plugins/vaultwarden
+cp -r plugins/vaultwarden ~/.hermes/plugins/vaultwarden
 ```
 
 Then configure `~/.hermes/config.yaml` (see Configuration section)
@@ -159,13 +159,20 @@ Raw secrets are never exposed to the agent. Instead:
 
 ```
 1. vaultwarden_search(query="github")              → metadata only
-2. vaultwarden_get_secret_ref(item_id, field)      → __VW_SECRET_xxxx__
-3. terminal(command="curl -H 'Bearer __VW_SECRET_xxxx__' ...")
-   ↑ middleware substitutes the real secret at execution time
+2. vaultwarden_get_secret_ref(item_id, field)      → $__VW_SECRET_xxxx__
+3. terminal(command="curl -H \"Bearer $__VW_SECRET_xxxx__\" ...")
+   ↑ tool_execution middleware writes the real secret to a temp file in
+     $XDG_RUNTIME_DIR/vw-secrets/ (chmod 600, mkstemp) and rewrites the
+     command to read from it via $(< path); the shell expands it at
+     execution time and the file is deleted in a finally block
 ```
+
+The placeholder reference MUST be double-quoted (or unquoted) — never single
+quotes — so the shell expands the `$(< path)` substitution.
 
 - Placeholders are **single-use** and expire after `placeholder_ttl_seconds`
 - The real secret is injected only at the moment of command execution
+- The raw secret never appears in the command string, argv, shell history, or logs
 - Every secret is registered with a redacting filter so it cannot leak into logs
 
 ## SSH Key Management
@@ -276,12 +283,14 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | Structured error classification | Errors classified by source stability (Node.js codes → rate limit → bw state → server API); retry only on idempotent network errors with exponential backoff + jitter |
 | Metadata masking (opt-in) | `metadata_masking=true` masks `username`/`uris` in list/search responses; `name` never masked. Default OFF preserves search usability |
 | Middleware fail-closed | If placeholder-injection middleware cannot be registered, the plugin refuses to load. No silent fallback without secret protection |
+| File-injected placeholder injection (VWP-04) | Secrets are written to a chmod 600 temp file (mkstemp, atomic) in a dedicated chmod 700 directory under `$XDG_RUNTIME_DIR` (`vw-secrets/`, typically tmpfs). The rewritten command only ever references `$(< path)` — the raw secret never enters the command string, argv, shell history, or logs. Temp files are deleted in a `finally` block even if the command fails |
 
 ## Development
 
 ```
-vaultwarden/
+plugins/vaultwarden/
 ├── __init__.py      # Plugin registration (register(ctx))
+├── plugin.yaml      # Plugin manifest (name, version, tools)
 ├── config.py        # Settings load, env resolution, config fallback
 ├── auth.py          # AuthManager: state machine, session, recovery
 ├── bw_cli.py        # BwCli: subprocess wrapper, base64 encoding, attachments
@@ -295,13 +304,16 @@ vaultwarden/
 └── tests/           # pytest suite
 ```
 
+The companion coding-agent skill `vaultwarden-usage` lives at
+`skills/devops/vaultwarden-usage/` in this repository.
+
 ### Running tests
 
 ```bash
-pytest vaultwarden/tests/ -q
+pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **316 tests** (functional files only — test filenames and
+Current suite: **320 tests** (functional files only — test filenames and
 markers must never embed a plugin version; enforced by
 `test_no_version_coupling.py`).
 

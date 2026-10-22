@@ -85,10 +85,11 @@ VAULTWARDEN_SEARCH = {
 VAULTWARDEN_GET_SECRET_REF = {
     "name": "vaultwarden_get_secret_ref",
     "description": (
-        "Create a single-use placeholder token (__VW_SECRET_xxxxxxxxxxxxxx__) "
-        "referencing a secret field of a vault item. Put the placeholder in a "
-        "terminal command instead of the real secret; the tool_request "
-        "middleware substitutes it at execution time. The secret value is "
+        "Create a single-use placeholder reference ($__VW_SECRET_xxxxxxxxxxxxxx__) "
+        "pointing at a secret field of a vault item. Put the reference in a "
+        "terminal command INSIDE DOUBLE QUOTES (never single quotes); the "
+        "tool_execution middleware injects the real secret via a temp file "
+        "($(< path)) at execution time. The secret value is "
         "NEVER returned here."),
     "parameters": {
         "type": "object",

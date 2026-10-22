@@ -1,19 +1,45 @@
-"""Terminal hook handlers (plan §7): chain-safe `tool_request` middleware +
-`post_tool_call` cleanup/redaction.
+"""Terminal hook handlers (plan §7): VWP-04 file-injection `tool_execution`
+middleware + `post_tool_call` cleanup/redaction.
+
+VWP-04 (v0.4.4, BREAKING): secrets are no longer written into the command
+string. The middleware intercepts the terminal call via Hermes's
+`tool_execution` middleware (which WRAPS the actual tool invocation, allowing
+cleanup in a `finally` block), resolves every `$__VW_SECRET_x__` reference
+through the single-use registry, writes the real secret to a mkstemp file
+(chmod 600, atomic, symlink-protected) inside a dedicated chmod 700 directory
+under `$XDG_RUNTIME_DIR` (tmpfs/RAM-backed in typical setups; falls back to
+`/tmp/vw-secrets-<uid>`), and rewrites the command so the reference becomes
+`$(< path)` — the shell reads the secret at execution time. After the call
+returns (or raises) the temp files are deleted in a `finally` block.
+
+Security properties:
+- the raw secret NEVER appears in the command string, argv, shell history or
+  any log line / tool response; it exists only inside the temp file for the
+  duration of the command execution;
+- every injected secret is registered with the RedactingFilter first, so even
+  echoed output is scrubbed;
+- unresolved references (expired / unknown / already-used) are left EXACTLY as
+  they were: the leading `$` makes them valid shell variable references that
+  expand to an empty string — fail-safe, the secret cannot leak and the
+  command simply fails with an empty value (the error is recorded for
+  post_tool_call to surface to the agent).
+
+Double-quote requirement (documented in the skill and README): the rewritten
+`$(< path)` substitution must be expanded by the shell. Shell expansion
+happens inside double quotes and unquoted — but NOT inside single quotes.
+Every placeholder reference therefore MUST be double-quoted (or unquoted).
 
 Middleware chain safety rules (CRITICAL):
-- return None when the tool is not "terminal";
-- return None when the command contains NO "__VW_SECRET_" substring;
-- only return modified args when placeholders were found AND resolved;
+- non-terminal tools are passed straight through to next_call;
+- commands without a "$__VW_SECRET_" substring are passed through untouched;
+- args are only modified when a placeholder was actually resolved;
 - never modify args unless an actual change was made.
-
-Resolution failures are FAIL-CLOSED: the placeholder token is replaced with a
-safe invalid sentinel so the raw secret can never reach the shell, and the
-error is recorded for post_tool_call to surface to the agent (never an empty
-string silently injected).
 """
 from __future__ import annotations
 
+import os
+import re
+import tempfile
 import threading
 from collections.abc import MutableMapping
 from typing import Any, Callable
@@ -21,19 +47,18 @@ from typing import Any, Callable
 from . import errors
 from .auth import AuthManager
 from .placeholders import PlaceholderRegistry
-from .security import (
-    escape_for_context,
-    get_logger,
-    get_redacting_filter,
-    looks_like_url_context,
-    placeholder_tokens,
-    url_escape,
-)
+from .security import get_logger, get_redacting_filter
 from .tools import _field_value
 
 log = get_logger("hooks")
 
+#: Kept for backward-compat with tests/consumers that still import it.
+#: VWP-04 does not inject sentinels anymore — unresolved references stay
+#: verbatim and rely on the fail-safe `$` shell-variable semantics.
 INVALID_SENTINEL = "__VW_PLACEHOLDER_INVALID__"
+
+# Placeholder as it appears in a command string: $__VW_SECRET_<token>__
+_VW_SECRET_CMD_RE = re.compile(r"\$__VW_SECRET_([0-9a-f]{12})__")
 
 # terminal-ish arg keys we scan across backends (Local/Docker/SSH/Modal/
 # Daytona/Singularity/Vercel Sandbox all pass the command string here).
@@ -46,15 +71,40 @@ _DEFAULT_TERMINAL_TOOLS = {
 _DEFAULT_COMMAND_KEYS = ("command", "cmd", "input", "script", "code")
 
 
-def _resolve_one(token: str, command: str, auth: AuthManager,
-                 registry: PlaceholderRegistry,
-                 task_id: str = "") -> tuple[str, dict | None]:
-    """Return (replacement, error_dict|None). Replacement is context-escaped."""
-    try:
-        entry = registry.consume(token)
-    except errors.PlaceholderError as exc:
-        log.warning("Placeholder %s: %s", token, exc.message)
-        return INVALID_SENTINEL, exc.to_dict()
+def _secrets_dir() -> str:
+    """Return the dedicated secrets directory, creating it if needed.
+
+    Prefers $XDG_RUNTIME_DIR/vw-secrets (typically tmpfs/RAM-backed).
+    Falls back to /tmp/vw-secrets-<uid> if XDG_RUNTIME_DIR is unavailable.
+    The directory is chmod 700 so no other user can list its contents.
+    """
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    if xdg and os.path.isdir(xdg) and os.access(xdg, os.W_OK):
+        d = os.path.join(xdg, "vw-secrets")
+    else:
+        d = os.path.join(tempfile.gettempdir(), f"vw-secrets-{os.getuid()}")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+def _inject_one(token: str, auth: AuthManager, registry: PlaceholderRegistry,
+                secrets_dir: str, temp_files: list[str],
+                task_id: str = "") -> str | None:
+    """Resolve one placeholder suffix; return the temp-file path or None.
+
+    The middleware has ALREADY consumed the token (single-use marking happens
+    up-front in ``vaultwarden_inject_secrets``), so here we only read the
+    registry entry and fetch the field value. None means "leave the reference
+    verbatim" (fail-safe `$` expansion): expired / unknown / already-used
+    tokens, or items whose field went empty. The real secret is ONLY ever
+    written to the returned temp file (mkstemp: atomic, O_EXCL, chmod 600) —
+    never into the command string.
+    """
+    placeholder = f"__VW_SECRET_{token}__"   # registry form (no $)
+    entry = registry.peek(placeholder)
+    if entry is None:
+        return None  # unknown/expired/already-used — error recorded upstream
     try:
         item = auth.get_item(entry.item_id)
         if entry.field_name.startswith("custom:"):
@@ -62,81 +112,124 @@ def _resolve_one(token: str, command: str, auth: AuthManager,
         else:
             value = _field_value(item, entry.field_name, None)
         if not value:
-            raise errors.PlaceholderError(
+            err = errors.PlaceholderError(
                 f"Referenced field '{entry.field_name}' is now empty.")
+            log.warning("Placeholder %s: %s", placeholder, err.message)
+            with _PENDING_LOCK:
+                _PENDING_ERRORS.setdefault(task_id or "", []).append(err.to_dict())
+            return None
     except errors.VaultwardenError as exc:
-        log.error("Secret fetch failed for %s (%s)", token, exc.code)
-        return INVALID_SENTINEL, exc.to_dict()
+        log.error("Secret fetch failed for %s (%s)", placeholder, exc.code)
+        with _PENDING_LOCK:
+            _PENDING_ERRORS.setdefault(task_id or "", []).append(exc.to_dict())
+        return None
+    # Write the secret to a mkstemp file (chmod 600, atomic, symlink-protected).
+    fd, path = tempfile.mkstemp(dir=secrets_dir, prefix=f"vw_{token}_")
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, value.encode("utf-8"))
+    finally:
+        os.close(fd)
+    temp_files.append(path)
     # Register the value so it gets scrubbed from any log line / output echo.
     get_redacting_filter().register_secret(value)
     # v0.1.4 (FAIL-6): also record the plaintext per-task so post_tool_call can
     # redact it from this specific tool call's output even when the global
     # filter state was reset by another component in between.
     record_task_secret(task_id, value)
-    if looks_like_url_context(command, token):
-        escaped = url_escape(value)
-    else:
-        escaped = escape_for_context(value, command, token)
-    return escaped, None
-
-
-def resolve_all_placeholders(command: str, auth: AuthManager,
-                             registry: PlaceholderRegistry,
-                             task_id: str = "") -> tuple[str, list[dict]]:
-    """Replace every token in *command*; returns (new_command, errors)."""
-    errors_out: list[dict] = []
-    for token in placeholder_tokens(command):
-        replacement, err = _resolve_one(token, command, auth, registry, task_id)
-        if err:
-            errors_out.append(err)
-        command = command.replace(token, replacement)
-    return command, errors_out
+    return path
 
 
 def make_placeholder_resolver(auth: AuthManager,
                               registry: PlaceholderRegistry,
                               config: Any = None) -> Callable[..., Any]:
-    """Build the `tool_request` middleware callback for ctx.register_middleware."""
+    """Build the `tool_execution` middleware callback (VWP-04 file injection).
+
+    Signature follows Hermes's tool_execution contract:
+    ``(tool_name, args, original_args, next_call, **kwargs)`` — the callback
+    WRAPS the actual tool invocation and calls ``next_call(modified_args)``,
+    which lets us delete the temp secret files in a guaranteed ``finally``.
+    """
 
     terminal_tools = set(getattr(config, "terminal_tool_names", None) or _DEFAULT_TERMINAL_TOOLS)
     command_keys = tuple(getattr(config, "terminal_command_keys", None) or _DEFAULT_COMMAND_KEYS)
 
-    def vaultwarden_resolve_placeholders(tool_name: str = "", args: dict | None = None,
-                                         task_id: str = "",
-                                         **kwargs: Any) -> dict | None:
+    def vaultwarden_inject_secrets(tool_name: str = "", args: dict | None = None,
+                                   original_args: dict | None = None,
+                                   next_call: Callable[..., Any] | None = None,
+                                   task_id: str = "",
+                                   **kwargs: Any) -> Any:
         # --- chain safety gates -------------------------------------------
         if tool_name not in terminal_tools:
+            if next_call is not None:
+                return next_call(args)
             return None
         if not isinstance(args, dict):
+            if next_call is not None:
+                return next_call(args)
             return None
-        key = next((k for k in command_keys
-                    if isinstance(args.get(k), str) and "__VW_SECRET_" in args[k]), None)
-        if key is None:
-            return None  # nothing to do — DO NOT touch other plugins' args
-        command = args[key]
-        modified, errs = resolve_all_placeholders(command, auth, registry, task_id)
-        if errs:
-            # stash for post_tool_call surfacing; fail-closed sentinel already applied
-            # v0.2.2 (BUGFIX): task-scoped + lock-protected store so parallel
-            # tool calls cannot clear each other's pending errors.
-            with _PENDING_LOCK:
-                _PENDING_ERRORS.setdefault(task_id or "", []).extend(errs)
-        if modified != command:
-            new_args = {**args, key: modified}
-            for extra_key in command_keys:
-                if extra_key != key and isinstance(args.get(extra_key), str) \
-                        and "__VW_SECRET_" in args[extra_key]:
-                    new_val, more = resolve_all_placeholders(
-                        args[extra_key], auth, registry, task_id)
-                    with _PENDING_LOCK:
-                        _PENDING_ERRORS.setdefault(task_id or "", []).extend(more)
-                    new_args[extra_key] = new_val
-            log.debug("Rewrote terminal args (%d placeholder(s)).",
-                      len(placeholder_tokens(command)))
-            return {"args": new_args}
-        return None
+        # Every command key holding a $__VW_SECRET_ reference gets injected.
+        targets = [k for k in command_keys
+                   if isinstance(args.get(k), str) and "$__VW_SECRET_" in args[k]]
+        if not targets:
+            # nothing to do — DO NOT touch other plugins' args
+            if next_call is not None:
+                return next_call(args)
+            return None
 
-    return vaultwarden_resolve_placeholders
+        if next_call is None:
+            # Legacy tool_request-style probe (no wrapper available): report
+            # whether injection WOULD happen, without consuming anything.
+            return {"args": args}
+
+        # VWP-04 single-use semantics: every $__VW_SECRET_ reference that
+        # reaches the middleware is CONSUMED — even if it later turns out to
+        # be expired/unknown/already-used or its vault field went empty (that
+        # reference stays verbatim as a fail-safe `$` expansion). Marking the
+        # tokens used up-front makes replay detection deterministic.
+        with _PENDING_LOCK:
+            task_errors = _PENDING_ERRORS.setdefault(task_id or "", [])
+        for key in targets:
+            for m in _VW_SECRET_CMD_RE.finditer(args[key]):
+                placeholder = f"__VW_SECRET_{m.group(1)}__"  # registry form
+                try:
+                    registry.consume(placeholder)
+                except errors.PlaceholderError as exc:
+                    log.warning("Placeholder %s: %s", placeholder, exc.message)
+                    task_errors.append(exc.to_dict())
+
+        secrets_dir = _secrets_dir()
+        temp_files: list[str] = []
+        new_args = dict(args)
+        resolved_any = False
+        try:
+            for key in targets:
+                command = new_args[key]
+                new_command = command
+                for m in _VW_SECRET_CMD_RE.finditer(command):
+                    path = _inject_one(m.group(1), auth, registry, secrets_dir,
+                                       temp_files, task_id)
+                    if path is None:
+                        continue  # expired/unknown/already-used -> leave as-is
+                    new_command = new_command.replace(m.group(0), f"$(< {path})")
+                    resolved_any = True
+                if new_command != command:
+                    new_args[key] = new_command
+                    resolved_any = True
+            if not resolved_any:
+                return next_call(args)
+            log.debug("Injected %d secret temp file(s) for %s.",
+                      len(temp_files), tool_name)
+            return next_call(new_args)
+        finally:
+            # Cleanup temp files — MUST run even if the command fails/times out
+            for path in temp_files:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    return vaultwarden_inject_secrets
 
 
 #: transient error store surfaced by post_tool_call then cleared.
@@ -231,10 +324,13 @@ def _redact_task_secrets(task_id: str, result: Any) -> None:
 
     scrubbed = _scrub(result)
     if isinstance(result, dict) and isinstance(scrubbed, dict):
-        # _scrub returns a rebuilt container; merge back so callers holding the
-        # original dict reference observe the redaction.
-        result.clear()
-        result.update(scrubbed)
+        # BUGFIX (v0.4.4): only merge back when _scrub actually produced a NEW
+        # container. When no key holds a str/dict/list value (e.g. a plain
+        # {"output": "..."} result), _scrub returns the SAME object — calling
+        # result.clear()/update(result) on it would wipe the dict entirely.
+        if scrubbed is not result:
+            result.clear()
+            result.update(scrubbed)
     elif scrubbed is not result and isinstance(result, MutableMapping):  # pragma: no cover
         result.clear()
         result.update(scrubbed)

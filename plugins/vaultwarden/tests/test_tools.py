@@ -94,8 +94,8 @@ def test_search_tool(tools_by_name):
 def test_get_secret_ref_returns_placeholder_not_secret(tools_by_name, registry):
     res = tools_by_name["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    assert TOKEN_RE.match(res["placeholder"])
-    assert res["ttl_seconds"] == 300
+    assert res["placeholder"].startswith("$")   # VWP-04: $ prefix
+    assert TOKEN_RE.match(res["placeholder"][1:])
     assert "sup3r-s3cret-pg!" not in str(res)
     # v0.3.7 (VWP-14): direct retrieval escape hatch removed — a raw value
     # key can never appear in the response, under any configuration.
@@ -107,8 +107,8 @@ def test_get_secret_ref_custom_field(tools_by_name, registry):
     res = tools_by_name["vaultwarden_get_secret_ref"](
         {"item_id": "aaaa1111-0000-0000-0000-000000000001",
          "field": "password", "custom_field_name": "api_key"})
-    assert TOKEN_RE.match(res["placeholder"])
-    snap = registry.snapshot()[res["placeholder"]]
+    assert TOKEN_RE.match(res["placeholder"][1:])
+    snap = registry.snapshot()[res["placeholder"][1:]]
     assert snap["field"] == "custom:api_key"   # resolved via custom field
     assert "custom-key-value" not in str(res)  # value never returned
 
@@ -243,7 +243,7 @@ def test_direct_retrieval_escape_hatch_removed(bw_cli, registry):
     tools = _dict_tools({s["name"]: h for s, h in get_tools(mgr, cfg, registry)})
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    assert TOKEN_RE.match(res["placeholder"])
+    assert TOKEN_RE.match(res["placeholder"][1:])
     assert "direct_value" not in res
     assert "sup3r-s3cret-pg!" not in str(res)
 
@@ -958,5 +958,5 @@ def test_get_secret_ref_not_affected_by_masking(bw_cli, registry):
     tools = _dict_tools(_conftest_dict_tools(auth, auth._config, registry))
     res = tools["vaultwarden_get_secret_ref"](
         {"item_id": "Postgres prod", "field": "password"})
-    assert TOKEN_RE.match(res["placeholder"])
+    assert TOKEN_RE.match(res["placeholder"][1:])
     assert "sup3r-s3cret-pg!" not in str(res)

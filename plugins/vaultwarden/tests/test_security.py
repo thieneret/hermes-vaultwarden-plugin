@@ -256,12 +256,17 @@ def test_resolver_uses_default_expanded_terminal_tools():
     auth = MagicMock()
     registry = MagicMock()
     mw = make_placeholder_resolver(auth, registry, config=None)
-    # foreign tool still ignored
-    assert mw("file_read", {"command": "__VW_SECRET_x__"}, task_id="t") is None
-    # new default exec-ish tool passes the gate (registry lookup mocked to fail
-    # closed, but the important part is it does NOT return None at the gate)
-    out = mw("exec", {"command": "echo __VW_SECRET_deadbeefcafe__"}, task_id="t-cfg")
-    assert out is not None
+    seen: list = []
+    nc = lambda a: seen.append(a) or "ran"  # noqa: E731
+    # foreign tool still ignored — passed straight through to next_call
+    assert mw("file_read", {"command": "$__VW_SECRET_x__"}, None, nc,
+              task_id="t") == "ran"
+    assert seen == [{"command": "$__VW_SECRET_x__"}]
+    # new default exec-ish tool passes the gate (registry lookup mocked to
+    # fail-safe, but the important part is it does NOT skip the tool)
+    out = mw("exec", {"command": "echo $__VW_SECRET_deadbeefcafe__"}, None, nc,
+             task_id="t-cfg")
+    assert out == "ran"
     from vaultwarden.hooks import _PENDING_ERRORS, _PENDING_LOCK
     with _PENDING_LOCK:
         _PENDING_ERRORS.pop("t-cfg", None)
@@ -279,12 +284,15 @@ def test_resolver_honours_custom_terminal_tool_names():
     cfg.terminal_tool_names = ["my_custom_shell"]
     cfg.terminal_command_keys = ["payload"]
     mw = make_placeholder_resolver(auth, registry, config=cfg)
+    seen: list = []
+    nc = lambda a: seen.append(a) or "ran"  # noqa: E731
     # default name "terminal" is NO LONGER handled when config overrides
-    assert mw("terminal", {"command": "__VW_SECRET_x__"}, task_id="t") is None
+    assert mw("terminal", {"command": "$__VW_SECRET_x__"}, None, nc,
+              task_id="t") == "ran"
     # custom name + custom key ARE handled
-    out = mw("my_custom_shell", {"payload": "echo __VW_SECRET_deadbeefcafe__"},
-             task_id="t-custom")
-    assert out is not None
+    out = mw("my_custom_shell", {"payload": "echo $__VW_SECRET_deadbeefcafe__"},
+             None, nc, task_id="t-custom")
+    assert out == "ran"
     from vaultwarden.hooks import _PENDING_ERRORS, _PENDING_LOCK
     with _PENDING_LOCK:
         _PENDING_ERRORS.pop("t-custom", None)
@@ -526,18 +534,28 @@ def test_middleware_chain_safety_other_plugin_last_word(fake_bw, tmp_path, regis
         return {"args": {**args, "timeout": 45}}  # adds its own field
 
     # --- call with NO placeholder: both middlewares must see original args,
-    # ours returns None, chain keeps other plugin's modification.
+    # ours passes them through byte-identical, chain keeps other plugin's edit.
     base = {"command": "ls -la"}
-    assert ours("terminal", dict(base)) is None
+    passthrough: list = []
+    assert ours("terminal", dict(base), None, lambda a: passthrough.append(a)) is None
+    assert passthrough == [{"command": "ls -la"}]   # untouched
     step = other_plugin_mw("terminal", base)
     assert step["args"] == {"command": "ls -la", "timeout": 45}
 
     # --- call WITH placeholder: ours runs last and preserves other fields.
     entry = registry.create("Postgres prod", "password")
-    mid = other_plugin_mw("terminal", {"command": f"echo {entry.token}"})
-    final = ours("terminal", mid["args"])
-    assert final["args"]["timeout"] == 45          # other plugin's edit kept
-    assert "sup3r-s3cret-pg!" in final["args"]["command"]
+    mid = other_plugin_mw("terminal", {"command": f"echo \"${entry.token}\""})
+    seen: list = []
+
+    def nc(a):
+        seen.append(a)
+        return "executed"
+
+    assert ours("terminal", mid["args"], None, nc) == "executed"
+    final = seen[0]
+    assert final["timeout"] == 45                   # other plugin's edit kept
+    assert "$(<" in final["command"]                # file injection happened
+    assert "sup3r-s3cret-pg!" not in final["command"]  # secret NOT in command
 
 
 def test_register_cleanup_removes_bootstrap_env(monkeypatch, tmp_path, fake_bw):

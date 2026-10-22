@@ -6,9 +6,11 @@ Pipeline: .env (bootstrap secrets, loaded by Hermes secret_scope) ->
 plugin-private memory -> isolated bw subprocesses with
 BITWARDENCLI_APPDATA_DIR pointing at this plugin's .bw-data.
 
-The LLM only ever sees metadata and single-use placeholder tokens; the
-tool_request middleware resolves them into terminal commands right before
-execution and post_tool_call cleans up + redacts.
+The LLM only ever sees metadata and single-use placeholder references
+(`$__VW_SECRET_x__`); the VWP-04 tool_execution middleware injects the real
+secret via a temp file (`$(< path)` under $XDG_RUNTIME_DIR/vw-secrets) right
+before execution, deletes the file in a finally block, and post_tool_call
+cleans up + redacts.
 """
 from __future__ import annotations
 
@@ -159,9 +161,9 @@ def register(ctx: Any) -> bool:
     # would leave placeholder tokens unresolved in terminal commands and
     # expose raw secrets. Any exception from register_middleware propagates
     # out of register(); do NOT wrap this call in a swallowing try/except.
-    log.info("vaultwarden: registering placeholder-injection middleware (fail-closed)")
+    log.info("vaultwarden: registering file-injection middleware (fail-closed)")
     result = ctx.register_middleware(
-        "tool_request", make_placeholder_resolver(auth, registry, config))
+        "tool_execution", make_placeholder_resolver(auth, registry, config))
     if result is False:
         # Some contexts signal failure with a False return instead of raising.
         raise RuntimeError(
@@ -169,7 +171,7 @@ def register(ctx: Any) -> bool:
             "Refusing to load without placeholder injection (fail-closed). "
             "Check Hermes plugin API compatibility."
         )
-    log.info("Placeholder resolver middleware registered")
+    log.info("File-injection middleware registered")
     try:
         ctx.register_hook("post_tool_call", make_post_cleanup_hook(auth, registry, config))
         ctx.register_hook("on_session_end", make_session_end_hook(auth, registry))
