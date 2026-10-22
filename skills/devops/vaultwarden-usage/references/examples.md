@@ -2,13 +2,17 @@
 
 Load when you need a concrete tool-call shape for a specific flow.
 
+**Note:** All placeholder references use the `$` prefix and MUST sit inside
+double quotes (or be unquoted) so the shell expands them. Never single-quote a
+placeholder reference.
+
 ## Example 1: API Request (placeholder)
 
 ```
 1. vaultwarden_search(query="openai")
 2. vaultwarden_get_secret_ref(item_id="def-456", field="password")
-   -> __VW_SECRET_9z8y7x6w5v4u__
-3. terminal(command="curl -H 'Authorization: Bearer __VW_SECRET_9z8y7x6w5v4u__' https://api.openai.com/v1/models")
+   -> $__VW_SECRET_9z8y7x6w5v4u__
+3. terminal(command="curl -H \"Authorization: Bearer $__VW_SECRET_9z8y7x6w5v4u__\" https://api.openai.com/v1/models")
 ```
 
 ## Example 2: Git Clone with Token (placeholder)
@@ -16,8 +20,8 @@ Load when you need a concrete tool-call shape for a specific flow.
 ```
 1. vaultwarden_search(query="forgejo-token")
 2. vaultwarden_get_secret_ref(item_id="abc-123", field="password")
-   -> __VW_SECRET_7k8m9n0p1q2r__
-3. terminal(command="git clone https://oauth2:__VW_SECRET_7k8m9n0p1q2r__@forgejo.example.com/user/repo.git")
+   -> $__VW_SECRET_7k8m9n0p1q2r__
+3. terminal(command="git clone https://oauth2:$__VW_SECRET_7k8m9n0p1q2r__@forgejo.example.com/user/repo.git")
 ```
 
 ## Example 3: SSH Key Loading (use_ssh)
@@ -42,7 +46,7 @@ vaultwarden_store(
 )
 -> {"created": true, "id": "...", "item": {...},
     "password_generated": true,
-    "password_placeholder": "__VW_SECRET_xxxx__",
+    "password_placeholder": "$__VW_SECRET_xxxx__",
     "placeholder_ttl_seconds": 300}
 ```
 

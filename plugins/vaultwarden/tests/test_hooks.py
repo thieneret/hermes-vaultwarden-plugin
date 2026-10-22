@@ -103,11 +103,15 @@ def test_full_lifecycle_file_injection(mw, post, registry):
     mw("terminal", {"command": f"export PGPASSWORD=\"{t}\"; psql -l"},
        None, next_call, task_id="t1")
     snap = registry.snapshot()
-    assert t[1:] not in snap                  # consumed (single use)
+    # VWP-04: consume() marks the token used but keeps the entry until the
+    # post_tool_call hook purges it via cleanup_used(). Single-use is already
+    # enforced at this point — a second consume() raises PLACEHOLDER_ERROR.
+    assert snap[t[1:]]["used"] is True        # consumed (single use)
     # finally block deleted every temp file after the call returned
     assert paths and all(not os.path.exists(p) for p in paths)
     res_obj = {"output": "ok"}
     post("terminal", {}, res_obj, task_id="t1")
+    assert t[1:] not in registry.snapshot()   # post_tool_call purged it
 
 
 def _injected_paths(command: str) -> list[str]:

@@ -1,7 +1,7 @@
 ---
 name: vaultwarden-usage
 description: "vaultwarden: secrets via placeholder tokens, ssh-add, git, password/key generation via store/update"
-version: 1.4.0
+version: 2.0.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -12,7 +12,7 @@ metadata:
 
 # Vaultwarden Secret Management
 
-> Minimum vaultwarden plugin version: **v0.3.8** (12 tools).
+> Minimum vaultwarden plugin version: **v0.4.4** (12 tools).
 
 ## When to Use
 
@@ -35,9 +35,13 @@ generate ssh key, key rotation.
 
 **NEVER attempt to read, extract, or output raw secret values.**
 
-The plugin uses **placeholder injection**: you only ever see opaque
-`__VW_SECRET_xxxx__` tokens. At execution time the middleware substitutes the
-real secret into the command — the raw secret never enters your context window.
+The plugin uses **file-injected placeholders**: you only ever see opaque
+`$__VW_SECRET_xxxx__` tokens. At execution time the middleware writes the real
+secret to a temporary file (chmod 600, in a dedicated directory) and rewrites
+the command to read from it via `$(< path)` — the raw secret never enters your
+context window, the command string, shell history, or `ps` output. Placeholders
+MUST be double-quoted (or unquoted) so the shell expands them; single quotes
+prevent expansion.
 
 **There is NO escape hatch.** No tool returns a raw stored secret under any
 configuration. For SSH keys, `vaultwarden_use_ssh` handles everything internally
@@ -98,9 +102,11 @@ Three mutually-exclusive sources per secret; supplying more than one is a
 ## Standard Workflow (3 Steps)
 
 1. `vaultwarden_search(query="github")` → metadata (id, name, username), NOT the password
-2. `vaultwarden_get_secret_ref(item_id="<uuid>", field="password")` → `{"placeholder": "__VW_SECRET_a1b2c3d4e5f6__", "ttl_seconds": 300}`
-3. `terminal(command="git clone https://myuser:__VW_SECRET_a1b2c3d4e5f6__@github.com/org/repo.git")`
-   The middleware substitutes the real secret at execution time.
+2. `vaultwarden_get_secret_ref(item_id="<uuid>", field="password")` → `{"placeholder": "$__VW_SECRET_a1b2c3d4e5f6__", "ttl_seconds": 300}`
+3. `terminal(command="git clone https://myuser:$__VW_SECRET_a1b2c3d4e5f6__@github.com/org/repo.git")`
+   The placeholder MUST be inside double quotes (or unquoted) — never single
+   quotes — so the shell expands it. The middleware writes the secret to a temp
+   file and rewrites the reference to `$(< path)` at execution time.
 
 ## Important Constraints
 
@@ -114,6 +120,7 @@ Three mutually-exclusive sources per secret; supplying more than one is a
 | SSH name uniqueness | `store_ssh` rejects duplicate names |
 | Generated secrets | `generate=true` stores the secret in the vault; only a placeholder/public key is returned |
 | Conflict = error | Two secret sources at once → `ConfigError`, not silent precedence |
+| Double quotes | Placeholder references MUST be double-quoted (or unquoted); never single-quoted |
 
 ## DO NOT
 
@@ -126,9 +133,10 @@ Three mutually-exclusive sources per secret; supplying more than one is a
 - ❌ NEVER pass a raw `password`/`pass` when `*_env`/`*_file` is available — if you must, relay the response `"warning"` to the user
 - ❌ NEVER pass `pass`/`file` alongside `generate=true` on an SSH tool (ConfigError)
 - ❌ NEVER rotate an SSH key (`update_ssh` + `generate=true`) without `confirm=true`
+- ❌ NEVER place a placeholder inside single quotes (shell won't expand it)
 
 ## References (load on demand)
 
 - **Examples** (concrete tool calls for every flow): `references/examples.md`
 - **Troubleshooting** (error recovery, best practices, verification): `references/troubleshooting.md`
-- **Architecture** (placeholder injection internals): `references/architecture.md`
+- **Architecture** (file-injection internals and the double-quote rule): `references/architecture.md`

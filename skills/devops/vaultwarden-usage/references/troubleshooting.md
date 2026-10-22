@@ -18,6 +18,7 @@ Load when an operation fails or you need operational guidance.
 | `AGENT_ERROR` | ssh-agent failed to start | Check socket path permissions; retry with explicit path |
 | `VALIDATION_ERROR` | File not a valid SSH key | Verify it starts with `-----BEGIN` or `ssh-` |
 | `UNSUPPORTED_BW_VERSION` | Plugin failed to start: `bw` below 2026.9.1 or unparseable | **The `vaultwarden_*` tools are unavailable.** Tell the user to upgrade `bw` to ≥ 2026.9.1. Fail-closed — no workaround |
+| Placeholder not substituted | Reference single-quoted, or `$` prefix missing | Use `$__VW_SECRET_x__` inside double quotes (see architecture.md) |
 
 **Critical rule:** After ANY placeholder-related error, NEVER reuse the same
 placeholder — always request a fresh one.
@@ -27,6 +28,7 @@ placeholder — always request a fresh one.
 | Practice | Why |
 | --- | --- |
 | Check `vaultwarden_status` before critical operations | Avoids mid-workflow session errors |
+| Always double-quote placeholder references | Single quotes prevent shell expansion and break injection |
 | Sync before searching recently created items | `vaultwarden_sync(force=true)` ensures fresh data |
 | Use `generate=true` for new credentials/keys | The generated secret is stored in the vault and never enters your context |
 | Use `*_env`/`*_file` for input secrets | Keeps the value out of the LLM context and chat history |

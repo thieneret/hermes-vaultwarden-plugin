@@ -324,10 +324,13 @@ def _redact_task_secrets(task_id: str, result: Any) -> None:
 
     scrubbed = _scrub(result)
     if isinstance(result, dict) and isinstance(scrubbed, dict):
-        # _scrub returns a rebuilt container; merge back so callers holding the
-        # original dict reference observe the redaction.
-        result.clear()
-        result.update(scrubbed)
+        # BUGFIX (v0.4.4): only merge back when _scrub actually produced a NEW
+        # container. When no key holds a str/dict/list value (e.g. a plain
+        # {"output": "..."} result), _scrub returns the SAME object — calling
+        # result.clear()/update(result) on it would wipe the dict entirely.
+        if scrubbed is not result:
+            result.clear()
+            result.update(scrubbed)
     elif scrubbed is not result and isinstance(result, MutableMapping):  # pragma: no cover
         result.clear()
         result.update(scrubbed)
