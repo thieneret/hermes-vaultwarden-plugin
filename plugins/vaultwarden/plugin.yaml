@@ -1,0 +1,122 @@
+name: vaultwarden
+version: 0.4.3
+description: >
+  Vaultwarden secrets management for Hermes Agent. Provides secure
+  access to vault items via placeholder injection, plus SSH key
+  storage and ssh-agent integration.
+author: thieneret
+requires_bins:
+  - bw
+provides_tools:
+  - vaultwarden_status
+  - vaultwarden_sync
+  - vaultwarden_list
+  - vaultwarden_search
+  - vaultwarden_get_secret_ref
+  - vaultwarden_store
+  - vaultwarden_update
+  - vaultwarden_delete
+  # v0.3.7 (VWP-12): vaultwarden_generate_password removed — generation is
+  # integrated into vaultwarden_store / vaultwarden_update via generate=true.
+  # v0.2.8: SSH key management
+  - vaultwarden_store_ssh
+  - vaultwarden_update_ssh
+  - vaultwarden_delete_ssh
+  - vaultwarden_use_ssh
+config:
+  enabled:
+    type: boolean
+    default: false
+    description: Enable the Vaultwarden plugin.
+  server_url:
+    type: string
+    description: Vaultwarden server URL (e.g. https://vault.example.com).
+  client_id:
+    type: string
+    description: API-key client id ("user.<uuid>").
+  client_secret_env:
+    type: string
+    default: VW_CLIENT_SECRET
+    description: NAME of the env var holding the client secret (value lives in .env).
+  master_password_env:
+    type: string
+    default: VW_MASTER_PASSWORD
+    description: NAME of the env var holding the master password (value lives in .env).
+  appdata_dir_env:
+    type: string
+    default: VW_APPDATA_DIR
+    description: NAME of optional env var overriding the isolated bw appdata dir.
+  allow_write:
+    type: boolean
+    default: false
+    description: Allow store/update/delete tools (vault mutations).
+  allow_startup_secret_injection:
+    type: boolean
+    default: false
+    description: Register the optional SecretSource adapter (disabled by default).
+  # v0.3.7 (VWP-14): allow_direct_secret_retrieval removed entirely.
+  # vaultwarden_get_secret_ref always returns only a placeholder.
+  auto_sync:
+    type: boolean
+    default: true
+  sync_interval_seconds:
+    type: integer
+    default: 300
+  session_timeout_seconds:
+    type: integer
+    default: 14400
+  placeholder_ttl_seconds:
+    type: integer
+    default: 300
+  max_placeholders:
+    type: integer
+    default: 50
+  bw_cli_path:
+    type: string
+    default: ""
+    description: >-
+      Optional FULL path to the bw binary (e.g. /usr/local/bin/bw).
+      A directory path alone is NOT sufficient. BW_CLI_PATH env overrides.
+  # v0.3.8 (VWP-10): retry / backoff for idempotent bw calls. NOTE: the
+  # minimum supported bw version is deliberately NOT configurable (VWP-11:
+  # fail-closed, no override).
+  bw_max_retries:
+    type: integer
+    default: 3
+    description: >-
+      Maximum retry attempts for idempotent bw calls on network errors.
+      Non-idempotent operations (login/unlock/create attachment/delete)
+      are never retried.
+  bw_backoff_base:
+    type: number
+    default: 1.0
+    description: >-
+      Base delay in seconds for exponential backoff between retries
+      (delay = base * 2^attempt + jitter).
+  bw_max_delay:
+    type: number
+    default: 10.0
+    description: >-
+      Upper cap in seconds for any single retry backoff delay.
+  terminal_tool_names:
+    type: array
+    default: []
+    description: >-
+      Tool names treated as terminal/exec for placeholder injection.
+      Empty list uses built-in defaults (terminal, shell, bash,
+      execute_command, run_command, exec, code_execution).
+  terminal_command_keys:
+    type: array
+    default: []
+    description: >-
+      Argument keys scanned for the command string in terminal tools.
+      Empty list uses built-in defaults (command, cmd, input, script, code).
+  # VWP-13 (v0.4.3): opt-in metadata masking for list/search responses.
+  metadata_masking:
+    type: boolean
+    default: false
+    description: >-
+      When true, vaultwarden_list and vaultwarden_search mask 'username'
+      and 'uris' with '***'. 'name', 'id', 'type', 'folder_id' are never
+      masked (needed for item identification). Default OFF preserves
+      search/list usability.
