@@ -784,13 +784,23 @@ def _validate_ssh_key_file(path: str) -> None:
             suggestion="Expected a file starting with '-----BEGIN' or 'ssh-'.")
 
 
-def _resolve_socket_path(ssh_auth_sock: str | None) -> tuple[str, bool]:
-    """Resolve the ssh-agent socket path (single module-level definition).
+def _resolve_socket_path() -> tuple[str, bool]:
+    """Resolve the ssh-agent socket path (developer-controlled).
 
-    Returns (socket_path, agent_started_by_plugin). Resolution rules:
-     - explicit param: direct path if it contains '/' or exists, otherwise
-       treated as an environment variable name holding the socket path;
-     - no param: fall back to $SSH_AUTH_SOCK, then start a fresh agent.
+    VWP-02 (v0.4.6, BREAKING): the LLM-controlled ``ssh_auth_sock`` tool
+    parameter was removed — it enabled local process/socket takeover
+    attacks. The socket path is now resolved exclusively from
+    developer-controlled environment variables.
+
+    Resolution order:
+    1. $VW_SSH_SOCKET_PATH env var (if set): use that path. Reuse if agent running.
+    2. $XDG_RUNTIME_DIR/auth.sock (fallback): reuse if agent running.
+
+    This is a developer-controlled setting, NOT user/LLM-configurable.
+    The $VW_SSH_SOCKET_PATH env var allows sharing the socket with external
+    tools (e.g. ssh-mcp server).
+
+    Returns (socket_path, agent_started_by_plugin).
     """
     def _agent_running(sock: str) -> bool:
         try:
@@ -802,52 +812,45 @@ def _resolve_socket_path(ssh_auth_sock: str | None) -> tuple[str, bool]:
             return False
 
     def _start_agent_at(sock: str) -> None:
+        # Ensure parent directory exists with safe permissions
+        parent = os.path.dirname(sock)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        # Security (VWP-02): reject symlinks — path redirection would let a
+        # local attacker swap the socket after resolution. errors has no
+        # dedicated SecurityError class (errors.py is frozen), so the
+        # SECURITY_ERROR taxonomy code is used via _vault_error().
+        if os.path.islink(sock) or (parent and os.path.islink(parent)):
+            raise _vault_error(
+                "Socket path or parent directory is a symlink.",
+                code="SECURITY_ERROR",
+                suggestion="Use a direct path, not a symlink.")
         subprocess.run(["ssh-agent", "-a", sock],
                        env=_ssh_base_env(),
                        capture_output=True, text=True, timeout=10)
 
-    def _start_agent_default() -> str:
-        r = subprocess.run(["ssh-agent"], env=_ssh_base_env(),
-                           capture_output=True, text=True,
-                           timeout=10)
-        for line in (r.stdout or "").splitlines():
-            if line.startswith("SSH_AUTH_SOCK="):
-                # v0.2.8: ssh-agent prints "SSH_AUTH_SOCK=/path; export ..."
-                return line.split("=", 1)[1].split(";", 1)[0].strip()
-        raise _vault_error(
-            "Failed to start ssh-agent: could not parse socket path.",
-            code="AGENT_ERROR")
-
-    if ssh_auth_sock:
-        if "/" in ssh_auth_sock or os.path.exists(ssh_auth_sock):
-            sock = ssh_auth_sock
-        else:
-            env_val = os.environ.get(ssh_auth_sock, "")
-            if not env_val:
-                raise _vault_error(
-                    f"Environment variable '{ssh_auth_sock}' is not set or empty.",
-                    code="VALIDATION_ERROR",
-                    suggestion=(
-                        "Provide a direct socket path (e.g. /tmp/ssh-xxx/agent.123) "
-                        "or set the environment variable first."))
-            sock = env_val
-
+    # Step 1: Check $VW_SSH_SOCKET_PATH
+    vw_sock = os.environ.get("VW_SSH_SOCKET_PATH", "").strip()
+    if vw_sock:
+        sock = os.path.abspath(vw_sock)
         if _agent_running(sock):
             return sock, False
         else:
             _start_agent_at(sock)
             return sock, True
+
+    # Step 2: Fallback to $XDG_RUNTIME_DIR/auth.sock
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    if xdg:
+        sock = os.path.join(xdg, "auth.sock")
     else:
-        env_sock = os.environ.get("SSH_AUTH_SOCK", "")
-        if env_sock:
-            if _agent_running(env_sock):
-                return env_sock, False
-            else:
-                _start_agent_at(env_sock)
-                return env_sock, True
-        else:
-            sock = _start_agent_default()
-            return sock, True
+        sock = os.path.join(tempfile.gettempdir(), f"vw-auth-{os.getuid()}.sock")
+
+    if _agent_running(sock):
+        return sock, False
+    else:
+        _start_agent_at(sock)
+        return sock, True
 
 
 def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
@@ -1156,7 +1159,9 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
 
     def run():
         name = str(args["name"])
-        ssh_auth_sock_param = args.get("ssh_auth_sock")
+        # VWP-02 (v0.4.6): the LLM-controlled `ssh_auth_sock` argument was
+        # removed from the schema; the socket path is resolved exclusively
+        # from developer-controlled environment variables.
 
         matches = auth.search_items(name)
         exact = [m for m in matches if m.get("name") == name]
@@ -1171,7 +1176,7 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
         item = exact[0]
         item_id = item.get("id", "")
 
-        sock, agent_started = _resolve_socket_path(ssh_auth_sock_param)
+        sock, agent_started = _resolve_socket_path()
 
         key_path = None
         askpass_path = None
@@ -1230,8 +1235,8 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
                 "ssh_auth_sock": sock,
                 "agent_started_by_plugin": agent_started,
                 "message": (
-                    f"Key loaded. Export SSH_AUTH_SOCK={sock} for "
-                    "subsequent SSH commands."),
+                    f"Key loaded. Use SSH_AUTH_SOCK={sock} for subsequent "
+                    "SSH commands."),
             }
         finally:
             # Clean up temp key file

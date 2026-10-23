@@ -22,6 +22,7 @@ from .bw_cli import BwCli, find_bw_binary
 from .config import PluginConfig, load_config
 from .hooks import (
     _cleanup_stale_secrets,
+    _cleanup_stale_sockets,
     make_placeholder_resolver,
     make_post_cleanup_hook,
     make_session_end_hook,
@@ -82,6 +83,10 @@ def register(ctx: Any) -> bool:
     # VWP-20 (v0.4.5): cleanup stale temp files from previous crashed runs
     # (SIGKILL/SIGTERM where the middleware's finally block did not run).
     _cleanup_stale_secrets()
+
+    # VWP-02 (v0.4.6): remove stale ssh-agent sockets (file exists but no
+    # agent running) at the developer-controlled socket locations.
+    _cleanup_stale_sockets()
 
     log.info("Vaultwarden plugin enabled, checking prerequisites...")
 

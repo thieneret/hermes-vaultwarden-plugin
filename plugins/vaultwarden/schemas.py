@@ -405,20 +405,18 @@ VAULTWARDEN_DELETE_SSH = {
 
 VAULTWARDEN_USE_SSH = {
     "name": "vaultwarden_use_ssh",
+    # VWP-02 (v0.4.6): the LLM-controlled `ssh_auth_sock` parameter was
+    # REMOVED — it enabled local process/socket takeover attacks. The socket
+    # path is now resolved from developer-controlled environment variables
+    # only (see tools._resolve_socket_path). Tool description intentionally
+    # carries no socket-behavior details.
     "description": (
-        "Load an SSH private key from the vault into ssh-agent. Retrieves "
-        "the key attachment and passphrase, then runs ssh-add. Returns the "
-        "SSH_AUTH_SOCK path for subsequent SSH commands."),
+        "Load an SSH private key from the vault into ssh-agent."),
     "parameters": {
         "type": "object",
         "properties": {
             "name": {"type": "string",
                      "description": "SSH key item name to load."},
-            "ssh_auth_sock": {"type": "string",
-                              "description": (
-                                  "Socket path OR environment variable name. "
-                                  "If omitted, uses $SSH_AUTH_SOCK. If that is "
-                                  "also empty, starts a new ssh-agent.")},
         },
         "required": ["name"],
     },
