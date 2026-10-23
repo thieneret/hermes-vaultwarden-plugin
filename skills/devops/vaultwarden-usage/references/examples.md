@@ -28,13 +28,12 @@ placeholder reference.
 
 ```
 1. vaultwarden_use_ssh(name="SSH - Production")
-   -> {"loaded": true, "ssh_auth_sock": "/tmp/ssh-XXXXXX/agent.1234", "key_fingerprint": "SHA256:..."}
-2. terminal(command="SSH_AUTH_SOCK=/tmp/ssh-XXXXXX/agent.1234 ssh user@host 'uname -a'")
+   -> {"loaded": true, "ssh_auth_sock": "<path>", "key_fingerprint": "SHA256:..."}
+2. terminal(command="SSH_AUTH_SOCK=<path> ssh user@host 'uname -a'")
 ```
 
-The tool handles everything internally (download key, retrieve passphrase, load
-into ssh-agent). No placeholder needed, no manual `ssh-add`. For a specific
-socket: `vaultwarden_use_ssh(name="SSH - Production", ssh_auth_sock="/tmp/my-agent.sock")`.
+The tool loads the key and returns a socket path. Use the returned
+`ssh_auth_sock` value as `SSH_AUTH_SOCK` for subsequent SSH commands.
 
 ## Example 4: New Credential with Generated Password (preferred)
 

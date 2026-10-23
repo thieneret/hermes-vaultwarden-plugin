@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -115,6 +116,44 @@ def _cleanup_stale_secrets():
                 log.info("cleaned stale secret file: %s", entry.name)
         except OSError:
             pass  # best-effort cleanup
+
+
+def _cleanup_stale_sockets():
+    """Remove stale ssh-agent sockets at plugin startup (VWP-02, v0.4.6).
+
+    A socket is stale if the file exists but no agent is running on it.
+    Checks both $VW_SSH_SOCKET_PATH and $XDG_RUNTIME_DIR/auth.sock — the
+    two developer-controlled socket locations used by
+    tools._resolve_socket_path(). Called from register() next to
+    _cleanup_stale_secrets().
+    """
+    def _is_stale(sock: str) -> bool:
+        if not os.path.exists(sock):
+            return False
+        try:
+            r = subprocess.run(["ssh-add", "-l"],
+                               env={"SSH_AUTH_SOCK": sock,
+                                    "PATH": os.environ.get("PATH", "")},
+                               capture_output=True, text=True, timeout=5)
+            return r.returncode not in (0, 1)  # agent not running
+        except Exception:
+            return True  # cannot determine, treat as stale
+
+    candidates = []
+    vw_sock = os.environ.get("VW_SSH_SOCKET_PATH", "").strip()
+    if vw_sock:
+        candidates.append(os.path.abspath(vw_sock))
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    if xdg:
+        candidates.append(os.path.join(xdg, "auth.sock"))
+
+    for sock in candidates:
+        if _is_stale(sock):
+            try:
+                os.unlink(sock)
+                log.info("cleaned stale ssh socket: %s", sock)
+            except OSError:
+                pass
 
 
 def _inject_one(token: str, auth: AuthManager, registry: PlaceholderRegistry,

@@ -20,6 +20,10 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
    injection would expose secrets in terminal commands)
 8. **Metadata leakage via list/search** (usernames, URIs revealing internal
    infrastructure or private emails in chat history)
+9. **LLM-controlled ssh-agent socket path** (a socket path supplied through a
+   tool call would let a local attacker take over the agent socket; mitigated
+   since v0.4.6 by VWP-02 — the socket path is resolved from
+   developer-controlled environment variables only)
 
 ## Primary Security Controls
 
@@ -43,6 +47,12 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 ### File-injected placeholder injection (VWP-04) — crash recovery (VWP-20)
 
 **Platform-dependent risk:** On native Linux with systemd, `$XDG_RUNTIME_DIR` is typically a tmpfs (RAM-backed), so temp files do not hit physical disk and are cleared on logout/reboot. In Docker containers or on Windows, `$XDG_RUNTIME_DIR` may be backed by persistent storage (overlay filesystem or NTFS), so temp files may persist on disk after a crash (SIGKILL/SIGTERM). The plugin mitigates this with startup cleanup: on each launch, it removes any temp files older than the placeholder TTL (5 minutes), ensuring that files left behind by a previous crash are deleted.
+
+**SSH socket path restriction (VWP-02):** The `vaultwarden_use_ssh` tool no
+longer accepts a user/LLM-specified socket path. The socket is resolved from
+developer-controlled environment variables (`$VW_SSH_SOCKET_PATH` or
+`$XDG_RUNTIME_DIR/auth.sock`), eliminating the socket takeover attack vector.
+Symlink checks prevent path redirection. Stale sockets are cleaned at startup.
 
 ### Error Classification by Source (VWP-09)
 

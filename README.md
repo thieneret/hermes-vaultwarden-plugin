@@ -151,7 +151,7 @@ VW_MASTER_PASSWORD="your-master-password"
 | `vaultwarden_store_ssh` | Store SSH key as login item + attachment (name must be unique). Supports `generate=true` to generate a keypair internally and return the public key; passphrase via `pass_env` / `pass_file`. | ✅ |
 | `vaultwarden_update_ssh` | Update user/passphrase/key attachment. Supports `generate=true` for key rotation (`confirm=true` required); returns the new public key; passphrase via `pass_env` / `pass_file`. | ✅ |
 | `vaultwarden_delete_ssh` | Delete SSH key item (attachment included) | ✅ |
-| `vaultwarden_use_ssh` | Load SSH key into ssh-agent | ❌ |
+| `vaultwarden_use_ssh` | Load SSH key into ssh-agent (socket path resolved from developer-controlled env vars, see SSH Agent Socket) | ❌ |
 
 ## Placeholder Injection (security model)
 
@@ -199,12 +199,30 @@ vaultwarden_store_ssh(name="SSH - Production", user="deploy",
 vaultwarden_use_ssh(name="SSH - Production")
 ```
 
-Socket resolution order for `ssh_auth_sock`:
-1. Direct socket path, or environment variable name
-2. `$SSH_AUTH_SOCK` (if set)
-3. Fresh `ssh-agent` (if neither)
+The passphrase is delivered via the `SSH_ASKPASS` mechanism (see Security
+Architecture below) — never via stdin, argv, or a file; the key uses an atomic
+temp file (`mkstemp`, `0600`) deleted in a `finally` block.
 
-If no agent is running on the resolved socket, one is started with `ssh-agent -a <socket>`. The passphrase is delivered via the `SSH_ASKPASS` mechanism (see Security Architecture below) — never via stdin, argv, or a file; the key uses an atomic temp file (`mkstemp`, `0600`) deleted in a `finally` block.
+### SSH Agent Socket
+
+The `vaultwarden_use_ssh` tool resolves the ssh-agent socket via a
+developer-controlled mechanism (NOT configurable by the LLM):
+
+1. **`$VW_SSH_SOCKET_PATH`** env var (if set): the socket is created/reused
+   at this path. This allows sharing the socket with external tools (e.g.
+   an ssh-mcp server).
+2. **`$XDG_RUNTIME_DIR/auth.sock`** (fallback): if `$VW_SSH_SOCKET_PATH`
+   is unset, the socket is created/reused here.
+
+If an agent is already running at the resolved socket, it is reused.
+Otherwise, a new agent is started. Stale sockets (file exists but no agent
+running) are cleaned up at plugin startup.
+
+**Sharing with ssh-mcp:** Set `$VW_SSH_SOCKET_PATH` to a path accessible by
+both the plugin and the ssh-mcp server, e.g.:
+```bash
+export VW_SSH_SOCKET_PATH=$XDG_RUNTIME_DIR/shared-ssh.sock
+```
 
 ### SSH key generation (`generate=true`)
 
