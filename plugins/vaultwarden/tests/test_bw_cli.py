@@ -126,6 +126,7 @@ class TestValidateBwPath:
     def test_find_bw_binary_uses_no_shutil_which(self):
         """VWP-01: shutil.which must be gone from bw_cli entirely."""
         import inspect
+
         import vaultwarden.bw_cli as mod
         src = inspect.getsource(mod)
         assert "shutil.which" not in src

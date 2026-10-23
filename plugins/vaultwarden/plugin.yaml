@@ -76,7 +76,7 @@ config:
     default: ""
     required: true
     description: >-
-      REQUIRED FULL absolute path to the bw binary (e.g. /usr/local/bin/bw).
+      REQUIRED FULL path (absolute) to the bw binary (e.g. /usr/local/bin/bw).
       A directory path alone is NOT sufficient. VWP-01 (v0.4.7, BREAKING):
       there is NO PATH lookup and NO environment-variable override —
       config.yaml is the single source of truth. The path must be an absolute regular

@@ -5,6 +5,34 @@ Author: **thieneret**
 
 ---
 
+## [0.4.7] - 2026-10-23
+
+### Security (VWP-01 — binary path pinning for the `bw` CLI)
+
+- **BREAKING CHANGE:** `bw` is now executed ONLY from the absolute path set in
+  `plugins.entries.vaultwarden.settings.bw_cli_path`. The PATH-based discovery
+  fallback (`shutil.which("bw")`) has been removed entirely — a compromised
+  `PATH` or a same-named malicious binary can no longer be executed with the
+  plugin's privileges.
+- **BREAKING CHANGE:** `bw_cli_path` is now REQUIRED. If it is empty, the
+  plugin fails closed: `register()` returns `False`, the agent continues
+  without the plugin, and no binary is ever spawned.
+- **BREAKING CHANGE:** The `BW_CLI_PATH` environment-variable override has
+  been removed. config.yaml is the single source of truth for the binary
+  location.
+- New `validate_bw_path()` in `bw_cli.py` enforces, before any subprocess is
+  spawned: the path must be absolute; regular file; contain NO symlink
+  anywhere in its chain; be executable; NOT be group- or world-writable; and
+  be owned by root or the current effective uid. Any violation logs the
+  precise reason and prevents the plugin from loading.
+- VWP-11 (fail-closed minimum-version check, `_MIN_BW_VERSION` /
+  `_check_version()`) is UNCHANGED — path pinning complements it.
+- Out of scope by design (user responsibility): cryptographic authenticity /
+  hash verification of the `bw` binary, and pinning of SSH helper binaries.
+- No tool-count change (12 tools).
+
+---
+
 ## [0.4.6] - 2026-10-23
 
 ### Security (VWP-02 — SSH socket path restriction)
