@@ -6,7 +6,12 @@ import os
 import pytest
 
 from vaultwarden import errors
-from vaultwarden.bw_cli import BwCli, encode_item, find_bw_binary
+from vaultwarden.bw_cli import (
+    BwCli,
+    encode_item,
+    find_bw_binary,
+    validate_bw_path,
+)
 
 
 def test_find_bw_binary_explicit(fake_bw):
@@ -14,9 +19,118 @@ def test_find_bw_binary_explicit(fake_bw):
 
 
 def test_find_bw_binary_missing(tmp_path, monkeypatch):
+    """VWP-01: empty path -> None. No PATH fallback, no BW_CLI_PATH env."""
     monkeypatch.setenv("PATH", str(tmp_path))  # empty dir -> no bw
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     assert find_bw_binary("") is None
+
+
+def test_find_bw_binary_no_path_fallback(tmp_path, monkeypatch):
+    """VWP-01 BREAKING: even with a valid 'bw' on PATH, lookup must not find it."""
+    planted = tmp_path / "bw"
+    planted.write_text("#!/bin/sh\necho ok\n")
+    planted.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("BW_CLI_PATH", str(planted))
+    assert find_bw_binary("") is None       # env override removed too
+    assert find_bw_binary(str(planted)) == str(planted)  # explicit still works
+
+
+# ------------------------------------------------------------- VWP-01 rules
+class TestValidateBwPath:
+    """validate_bw_path(): strict binary-path pinning rules (VWP-01)."""
+
+    def test_valid_path_accepted(self, fake_bw):
+        assert validate_bw_path(fake_bw) == os.path.abspath(fake_bw)
+
+    def test_empty_rejected(self):
+        with pytest.raises(errors.ConfigError, match="required"):
+            validate_bw_path("")
+        with pytest.raises(errors.ConfigError, match="required"):
+            validate_bw_path("   ")
+
+    def test_relative_rejected(self, fake_bw):
+        with pytest.raises(errors.BinaryError, match="absolute"):
+            validate_bw_path("./bw")
+
+    def test_file_symlink_rejected(self, fake_bw, tmp_path):
+        link = tmp_path / "bw-link"
+        link.symlink_to(fake_bw)
+        with pytest.raises(errors.BinaryError, match="symlink"):
+            validate_bw_path(str(link))
+
+    def test_parent_dir_symlink_rejected(self, fake_bw, tmp_path):
+        realdir = tmp_path / "realbin"
+        realdir.mkdir()
+        moved = realdir / "bw"
+        os.rename(fake_bw, moved)
+        dirlink = tmp_path / "binlink"
+        dirlink.symlink_to(realdir, target_is_directory=True)
+        with pytest.raises(errors.BinaryError, match="symlink"):
+            validate_bw_path(str(dirlink / "bw"))
+
+    def test_not_regular_file_rejected(self, tmp_path):
+        with pytest.raises(errors.BinaryError, match="regular file"):
+            validate_bw_path(str(tmp_path))          # directory
+
+    def test_non_executable_rejected(self, tmp_path):
+        p = tmp_path / "bw-noexec"
+        p.write_text("#!/bin/sh\n")
+        p.chmod(0o644)
+        with pytest.raises(errors.BinaryError, match="executable"):
+            validate_bw_path(str(p))
+
+    def test_group_writable_rejected(self, tmp_path):
+        p = tmp_path / "bw-grp"
+        p.write_text("#!/bin/sh\n")
+        p.chmod(0o775)
+        with pytest.raises(errors.BinaryError, match="group/world-writable"):
+            validate_bw_path(str(p))
+
+    def test_world_writable_rejected(self, tmp_path):
+        p = tmp_path / "bw-oth"
+        p.write_text("#!/bin/sh\n")
+        p.chmod(0o777)
+        with pytest.raises(errors.BinaryError, match="group/world-writable"):
+            validate_bw_path(str(p))
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="needs root to chown")
+    def test_wrong_owner_rejected(self, tmp_path):
+        nobody = None
+        try:
+            import pwd
+            nobody = pwd.getpwnam("nobody").pw_uid
+        except KeyError:
+            pass
+        if nobody is None or nobody in (0, os.geteuid()):
+            pytest.skip("no usable foreign uid available")
+        p = tmp_path / "bw-owner"
+        p.write_text("#!/bin/sh\n")
+        p.chmod(0o755)
+        os.chown(p, nobody, -1)
+        with pytest.raises(errors.BinaryError, match="owner"):
+            validate_bw_path(str(p))
+
+    @pytest.mark.skipif(os.geteuid() != 0, reason="needs root to chown")
+    def test_euid_owner_accepted(self, tmp_path):
+        p = tmp_path / "bw-euid"
+        p.write_text("#!/bin/sh\n")
+        p.chmod(0o755)
+        os.chown(p, os.geteuid(), -1)
+        assert validate_bw_path(str(p)) == str(p)
+
+    def test_find_bw_binary_returns_none_on_invalid(self, tmp_path):
+        bad = tmp_path / "bw"           # nonexistent absolute path
+        assert find_bw_binary(str(bad)) is None
+
+    def test_find_bw_binary_uses_no_shutil_which(self):
+        """VWP-01: shutil.which must be gone from bw_cli entirely."""
+        import inspect
+
+        import vaultwarden.bw_cli as mod
+        src = inspect.getsource(mod)
+        assert "shutil.which" not in src
+        assert not hasattr(mod, "shutil")
 
 
 def test_base_env_is_minimal_and_allowlisted(bw_cli):

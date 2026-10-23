@@ -100,7 +100,7 @@ plugins:
         session_timeout_seconds: 14400
         placeholder_ttl_seconds: 300
         max_placeholders: 50
-        bw_cli_path: "/path/to/bw"
+        bw_cli_path: "/usr/local/bin/bw"   # REQUIRED, absolute (VWP-01)
         metadata_masking: false
         bw_max_retries: 3
         bw_backoff_base: 1.0
@@ -128,6 +128,7 @@ VW_MASTER_PASSWORD="your-master-password"
 | `bw_backoff_base` | Base delay (seconds) for exponential backoff. Default: `1.0` |
 | `bw_max_delay` | Maximum delay cap (seconds). Default: `10.0` |
 | `metadata_masking` | When `true`, `vaultwarden_list` and `vaultwarden_search` mask `username` and `uris` with `***`. `name` is never masked. Default: `false` |
+| `bw_cli_path` | **REQUIRED** FULL absolute path to the `bw` binary (e.g. `/usr/local/bin/bw`). Since v0.4.7 (VWP-01, BREAKING) there is NO PATH lookup and NO environment-variable override — config.yaml is the single source of truth. The path is validated before use: absolute, regular file, no symlink anywhere in the chain, executable, not group/world-writable, owned by root or the current user. If missing or invalid the plugin fails closed (does not load; the agent continues without it). Authenticity/hash verification of the binary and pinning of SSH helper binaries are out of scope (operator responsibility). |
 
 ## Tools
 
@@ -300,6 +301,7 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | bw version enforcement | `bw --version` checked at startup against a hardcoded minimum (2026.9.1); plugin refuses to load if below or unparseable — no override |
 | Structured error classification | Errors classified by source stability (Node.js codes → rate limit → bw state → server API); retry only on idempotent network errors with exponential backoff + jitter |
 | Metadata masking (opt-in) | `metadata_masking=true` masks `username`/`uris` in list/search responses; `name` never masked. Default OFF preserves search usability |
+| Binary path pinning (VWP-01) | `bw` is executed ONLY from the REQUIRED absolute `bw_cli_path` (config.yaml). No PATH lookup, no env override. Validated before use: regular file, no symlink in chain, executable, not group/world-writable, owned by root/current user; otherwise the plugin fails closed and does not load |
 | Middleware fail-closed | If placeholder-injection middleware cannot be registered, the plugin refuses to load. No silent fallback without secret protection |
 | File-injected placeholder injection (VWP-04) | Secrets are written to a chmod 600 temp file (mkstemp, atomic) in a dedicated chmod 700 directory under `$XDG_RUNTIME_DIR` (`vw-secrets/`, typically tmpfs). The rewritten command only ever references `$(< path)` — the raw secret never enters the command string, argv, shell history, or logs. Temp files are deleted in a `finally` block even if the command fails |
 
@@ -331,11 +333,14 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **335 tests** (functional files only — test filenames and
+Current suite: **350 tests** (functional files only — test filenames and
 markers must never embed a plugin version; enforced by
 `test_no_version_coupling.py`). Includes positive-control suites for
 concurrency (VWP-18), subprocess env isolation (VWP-19), and crash recovery
 (VWP-20).
+
+Audit remediation status (handoff): **17/20 findings complete** — VWP-01
+(binary path pinning) was closed in v0.4.7.
 
 ## License
 

@@ -15,7 +15,7 @@ import base64
 import json
 import os
 import random
-import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -69,14 +69,90 @@ _NOT_FOUND_MARKERS = (
 )
 
 
+def validate_bw_path(path: str) -> str:
+    """VWP-01: strictly validate the pinned bw binary path.
+
+    The ``bw`` binary is executed ONLY from the absolute path configured in
+    ``plugins.entries.vaultwarden.settings.bw_cli_path`` (config.yaml).
+    There is NO PATH lookup and NO environment-variable override — a
+    compromised PATH or same-named binary must never run with the plugin's
+    privileges.
+
+    Validation rules (any failure raises):
+      * path must be non-empty                       -> ConfigError
+      * path must be absolute                        -> BinaryError
+      * no symlink anywhere in the chain             -> BinaryError
+        (os.path.abspath(p) must equal os.path.realpath(p))
+      * target must be a regular file                -> BinaryError
+      * target must be executable (X_OK)             -> BinaryError
+      * target must NOT be group/world-writable      -> BinaryError
+      * owner must be root (uid 0) or the euid       -> BinaryError
+
+    Returns the validated path string on success.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        raise errors.ConfigError(
+            "bw_cli_path is required.",
+            suggestion="Set plugins.entries.vaultwarden.settings.bw_cli_path "
+                       "to the FULL absolute path of the bw binary "
+                       "(e.g. /usr/local/bin/bw) in config.yaml.")
+
+    if not os.path.isabs(raw):
+        raise errors.BinaryError(
+            f"bw_cli_path {raw!r} must be an absolute path.")
+
+    # Symlink check FIRST: reject if the configured path is (or traverses)
+    # any symlink — abspath (lexical) must equal realpath (resolved).
+    abs_path = os.path.abspath(raw)
+    real_path = os.path.realpath(abs_path)
+    if abs_path != real_path:
+        raise errors.BinaryError(
+            f"bw_cli_path {raw!r} resolves through a symlink "
+            f"(realpath: {real_path}); symlinks are not allowed.")
+
+    try:
+        st = os.stat(abs_path)
+    except OSError as exc:
+        raise errors.BinaryError(
+            f"bw binary at {raw!r} not found or not accessible: "
+            f"{type(exc).__name__}") from exc
+
+    if not stat.S_ISREG(st.st_mode):
+        raise errors.BinaryError(
+            f"bw_cli_path {raw!r} is not a regular file.")
+
+    if not os.access(abs_path, os.X_OK):
+        raise errors.BinaryError(
+            f"bw binary at {raw!r} is not executable.")
+
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise errors.BinaryError(
+            f"bw binary at {raw!r} is group/world-writable; refusing to "
+            "execute a binary other users can modify.")
+
+    if st.st_uid not in (0, os.geteuid()):
+        raise errors.BinaryError(
+            f"bw binary at {raw!r} has unexpected owner uid {st.st_uid}; "
+            "it must be owned by root or the current effective user.")
+
+    return abs_path
+
+
 def find_bw_binary(explicit: str = "") -> str | None:
-    """Locate the bw binary: explicit path -> BW_CLI_PATH -> PATH lookup."""
-    for candidate in (explicit, os.environ.get("BW_CLI_PATH", "")):
-        if candidate:
-            p = Path(candidate).expanduser()
-            if p.is_file() and os.access(p, os.X_OK):
-                return str(p)
-    return shutil.which("bw")
+    """Return the validated pinned bw path, or None on any validation failure.
+
+    VWP-01 (v0.4.7 BREAKING): validates ONLY the explicitly configured
+    ``bw_cli_path``. The former environment-variable override and the
+    PATH-lookup fallback are REMOVED — config.yaml is the single source of
+    truth for the binary location. On failure the reason is logged and None
+    is returned (the caller fails closed).
+    """
+    try:
+        return validate_bw_path(explicit)
+    except errors.VaultwardenError as exc:
+        log.warning("bw_cli_path validation failed (%s): %s", exc.code, exc.message)
+        return None
 
 
 class BwCli:
@@ -88,7 +164,12 @@ class BwCli:
              backoff_base: float = 1.0,
              max_delay: float = 10.0):
         if not bw_path or not find_bw_binary(bw_path):
-            raise errors.BinaryError("Bitwarden CLI ('bw') not found.")
+            # VWP-01 (v0.4.7): the path is validated strictly here — no PATH
+            # lookup and no env override; config.yaml is the only source of
+            # truth for the binary location.
+            raise errors.BinaryError(
+                "Configured bw_cli_path is missing or failed validation "
+                "(see plugin log).")
         self.bw_path = str(bw_path)
         self.appdata_dir = str(Path(appdata_dir).expanduser())
         self.timeout = timeout

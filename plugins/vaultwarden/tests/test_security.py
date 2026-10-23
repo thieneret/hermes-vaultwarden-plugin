@@ -66,11 +66,11 @@ def test_audit_flags_disallowed_keys():
 def test_no_bootstrap_secrets_in_os_environ_after_register(monkeypatch, tmp_path, fake_bw):
     monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
     monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
-    monkeypatch.setenv("BW_CLI_PATH", fake_bw)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import vaultwarden
     from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
-    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
+                           "bw_cli_path": fake_bw})
     vaultwarden.register(ctx)
     assert "VW_CLIENT_SECRET" not in os.environ
     assert "VW_MASTER_PASSWORD" not in os.environ
@@ -566,11 +566,11 @@ def test_register_cleanup_removes_bootstrap_env(monkeypatch, tmp_path, fake_bw):
     import vaultwarden
     monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
     monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
-    monkeypatch.setenv("BW_CLI_PATH", fake_bw)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
-    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
+                           "bw_cli_path": fake_bw})
     ok = vaultwarden.register(ctx)
     assert ok is True
     assert "VW_CLIENT_SECRET" not in os.environ
