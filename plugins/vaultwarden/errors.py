@@ -53,7 +53,11 @@ class ConfigError(VaultwardenError):
 class BinaryError(VaultwardenError):
     code = "BINARY_ERROR"
     recoverable = False
-    suggestion = "Install the Bitwarden CLI (`npm install -g @bitwarden/cli`) or set BW_CLI_PATH."
+    # v0.4.7 (VWP-01): the env override was removed — bw_cli_path in
+    # config.yaml is the single source of truth for the binary location.
+    suggestion = ("Install the Bitwarden CLI (`npm install -g @bitwarden/cli`) "
+                  "and set plugins.entries.vaultwarden.settings.bw_cli_path "
+                  "to its full absolute path in config.yaml.")
 
 
 class AuthError(VaultwardenError):

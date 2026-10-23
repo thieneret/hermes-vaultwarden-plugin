@@ -264,6 +264,10 @@ BASE_SECTION = {
     "allow_write": False,
 }
 
+# VWP-01 (v0.4.7 BREAKING): bw_cli_path is REQUIRED — there is no PATH
+# lookup and no BW_CLI_PATH env override any more. Tests that need a real
+# binary pass it via section={"bw_cli_path": fake_bw}.
+
 BASE_ENV = {
     "VW_CLIENT_SECRET": "cs-secret",
     "VW_MASTER_PASSWORD": "mp-secret",

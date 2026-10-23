@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 0.4.6
+version: 0.4.7
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key
@@ -74,9 +74,15 @@ config:
   bw_cli_path:
     type: string
     default: ""
+    required: true
     description: >-
-      Optional FULL path to the bw binary (e.g. /usr/local/bin/bw).
-      A directory path alone is NOT sufficient. BW_CLI_PATH env overrides.
+      REQUIRED FULL absolute path to the bw binary (e.g. /usr/local/bin/bw).
+      A directory path alone is NOT sufficient. VWP-01 (v0.4.7, BREAKING):
+      there is NO PATH lookup and NO environment-variable override —
+      config.yaml is the single source of truth. The path must be an absolute regular
+      file with no symlink anywhere in its chain, executable, not
+      group/world-writable, and owned by root or the current user; the
+      plugin fails closed (does not load) otherwise.
   # v0.3.8 (VWP-10): retry / backoff for idempotent bw calls. NOTE: the
   # minimum supported bw version is deliberately NOT configurable (VWP-11:
   # fail-closed, no override).

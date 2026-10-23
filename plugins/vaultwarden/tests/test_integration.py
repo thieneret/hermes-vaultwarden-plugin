@@ -29,11 +29,13 @@ def _dict_tools(raw):
 def _register_ok(monkeypatch, tmp_path, fake_bw, section_extra=None, env_extra=None):
     monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
     monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
-    monkeypatch.setenv("BW_CLI_PATH", fake_bw)
+    # VWP-01 (v0.4.7 BREAKING): BW_CLI_PATH env override removed — the path
+    # must be pinned via the bw_cli_path setting in config.yaml.
+    monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     for k, v in (env_extra or {}).items():
         monkeypatch.setenv(k, v)
-    section = {**BASE_SECTION, **(section_extra or {})}
+    section = {**BASE_SECTION, "bw_cli_path": fake_bw, **(section_extra or {})}
     ctx = RecordingCtx(section)
     ok = vaultwarden.register(ctx)
     return ok, ctx
@@ -69,22 +71,60 @@ def test_register_disabled_returns_false(monkeypatch, tmp_path, fake_bw):
 
 
 def test_graceful_degradation_missing_bw(monkeypatch, tmp_path):
-    """No bw binary anywhere -> register() returns False, agent continues, no crash."""
+    """No pinned bw_cli_path -> register() returns False, agent continues, no crash.
+
+    VWP-01 (v0.4.7 BREAKING): even with a valid 'bw' on PATH and BW_CLI_PATH
+    set, the plugin must NOT discover it — config.yaml is the only source.
+    """
     monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
     monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
-    monkeypatch.delenv("BW_CLI_PATH", raising=False)
-    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    planted = tmp_path / "bw"
+    planted.write_text("#!/bin/sh\necho ok\n")
+    planted.chmod(0o755)
+    monkeypatch.setenv("BW_CLI_PATH", str(planted))
+    monkeypatch.setenv("PATH", str(tmp_path))
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
     assert vaultwarden.register(ctx) is False
     assert ctx.tools == []
 
 
+def test_register_fails_closed_invalid_bw_cli_path(monkeypatch, tmp_path):
+    """Configured but invalid bw_cli_path -> register() returns False."""
+    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
+    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
+    monkeypatch.delenv("BW_CLI_PATH", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
+                        "bw_cli_path": str(tmp_path / "no-such-bw")})
+    assert vaultwarden.register(ctx) is False
+    assert ctx.tools == []
+
+
+def test_bw_cli_path_env_no_longer_overrides_config(monkeypatch):
+    """VWP-01 BREAKING: BW_CLI_PATH env must NOT override/replace config.yaml."""
+    from vaultwarden.config import load_config
+    from vaultwarden.tests.conftest import SettingsContext
+
+    monkeypatch.setenv("BW_CLI_PATH", "/from/env/bw")
+
+    # Config value wins; the env snapshot (which contains BW_CLI_PATH) is ignored.
+    cfg = load_config(SettingsContext({**BASE_SECTION,
+                                       "bw_cli_path": "/from/config/bw"}),
+                      env={"BW_CLI_PATH": "/from/env/bw"})
+    assert cfg.bw_cli_path == "/from/config/bw"      # env ignored
+
+    # Empty config + BW_CLI_PATH set -> still empty -> register() fails closed.
+    cfg2 = load_config(SettingsContext(BASE_SECTION),
+                       env={"BW_CLI_PATH": "/from/env/bw"})
+    assert cfg2.bw_cli_path == ""
+
+
 def test_graceful_degradation_missing_env(monkeypatch, tmp_path, fake_bw):
     monkeypatch.delenv("VW_CLIENT_SECRET", raising=False)
     monkeypatch.delenv("VW_MASTER_PASSWORD", raising=False)
-    monkeypatch.setenv("BW_CLI_PATH", fake_bw)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
+                           "bw_cli_path": fake_bw})
     assert vaultwarden.register(ctx) is False   # logged, not raised
 
 
@@ -441,9 +481,9 @@ def test_register_raises_when_middleware_registration_fails(monkeypatch, tmp_pat
 
     monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
     monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
-    monkeypatch.setenv("BW_CLI_PATH", fake_bw)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
+                           "bw_cli_path": fake_bw})
     ctx.register_middleware = _boom
     with pytest.raises(RuntimeError, match="Hermes API mismatch"):
         vaultwarden.register(ctx)
@@ -453,9 +493,9 @@ def test_register_raises_when_middleware_registration_returns_false(monkeypatch,
     """A False return (instead of an exception) must also abort loading."""
     monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
     monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
-    monkeypatch.setenv("BW_CLI_PATH", fake_bw)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
+                           "bw_cli_path": fake_bw})
     ctx.register_middleware = lambda kind, fn: False
     with pytest.raises(RuntimeError, match="fail-closed"):
         vaultwarden.register(ctx)

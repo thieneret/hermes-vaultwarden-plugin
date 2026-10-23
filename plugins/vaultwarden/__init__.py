@@ -90,14 +90,27 @@ def register(ctx: Any) -> bool:
 
     log.info("Vaultwarden plugin enabled, checking prerequisites...")
 
-    # graceful degradation: missing bw -> tools disabled, agent continues
-    bw_path = find_bw_binary(config.bw_cli_path)
-    if not bw_path:
-        log.warning("Vaultwarden plugin load FAILED: Bitwarden CLI ('bw') not found "
-                    "(bw_cli_path=%r, BW_CLI_PATH=%r)",
-                    config.bw_cli_path, os.environ.get("BW_CLI_PATH", ""))
+    # VWP-01 (v0.4.7 BREAKING): bw is executed ONLY from the pinned,
+    # strictly validated bw_cli_path (config.yaml). No PATH lookup and no
+    # env override. Fail closed: missing or invalid path ->
+    # register() returns False and the agent continues without the plugin.
+    configured_bw = config.bw_cli_path
+    if not configured_bw:
+        log.warning("Vaultwarden plugin load FAILED: bw_cli_path is required "
+                    "but not configured. Set "
+                    "plugins.entries.vaultwarden.settings.bw_cli_path to the "
+                    "FULL absolute path of the bw binary in config.yaml.")
         return False
-    log.info("Bitwarden CLI found: %s", bw_path)
+    bw_path = find_bw_binary(configured_bw)
+    if not bw_path:
+        log.warning("Vaultwarden plugin load FAILED: bw_cli_path=%r is "
+                    "configured but failed validation (must be an absolute, "
+                    "regular, executable file with no symlink in its chain, "
+                    "not group/world-writable, owned by root or the current "
+                    "user). See the validation warning above for the exact "
+                    "reason.", configured_bw)
+        return False
+    log.info("Bitwarden CLI pinned and validated: %s", bw_path)
 
     try:
         client_secret, master_password = _resolve_secrets(config)

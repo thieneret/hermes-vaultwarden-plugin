@@ -227,7 +227,9 @@ class PluginConfig:
 
     @property
     def bw_cli_path(self) -> str:
-        return str(self.env_snapshot.get("BW_CLI_PATH") or self._raw("bw_cli_path") or "")
+        # VWP-01 (v0.4.7 BREAKING): the former environment-variable
+        # override is REMOVED — config.yaml is the single source of truth.
+        return str(self._raw("bw_cli_path") or "")
 
     # v0.2.2 (BUGFIX): configurable terminal tool names / command keys.
     # Empty list => hooks.py falls back to its built-in defaults.
