@@ -5,6 +5,21 @@ Author: **thieneret**
 
 ---
 
+## [0.4.6] - 2026-10-23
+
+### Security (VWP-02 — SSH socket path restriction)
+
+- **BREAKING:** Removed the `ssh_auth_sock` parameter from
+  `vaultwarden_use_ssh`. The socket path is now resolved from
+  developer-controlled environment variables (`$VW_SSH_SOCKET_PATH` or
+  `$XDG_RUNTIME_DIR/auth.sock`), eliminating the LLM-controlled socket
+  takeover attack vector. If an agent is already running at the resolved
+  socket, it is reused. Stale sockets are cleaned at plugin startup.
+
+No tool-count change (12 tools).
+
+---
+
 ## [0.4.5] - 2026-10-22
 
 ### Security (audit findings VWP-18, VWP-19, VWP-20)

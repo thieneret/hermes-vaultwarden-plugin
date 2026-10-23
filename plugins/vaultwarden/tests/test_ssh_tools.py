@@ -51,84 +51,94 @@ def test_validate_ssh_key_file_not_ssh_key(tmp_path):
     assert exc_info.value.code == "VALIDATION_ERROR"
 
 
-# ── Socket resolution ────────────────────────────────────────────────────
+# ── Socket resolution (VWP-02: developer-controlled, parameter-less) ─────
 
-def test_resolve_socket_direct_path_running():
-    """Direct path with running agent → use it, no start."""
-    with patch("vaultwarden.tools.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0)
-        sock, started = _resolve_socket_path("/tmp/ssh-test/agent.123")
-        assert sock == "/tmp/ssh-test/agent.123"
-        assert started is False
-
-
-def test_resolve_socket_direct_path_not_running():
-    """Direct path without running agent → start agent with -a."""
-    with patch("vaultwarden.tools.subprocess.run") as mock_run:
-        mock_run.side_effect = [
-            MagicMock(returncode=2),  # ssh-add -l → no agent
-            MagicMock(returncode=0),  # ssh-agent -a → started
-        ]
-        sock, started = _resolve_socket_path("/tmp/ssh-test/agent.456")
-        assert sock == "/tmp/ssh-test/agent.456"
-        assert started is True
-        agent_call = mock_run.call_args_list[1]
-        assert "-a" in agent_call[0][0]
-
-
-def test_resolve_socket_env_var():
-    """Env var name → resolve to path."""
-    with patch.dict(os.environ, {"MY_SOCK": "/tmp/ssh-env/agent.789"}):
+def test_resolve_socket_vw_env_var_running(tmp_path):
+    """$VW_SSH_SOCKET_PATH set, agent running → reuse, no new agent."""
+    sock_path = str(tmp_path / "vw-agent.sock")
+    with patch.dict(os.environ, {"VW_SSH_SOCKET_PATH": sock_path}, clear=False):
         with patch("vaultwarden.tools.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            sock, started = _resolve_socket_path("MY_SOCK")
-            assert sock == "/tmp/ssh-env/agent.789"
-
-
-def test_resolve_socket_env_var_not_set():
-    """Non-existent env var → clear error."""
-    with patch.dict(os.environ, {}, clear=True):
-        with pytest.raises(errors.VaultwardenError) as exc_info:
-            _resolve_socket_path("NONEXISTENT_VAR")
-        assert exc_info.value.code == "VALIDATION_ERROR"
-
-
-def test_resolve_socket_no_param_uses_env():
-    """No param → read $SSH_AUTH_SOCK."""
-    with patch.dict(os.environ, {"SSH_AUTH_SOCK": "/tmp/ssh-default/agent"}):
-        with patch("vaultwarden.tools.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            sock, started = _resolve_socket_path(None)
-            assert sock == "/tmp/ssh-default/agent"
+            mock_run.return_value = MagicMock(returncode=0)  # ssh-add -l OK
+            sock, started = _resolve_socket_path()
+            assert sock == os.path.abspath(sock_path)
             assert started is False
+            # only the ssh-add probe ran — no ssh-agent spawn
+            assert mock_run.call_count == 1
+            assert mock_run.call_args_list[0][0][0] == ["ssh-add", "-l"]
 
 
-def test_resolve_socket_no_param_env_empty_starts_agent():
-    """No param, empty $SSH_AUTH_SOCK → start fresh agent."""
-    with patch.dict(os.environ, {"SSH_AUTH_SOCK": ""}, clear=True):
-        with patch("vaultwarden.tools.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout="SSH_AUTH_SOCK=/tmp/ssh-new/agent.999; export SSH_AUTH_SOCK;\n")
-            sock, started = _resolve_socket_path(None)
-            assert sock == "/tmp/ssh-new/agent.999"
-            assert started is True
-
-
-def test_resolve_socket_env_set_but_agent_dead():
-    """$SSH_AUTH_SOCK set but agent not running → start agent at that path."""
-    with patch.dict(os.environ, {"SSH_AUTH_SOCK": "/tmp/ssh-dead/agent"}):
+def test_resolve_socket_vw_env_var_not_running(tmp_path):
+    """$VW_SSH_SOCKET_PATH set, no agent → start agent at that path."""
+    sock_path = str(tmp_path / "sub" / "vw-agent.sock")
+    with patch.dict(os.environ, {"VW_SSH_SOCKET_PATH": sock_path}, clear=False):
         with patch("vaultwarden.tools.subprocess.run") as mock_run:
             mock_run.side_effect = [
                 MagicMock(returncode=2),  # ssh-add -l → no agent
                 MagicMock(returncode=0),  # ssh-agent -a → started
             ]
-            sock, started = _resolve_socket_path(None)
-            assert sock == "/tmp/ssh-dead/agent"
+            sock, started = _resolve_socket_path()
+            assert sock == os.path.abspath(sock_path)
             assert started is True
             agent_call = mock_run.call_args_list[1]
-            assert "-a" in agent_call[0][0]
-            assert "/tmp/ssh-dead/agent" in agent_call[0][0]
+            assert agent_call[0][0][:2] == ["ssh-agent", "-a"]
+            assert sock in agent_call[0][0]
+
+
+def test_resolve_socket_fallback_xdg_runtime(tmp_path):
+    """$VW_SSH_SOCKET_PATH unset → falls back to $XDG_RUNTIME_DIR/auth.sock."""
+    with patch.dict(os.environ, {
+            "VW_SSH_SOCKET_PATH": "",
+            "XDG_RUNTIME_DIR": str(tmp_path)}, clear=False):
+        with patch("vaultwarden.tools.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1)  # agent running (no keys)
+            sock, started = _resolve_socket_path()
+            assert sock == os.path.join(str(tmp_path), "auth.sock")
+            assert started is False
+
+
+def test_resolve_socket_symlink_rejected(tmp_path):
+    """Symlinked socket path → SECURITY_ERROR (path redirection guard)."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link"
+    link_dir.symlink_to(real_dir)
+    sock_path = str(link_dir / "agent.sock")
+    with patch.dict(os.environ, {"VW_SSH_SOCKET_PATH": sock_path}, clear=False):
+        with patch("vaultwarden.tools.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=2)  # no agent → try start
+            with pytest.raises(errors.VaultwardenError) as exc_info:
+                _resolve_socket_path()
+            assert exc_info.value.code == "SECURITY_ERROR"
+
+
+# ── Stale socket cleanup (plugin startup) ────────────────────────────────
+
+def test_cleanup_stale_sockets_removes_stale(tmp_path):
+    """Socket file exists but no agent running → removed at startup."""
+    from vaultwarden.hooks import _cleanup_stale_sockets
+    stale = tmp_path / "auth.sock"
+    stale.write_text("")  # placeholder file standing in for the socket
+    with patch.dict(os.environ, {
+            "VW_SSH_SOCKET_PATH": str(stale),
+            "XDG_RUNTIME_DIR": ""}, clear=False):
+        with patch("vaultwarden.hooks.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=2)  # agent not running
+            _cleanup_stale_sockets()
+    assert not stale.exists()
+
+
+def test_cleanup_stale_sockets_keeps_active(tmp_path):
+    """Agent running on the socket → file is NOT removed."""
+    from vaultwarden.hooks import _cleanup_stale_sockets
+    active = tmp_path / "auth.sock"
+    active.write_text("")
+    with patch.dict(os.environ, {
+            "VW_SSH_SOCKET_PATH": str(active),
+            "XDG_RUNTIME_DIR": ""}, clear=False):
+        with patch("vaultwarden.hooks.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)  # agent running
+            _cleanup_stale_sockets()
+    assert active.exists()
 
 
 # ── store_ssh name uniqueness ────────────────────────────────────────────
@@ -211,7 +221,7 @@ def test_use_ssh_env_keyset_and_cleanup(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
     monkeypatch.setattr(tools, "_resolve_socket_path",
-                        lambda p: ("/tmp/fake.sock", False))
+                        lambda: ("/tmp/fake.sock", False))
     registry = PlaceholderRegistry()
     cfg = make_config()
     handler = {s["name"]: h for s, h in
