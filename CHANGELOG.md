@@ -5,6 +5,42 @@ Author: **thieneret**
 
 ---
 
+## [0.4.8] - 2026-10-24
+
+### Bugfixes (live-container testing of v0.4.7)
+
+- **Defects 1-2 (store_ssh KeyError):** `vaultwarden_store_ssh` upload mode
+  now validates the presence of `user` and `file` BEFORE reading them from
+  the args dict, raising a clear `ConfigError` ("'user'/'file' is required
+  in upload mode") instead of leaking a raw `KeyError` reported as
+  "Internal plugin error: KeyError".
+- **Defect 3 (permanent delete):** `BwCli.delete_item` with
+  `permanent=true` now performs a REAL `bw sync` and retries the delete
+  exactly once when `bw` returns not_found (e.g. the item is already in the
+  trash and invisible in a stale local cache). The final not_found message
+  names the `item_id` ("No item matching id '<id>'.") instead of the
+  misleading "No matching item for query '--permanent'" (which came from
+  `args[-1]`).
+- **Defect 4 (password_env in multiplex mode):** `_resolve_secret_input`'s
+  env channel now resolves via `config.resolve_secret()` (get_secret-first)
+  when a config is available — all four call sites (`h_store`, `h_update`,
+  `h_store_ssh`, `h_update_ssh`) pass it. In multiplex gateway mode `.env`
+  values are NOT in `os.environ`, so `password_env` / `pass_env` previously
+  reported "not set or empty"; they now resolve correctly. The raw
+  `os.environ.get()` fallback remains for callers without a config.
+- **Latent AttributeError:** added the missing `errors.PluginError` class
+  (code `PLUGIN_ERROR`) used by `auth._configure_server`.
+
+### Unchanged
+
+- VWP-01 (v0.4.7) binary path pinning, VWP-11 version check, the error
+  taxonomy codes, the 12-tool registration, and every security mechanism
+  (RedactingFilter, askpass env delivery, temp-file cleanup, 0600/0700
+  permissions, env isolation) are untouched. No breaking changes to any
+  tool schema or response shape.
+
+---
+
 ## [0.4.7] - 2026-10-23
 
 ### Security (VWP-01 — binary path pinning for the `bw` CLI)

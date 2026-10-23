@@ -574,8 +574,29 @@ class BwCli:
         args = ["delete", "item", item_id]
         if permanent:
             args.append("--permanent")
-        return self.run(args, env={"BW_SESSION": session_key}, raw=True,
-                      retryable=False)
+        # v0.4.8 (BUGFIX, Defect 3): a permanent delete can hit not_found
+        # when the item is already in the trash and invisible in a stale
+        # local cache. On NotFoundError with permanent=True, run a REAL
+        # `bw sync` (NOT sync(force=True), which maps to `bw sync --last`)
+        # and retry the delete exactly once. The final error message names
+        # the item_id — never args[-1] ("--permanent"), which produced the
+        # misleading "No matching item for query '--permanent'".
+        try:
+            return self.run(args, env={"BW_SESSION": session_key}, raw=True,
+                          retryable=False)
+        except errors.NotFoundError:
+            if not permanent:
+                raise errors.NotFoundError(
+                    f"No item matching id '{item_id}'.")
+            log.info("Permanent delete of %s returned not_found; "
+                     "syncing vault and retrying once.", item_id)
+            self.sync(session_key)
+            try:
+                return self.run(args, env={"BW_SESSION": session_key},
+                                raw=True, retryable=False)
+            except errors.NotFoundError:
+                raise errors.NotFoundError(
+                    f"No item matching id '{item_id}'.")
 
     # ---------------------------------------------------------- attachments
     def create_attachment(self, session_key: str, file_path: str,

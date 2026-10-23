@@ -830,15 +830,23 @@ def test_store_ssh_upload_raw_pass_dual_warning(tmp_path):
     assert "MUST warn the user" in res["warning"]
 
 
-def test_store_ssh_upload_pass_env(tmp_path, monkeypatch):
+def test_store_ssh_upload_pass_env(tmp_path):
     key = tmp_path / "id_ed25519"
     key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n"
                    "-----END OPENSSH PRIVATE KEY-----\n")
-    monkeypatch.setenv("VW_SSH_PASS", "env-pass")
     auth, tools = _store_ssh_tools()
-    res = tools["vaultwarden_store_ssh"](
-        {"name": "SSH - Up", "user": "deploy", "file": str(key),
-         "pass_env": "VW_SSH_PASS"})
+    # v0.4.8 (Defect 4): pass_env resolves via config.resolve_secret —
+    # inject through the config env snapshot (.env channel), not os.environ.
+    cfg = auth._config                                   # noqa: SLF001
+    orig_snapshot = dict(cfg.env_snapshot)
+    cfg.env_snapshot["VW_SSH_PASS"] = "env-pass"         # type: ignore[index]
+    try:
+        res = tools["vaultwarden_store_ssh"](
+            {"name": "SSH - Up", "user": "deploy", "file": str(key),
+             "pass_env": "VW_SSH_PASS"})
+    finally:
+        cfg.env_snapshot.clear()
+        cfg.env_snapshot.update(orig_snapshot)
     assert res["created"] is True
     assert "warning" not in res
     assert auth._created_ssh["args"][2] == "env-pass"  # noqa: SLF001
@@ -863,6 +871,55 @@ def test_store_ssh_upload_pass_file(tmp_path):
 
 EXISTING_SSH = [{"id": "ssh-item-1", "name": "SSH - Rot",
                  "attachments": [{"id": "att-old", "name": "key"}]}]
+
+# ── v0.4.8 (Defects 1-2): upload-mode user/file validation ────────────────
+
+def test_store_ssh_upload_missing_file_raises_config_error():
+    """v0.4.8: missing 'file' in upload mode -> clear ConfigError, never a
+    raw KeyError ("Internal plugin error: KeyError")."""
+    auth, tools = _store_ssh_tools()
+    res = tools["vaultwarden_store_ssh"](
+        {"name": "SSH - Up", "user": "deploy", "pass": "p"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "KeyError" not in res["error"]
+    assert "'file'" in res["error"] and "required in upload mode" in res["error"]
+
+
+def test_store_ssh_upload_missing_user_raises_config_error():
+    """v0.4.8: missing 'user' in upload mode -> clear ConfigError."""
+    auth, tools = _store_ssh_tools()
+    res = tools["vaultwarden_store_ssh"](
+        {"name": "SSH - Up", "file": "/tmp/k", "pass": "p"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "KeyError" not in res["error"]
+    assert "'user'" in res["error"] and "required in upload mode" in res["error"]
+
+
+def test_store_ssh_upload_pass_env_resolved_via_config(tmp_path):
+    """v0.4.8 (Defect 4): pass_env resolves via config.resolve_secret —
+    works for values NOT present in os.environ (multiplex gateway mode)."""
+    key = tmp_path / "id_ed25519"
+    key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n"
+                   "-----END OPENSSH PRIVATE KEY-----\n")
+    auth, tools = _store_ssh_tools()
+    cfg = auth._config                                    # noqa: SLF001
+    orig_resolve = cfg.resolve_secret
+
+    def fake_resolve(var_name, *, required=True):
+        if var_name == "VW_SSH_MULTIPLEX_PASS":
+            return "multiplex-pass"
+        return orig_resolve(var_name, required=required)
+    cfg.resolve_secret = fake_resolve                     # type: ignore[method-assign]
+    try:
+        os.environ.pop("VW_SSH_MULTIPLEX_PASS", None)
+        res = tools["vaultwarden_store_ssh"](
+            {"name": "SSH - Up", "user": "deploy", "file": str(key),
+             "pass_env": "VW_SSH_MULTIPLEX_PASS"})
+    finally:
+        cfg.resolve_secret = orig_resolve                 # type: ignore[method-assign]
+    assert res.get("created") is True, res
+    assert auth._created_ssh["args"][2] == "multiplex-pass"  # noqa: SLF001
+
 
 
 def _update_ssh_tools():
@@ -918,10 +975,17 @@ def test_update_ssh_upload_raw_pass_warning():
     assert auth._bw.edited_items[0]["login"]["password"] == "raw-new-pass"  # noqa: SLF001
 
 
-def test_update_ssh_upload_pass_env(monkeypatch):
+def test_update_ssh_upload_pass_env():
     auth, tools = _update_ssh_tools()
-    monkeypatch.setenv("VW_ROT_PASS", "env-new-pass")
-    res = tools["vaultwarden_update_ssh"](
-        {"name": "SSH - Rot", "pass_env": "VW_ROT_PASS"})
+    # v0.4.8 (Defect 4): inject through the config env snapshot (.env channel).
+    cfg = auth._config                                   # noqa: SLF001
+    orig_snapshot = dict(cfg.env_snapshot)
+    cfg.env_snapshot["VW_ROT_PASS"] = "env-new-pass"     # type: ignore[index]
+    try:
+        res = tools["vaultwarden_update_ssh"](
+            {"name": "SSH - Rot", "pass_env": "VW_ROT_PASS"})
+    finally:
+        cfg.env_snapshot.clear()
+        cfg.env_snapshot.update(orig_snapshot)
     assert "warning" not in res
     assert auth._bw.edited_items[0]["login"]["password"] == "env-new-pass"  # noqa: SLF001

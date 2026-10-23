@@ -334,5 +334,10 @@ def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> 
             "PluginContext.get_config(). Add your configuration to "
             "plugins.entries.vaultwarden.settings in config.yaml. "
             "Plugin will use defaults (enabled=false) and will not load.")
-    snapshot = dict(os.environ) if env is None else dict(env)
+    # v0.4.8: when no explicit env mapping is given, keep a LIVE view of
+    # os.environ instead of a static copy — env values injected after config
+    # load time (e.g. gateway exports, unit tests using monkeypatch.setenv /
+    # patch.dict) must remain reachable through resolve_secret()'s fallback.
+    # An explicitly provided mapping (tests with env={...}) stays isolated.
+    snapshot = os.environ if env is None else dict(env)
     return PluginConfig(section=section, env_snapshot=snapshot)

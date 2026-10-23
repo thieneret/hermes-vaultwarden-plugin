@@ -149,7 +149,7 @@ _DIRECT_SECRET_WARNING = (
 
 def _resolve_secret_input(
     args: dict, *, direct_key: str, env_key: str, file_key: str,
-    tool_name: str,
+    tool_name: str, config: PluginConfig | None = None,
 ) -> tuple[str | None, str | None]:
     """Resolve a secret from exactly one of: direct value, env var, or file.
 
@@ -160,6 +160,12 @@ def _resolve_secret_input(
     does not exist. The file channel is strict: regular file, owner-readable
     (mode & 0o400), no group/other access (mode & 0o077 == 0) — otherwise
     the file is NOT read and ConfigError is raised.
+
+    v0.4.8 (BUGFIX, Defect 4): when `config` is provided, the env channel
+    resolves via config.resolve_secret() (get_secret-first) instead of raw
+    os.environ.get() — in multiplex gateway mode .env values are NOT in
+    os.environ (see config.py module docstring), so the raw lookup made
+    password_env/pass_env from .env falsely report "not set or empty".
     """
     provided = [k for k in (direct_key, env_key, file_key) if args.get(k)]
     if len(provided) > 1:
@@ -178,7 +184,11 @@ def _resolve_secret_input(
         )
         return str(args[direct_key]), warning
     if args.get(env_key):
-        val = os.environ.get(str(args[env_key]), "")
+        var_name = str(args[env_key])
+        if config is not None:
+            val = config.resolve_secret(var_name, required=False)
+        else:
+            val = os.environ.get(var_name, "")
         if not val:
             raise errors.ConfigError(
                 f"{tool_name}: environment variable {args[env_key]!r} "
@@ -565,7 +575,8 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             else:
                 resolved_password, pw_warning = _resolve_secret_input(
                     args, direct_key="password", env_key="password_env",
-                    file_key="password_file", tool_name="vaultwarden_store")
+                    file_key="password_file", tool_name="vaultwarden_store",
+                    config=config)
 
             if generate:
                 gen_opts = args.get("generate_options") or {}
@@ -649,7 +660,8 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             else:
                 resolved_password, pw_warning = _resolve_secret_input(
                     args, direct_key="password", env_key="password_env",
-                    file_key="password_file", tool_name="vaultwarden_update")
+                    file_key="password_file", tool_name="vaultwarden_update",
+                    config=config)
 
             if generate:
                 gen_opts = args.get("generate_options") or {}
@@ -934,7 +946,8 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
         # Upload mode: resolve the passphrase from exactly one channel.
         passphrase, pw_warning = _resolve_secret_input(
             args, direct_key="pass", env_key="pass_env",
-            file_key="pass_file", tool_name="vaultwarden_store_ssh")
+            file_key="pass_file", tool_name="vaultwarden_store_ssh",
+            config=config)
         if passphrase is None:
             raise errors.ConfigError(
                 "vaultwarden_store_ssh: requires pass, pass_env, pass_file, "
@@ -942,6 +955,18 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 suggestion="Provide the passphrase via one channel, or set "
                            "generate=true to create a new keypair.",
             )
+        # v0.4.8 (BUGFIX, Defects 1-2): validate presence BEFORE the raw
+        # dict lookups — a missing 'file'/'user' must raise a clear
+        # ConfigError, never leak a KeyError ("Internal plugin error").
+        if not args.get("user"):
+            raise errors.ConfigError(
+                "vaultwarden_store_ssh: 'user' is required in upload mode.",
+                suggestion="Provide the SSH username, or use generate=true.")
+        if not args.get("file"):
+            raise errors.ConfigError(
+                "vaultwarden_store_ssh: 'file' (absolute SSH private key path) "
+                "is required in upload mode.",
+                suggestion="Provide the key file path, or use generate=true.")
         user = str(args["user"])
         file_path = str(args["file"])
 
@@ -1075,7 +1100,8 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
         # Non-generate update path (upload semantics).
         resolved_pass, pw_warning = _resolve_secret_input(
             args, direct_key="pass", env_key="pass_env",
-            file_key="pass_file", tool_name="vaultwarden_update_ssh")
+            file_key="pass_file", tool_name="vaultwarden_update_ssh",
+            config=config)
 
         updates = {}
         if args.get("user"):
