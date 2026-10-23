@@ -769,3 +769,79 @@ class TestExponentialBackoff:
         src = inspect.getsource(mod)
         assert "tenacity" not in src
         assert "import random" in src
+
+
+# ---------------------------------------------------------------------------
+# v0.4.8 (Defect 3): delete_item permanent sync-retry + item_id message
+# ---------------------------------------------------------------------------
+
+_NOT_FOUND_ERR = {"rc": 1, "out": "", "err": "Cannot find item."}
+_DELETED_OK = {"rc": 0, "out": "Item abc123 has been deleted.", "err": ""}
+
+
+class TestDeleteItemPermanentSyncRetry:
+    """permanent=true + not_found -> real `bw sync` + ONE retry; the final
+    error names the item_id, never args[-1] ('--permanent')."""
+
+    def test_permanent_not_found_then_sync_retry_succeeds(self, fake_bw,
+                                                          appdata,
+                                                          monkeypatch):
+        import subprocess as sp
+        # call order after --version: delete(not_found), sync(ok), delete(ok)
+        fake_run, calls = _mk_run(cmd_results=[dict(_NOT_FOUND_ERR),
+                                               dict(_OK),
+                                               dict(_DELETED_OK)])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+        out = cli.delete_item("sess", "abc123", permanent=True)
+        assert "has been deleted" in out
+        cmds = [c[1:] for c in calls]
+        assert cmds[0] == ["--version"]
+        assert cmds[1] == ["delete", "item", "abc123", "--permanent"]
+        assert cmds[2] == ["sync"]          # REAL sync — NOT ["sync", "--last"]
+        assert cmds[3] == ["delete", "item", "abc123", "--permanent"]
+        assert len(calls) == 4              # exactly one retry
+
+    def test_permanent_not_found_twice_raises_item_id_message(self, fake_bw,
+                                                              appdata,
+                                                              monkeypatch):
+        import subprocess as sp
+        fake_run, calls = _mk_run(cmd_results=[dict(_NOT_FOUND_ERR),
+                                               dict(_OK),
+                                               dict(_NOT_FOUND_ERR)])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+        with pytest.raises(errors.NotFoundError) as exc_info:
+            cli.delete_item("sess", "abc123", permanent=True)
+        msg = exc_info.value.message
+        assert "abc123" in msg
+        assert "--permanent" not in msg     # never args[-1]
+        cmds = [c[1:] for c in calls]
+        assert cmds.count(["sync"]) == 1    # sync ran exactly once
+        # only ONE retry of the delete (no infinite loop)
+        assert cmds.count(["delete", "item", "abc123", "--permanent"]) == 2
+
+    def test_non_permanent_not_found_no_sync_no_retry(self, fake_bw, appdata,
+                                                      monkeypatch):
+        import subprocess as sp
+        fake_run, calls = _mk_run(cmd_results=[dict(_NOT_FOUND_ERR)])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+        with pytest.raises(errors.NotFoundError) as exc_info:
+            cli.delete_item("sess", "abc123")
+        assert "abc123" in exc_info.value.message
+        cmds = [c[1:] for c in calls]
+        assert ["sync"] not in cmds         # no sync without permanent
+        assert cmds.count(["delete", "item", "abc123"]) == 1
+
+    def test_other_errors_propagate_unchanged(self, fake_bw, appdata,
+                                              monkeypatch):
+        """Non-NotFoundError exceptions must pass through untouched."""
+        import subprocess as sp
+        fake_run, calls = _mk_run(cmd_results=[dict(_SESS_ERR)])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+        with pytest.raises(errors.SessionError):
+            cli.delete_item("sess", "abc123", permanent=True)
+        cmds = [c[1:] for c in calls]
+        assert ["sync"] not in cmds         # sync only on NotFoundError

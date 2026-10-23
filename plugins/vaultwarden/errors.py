@@ -50,6 +50,15 @@ class ConfigError(VaultwardenError):
     suggestion = "Fix the vaultwarden section of config.yaml or the .env file."
 
 
+# v0.4.8 (BUGFIX): auth._configure_server raises errors.PluginError, which
+# did not exist — a failed `bw config server` produced a latent
+# AttributeError instead of the intended structured error.
+class PluginError(VaultwardenError):
+    """Generic plugin-level failure (base taxonomy code PLUGIN_ERROR)."""
+
+    code = "PLUGIN_ERROR"
+
+
 class BinaryError(VaultwardenError):
     code = "BINARY_ERROR"
     recoverable = False

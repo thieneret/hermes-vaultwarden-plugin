@@ -732,6 +732,79 @@ def test_rsi_none_provided():
     assert val is None and warning is None
 
 
+# ── v0.4.8 (Defect 4): multiplex-aware env resolution via config ───────────
+
+def test_rsi_env_with_config_uses_resolve_secret(monkeypatch):
+    """v0.4.8: with a config, the env channel resolves via
+    config.resolve_secret() (get_secret-first) — NOT raw os.environ.get().
+    In multiplex gateway mode .env values are absent from os.environ."""
+    from vaultwarden.config import PluginConfig
+
+    monkeypatch.delenv("VW_MULTIPLEX_PW", raising=False)
+    cfg = PluginConfig.__new__(PluginConfig)   # bypass __init__/validation
+    calls: list[tuple[str, bool]] = []
+
+    def fake_resolve(var_name, *, required=True):
+        calls.append((var_name, required))
+        return "from-resolve-secret"
+
+    cfg.resolve_secret = fake_resolve          # type: ignore[method-assign]
+    val, warning = _resolve_secret_input(
+        {"password_env": "VW_MULTIPLEX_PW"}, direct_key="password",
+        env_key="password_env", file_key="password_file",
+        tool_name="vaultwarden_store", config=cfg)
+    assert val == "from-resolve-secret"
+    assert warning is None
+    assert calls == [("VW_MULTIPLEX_PW", False)]
+
+
+def test_rsi_env_with_config_empty_still_raises(monkeypatch):
+    """Empty resolve_secret result keeps the existing ConfigError message."""
+    from vaultwarden.config import PluginConfig
+
+    monkeypatch.delenv("VW_EMPTY_VAR", raising=False)
+    cfg = PluginConfig.__new__(PluginConfig)
+    cfg.resolve_secret = lambda name, *, required=True: ""  # type: ignore
+    with pytest.raises(errors.ConfigError) as exc_info:
+        _resolve_secret_input(
+            {"password_env": "VW_EMPTY_VAR"}, direct_key="password",
+            env_key="password_env", file_key="password_file",
+            tool_name="vaultwarden_store", config=cfg)
+    assert "not set or empty" in exc_info.value.message
+
+
+def test_store_password_env_resolved_via_config(write_auth_manager):
+    """v0.4.8 (Defect 4): h_store passes config -> password_env resolves
+    through config.resolve_secret even when NOT in os.environ."""
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    cfg = auth._config                          # noqa: SLF001
+    captured: dict = {}
+    orig_create = auth.create_item
+
+    def _create(item):
+        captured["item"] = item
+        return orig_create(item)
+    auth.create_item = _create                  # type: ignore[attr-defined]
+    orig_resolve = cfg.resolve_secret
+
+    def fake_resolve(var_name, *, required=True):
+        if var_name == "VW_NOT_IN_OS_ENVIRON":
+            return "multiplex-secret"
+        return orig_resolve(var_name, required=required)
+    cfg.resolve_secret = fake_resolve           # type: ignore[method-assign]
+    try:
+        os.environ.pop("VW_NOT_IN_OS_ENVIRON", None)
+        res = tools["vaultwarden_store"](
+            {"type": "login", "name": "env-test-multiplex",
+             "username": "u", "password_env": "VW_NOT_IN_OS_ENVIRON"})
+    finally:
+        cfg.resolve_secret = orig_resolve       # type: ignore[method-assign]
+    assert res["created"] is True
+    assert captured["item"]["login"]["password"] == "multiplex-secret"
+    assert "multiplex-secret" not in json.dumps(res)
+
+
 # ── h_store / h_update secret-input channel wiring ────────────────────────────────────────────────
 
 
