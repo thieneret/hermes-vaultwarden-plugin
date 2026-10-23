@@ -819,10 +819,19 @@ def test_store_password_env_resolved(write_auth_manager):
         captured["item"] = item
         return orig_create(item)
     auth.create_item = _create                           # type: ignore[attr-defined]
-    with patch.dict(os.environ, {"GH_TOKEN": "gh-secret-xyz"}):
+    # v0.4.8 (Defect 4): password_env resolves via config.resolve_secret —
+    # inject through the config env snapshot (the .env channel), not raw
+    # os.environ, exactly like a multiplex gateway deployment.
+    cfg = auth._config                                   # noqa: SLF001
+    orig_snapshot = dict(cfg.env_snapshot)
+    cfg.env_snapshot["GH_TOKEN"] = "gh-secret-xyz"       # type: ignore[index]
+    try:
         res = tools["vaultwarden_store"](
             {"type": "login", "name": "env-test", "username": "u",
              "password_env": "GH_TOKEN"})
+    finally:
+        cfg.env_snapshot.clear()
+        cfg.env_snapshot.update(orig_snapshot)
     assert res["created"] is True
     assert "warning" not in res
     assert captured["item"]["login"]["password"] == "gh-secret-xyz"
@@ -902,10 +911,17 @@ def test_update_password_env_resolved(write_auth_manager):
         captured["item"] = item
         return orig_edit(item)
     auth.edit_item = _edit                               # type: ignore[attr-defined]
-    with patch.dict(os.environ, {"VW_UPD_PW": "upd-env-pw"}):
+    # v0.4.8 (Defect 4): inject through the config env snapshot (.env channel).
+    cfg = auth._config                                   # noqa: SLF001
+    orig_snapshot = dict(cfg.env_snapshot)
+    cfg.env_snapshot["VW_UPD_PW"] = "upd-env-pw"         # type: ignore[index]
+    try:
         res = tools["vaultwarden_update"](
             {"item_id": "aaaa1111-0000-0000-0000-000000000001",
              "password_env": "VW_UPD_PW"})
+    finally:
+        cfg.env_snapshot.clear()
+        cfg.env_snapshot.update(orig_snapshot)
     assert res["updated"] is True
     assert captured["item"]["login"]["password"] == "upd-env-pw"
 
