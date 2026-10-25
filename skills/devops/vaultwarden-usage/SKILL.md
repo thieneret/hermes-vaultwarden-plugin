@@ -63,11 +63,11 @@ configuration. For SSH keys, `vaultwarden_use_ssh` handles everything internally
 | `vaultwarden_list` | List items (metadata only) |
 | `vaultwarden_search` | Search by name/username/uri |
 | `vaultwarden_get_secret_ref` | Single-use placeholder token |
-| `vaultwarden_store` | Create item. `generate=true` (password) or `password_env`/`password_file` input |
-| `vaultwarden_update` | Update item. `generate=true` or `password_env`/`password_file` input |
+| `vaultwarden_store` | Create item. `generate=true` (password) or `password_file` input |
+| `vaultwarden_update` | Update item. `generate=true` or `password_file` input |
 | `vaultwarden_delete` | Delete item (requires `confirm: true`) |
-| `vaultwarden_store_ssh` | Store SSH key. `generate=true` (keypair) or `pass_env`/`pass_file` input |
-| `vaultwarden_update_ssh` | Update SSH key. `generate=true` (rotation, needs `confirm`) or `pass_env`/`pass_file` |
+| `vaultwarden_store_ssh` | Store SSH key. `generate=true` (keypair) or `pass_file` input |
+| `vaultwarden_update_ssh` | Update SSH key. `generate=true` (rotation, needs `confirm`) or `pass_file` |
 | `vaultwarden_delete_ssh` | Delete SSH key (requires `confirm: true`) |
 | `vaultwarden_use_ssh` | Load SSH key from vault into ssh-agent |
 
@@ -85,19 +85,25 @@ The plugin generates a 32-char passphrase and a keypair internally; the private
 key + passphrase go to the vault, **only the public key + fingerprint are
 returned** (paste the public key into `authorized_keys`). Parameters:
 `key_type` (`ed25519` default | `rsa`), `rsa_bits` (default **4096**, rsa only).
-In generate mode `pass`/`pass_env`/`pass_file`/`file` are **forbidden**.
+In generate mode `pass`/`pass_file`/`file` are **forbidden**.
 `update_ssh` + `generate=true` is a **key rotation** and requires `confirm=true`.
 
 ## Secret input channels (store/update + ssh_store/ssh_update)
 
-Three mutually-exclusive sources per secret; supplying more than one is a
-`ConfigError`:
+Two mutually-exclusive sources per secret (plus `generate=true`); supplying more
+than one is a `ConfigError`:
 
 | Source | Param (store/update) | Param (ssh) | Notes |
 | --- | --- | --- | --- |
-| Env var | `password_env` | `pass_env` | Name of a var in the Hermes process env (e.g. `~/.hermes/.env`) |
 | Owner-only file | `password_file` | `pass_file` | Must be chmod 600 (owner-read only); rejected otherwise |
 | Raw value | `password` | `pass` | **Discouraged** — response carries a `"warning"` field to relay to the user |
+
+> **v0.4.9 BREAKING CHANGE:** the env-var channel (`password_env` / `pass_env`)
+> was REMOVED — in multiplex gateway mode Hermes loads `.env` only at startup,
+> so env secrets required a full restart. Supplying these parameters now raises
+> an explicit `ConfigError` ("removed in v0.4.9"); use `*_file` or
+> `generate=true` instead. Bootstrap secrets (`client_secret_env` /
+> `master_password_env`) are unaffected.
 
 ## Standard Workflow (3 Steps)
 

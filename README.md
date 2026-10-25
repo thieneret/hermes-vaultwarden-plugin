@@ -141,16 +141,16 @@ VW_MASTER_PASSWORD="your-master-password"
 | `vaultwarden_list` | List items — metadata only | ❌ |
 | `vaultwarden_search` | Search items by name/username/uri — metadata only | ❌ |
 | `vaultwarden_get_secret_ref` | Generate a single-use placeholder token | ❌ |
-| `vaultwarden_store` | Create a new vault item. Supports `generate=true` to auto-generate a password stored directly in the vault; password can be supplied via `password_env` / `password_file` to keep it out of the LLM context. | ✅ |
-| `vaultwarden_update` | Update an existing item. Supports `generate=true` to regenerate the password, stored directly in the vault; password can be supplied via `password_env` / `password_file` to keep it out of the LLM context. | ✅ |
+| `vaultwarden_store` | Create a new vault item. Supports `generate=true` to auto-generate a password stored directly in the vault; password can be supplied via `password_file` to keep it out of the LLM context. | ✅ |
+| `vaultwarden_update` | Update an existing item. Supports `generate=true` to regenerate the password, stored directly in the vault; password can be supplied via `password_file` to keep it out of the LLM context. | ✅ |
 | `vaultwarden_delete` | Delete an item (`confirm=true` required) | ✅ |
 
 ### SSH key management tools
 
 | Tool | Purpose | Requires `allow_write` |
 |------|---------|:---:|
-| `vaultwarden_store_ssh` | Store SSH key as login item + attachment (name must be unique). Supports `generate=true` to generate a keypair internally and return the public key; passphrase via `pass_env` / `pass_file`. | ✅ |
-| `vaultwarden_update_ssh` | Update user/passphrase/key attachment. Supports `generate=true` for key rotation (`confirm=true` required); returns the new public key; passphrase via `pass_env` / `pass_file`. | ✅ |
+| `vaultwarden_store_ssh` | Store SSH key as login item + attachment (name must be unique). Supports `generate=true` to generate a keypair internally and return the public key; passphrase via `pass_file`. | ✅ |
+| `vaultwarden_update_ssh` | Update user/passphrase/key attachment. Supports `generate=true` for key rotation (`confirm=true` required); returns the new public key; passphrase via `pass_file`. | ✅ |
 | `vaultwarden_delete_ssh` | Delete SSH key item (attachment included) | ✅ |
 | `vaultwarden_use_ssh` | Load SSH key into ssh-agent (socket path resolved from developer-controlled env vars, see SSH Agent Socket) | ❌ |
 
@@ -235,7 +235,7 @@ export VW_SSH_SOCKET_PATH=$XDG_RUNTIME_DIR/shared-ssh.sock
 4. The private key is stored as a vault attachment and the passphrase as the item `password` field. Neither is ever returned.
 5. The response contains the **public key** and **fingerprint** (non-secret — paste the public key into `authorized_keys`).
 
-In generate mode, `pass` / `pass_env` / `pass_file` / `file` are forbidden (the plugin supplies them). `vaultwarden_update_ssh` + `generate=true` is a **key rotation** (destructive: replaces the existing keypair + passphrase) and therefore requires `confirm=true`, mirroring `vaultwarden_delete_ssh`.
+In generate mode, `pass` / `pass_file` / `file` are forbidden (the plugin supplies them). `vaultwarden_update_ssh` + `generate=true` is a **key rotation** (destructive: replaces the existing keypair + passphrase) and therefore requires `confirm=true`, mirroring `vaultwarden_delete_ssh`.
 
 ```
 # Generate a new ed25519 keypair
@@ -255,36 +255,44 @@ vaultwarden_update_ssh(name="SSH - New", generate=true, confirm=true)
 
 ## Secret input channels
 
-Write tools that accept a secret (`vaultwarden_store` / `vaultwarden_update` via `password*`, `vaultwarden_store_ssh` / `vaultwarden_update_ssh` via `pass*`) support three **mutually exclusive** input sources:
+Write tools that accept a secret (`vaultwarden_store` / `vaultwarden_update` via `password*`, `vaultwarden_store_ssh` / `vaultwarden_update_ssh` via `pass*`) support two **mutually exclusive** input sources (plus `generate=true`):
 
 | Source | Parameter (store/update) | Parameter (ssh) | Notes |
 |--------|--------------------------|-----------------|-------|
 | Raw value | `password` | `pass` | Enters the LLM context and chat history — **not secure**. Emits a warning in BOTH the log and the tool response. |
-| Environment variable | `password_env` | `pass_env` | Name of an env var holding the secret, resolved from the Hermes process env (e.g. `~/.hermes/.env`). |
 | Owner-only file | `password_file` | `pass_file` | Path to a file holding the secret. Must be a regular file readable **only by the owner** (chmod 600) — permission violations are rejected before the file is read. |
 
 Rules:
 
-- **Conflicting sources are an error.** Providing more than one of the trio raises `ConfigError` (no silent precedence). In generate mode, supplying any secret/file parameter is also a `ConfigError`.
-- **Raw input triggers a dual-channel warning:** a value-free `log.warning` AND a `"warning"` field in the tool response. The response warning is an **imperative instruction directing the agent to warn the user** that direct secret input is insecure and to recommend the safer `*_env` / `*_file` channels; it never contains the secret value itself. Raw input is still accepted (accept-and-warn).
-- Env/file-resolved secrets never appear in the tool call arguments, keeping them out of the LLM context entirely.
+- **Conflicting sources are an error.** Providing more than one of the pair raises `ConfigError` (no silent precedence). In generate mode, supplying any secret/file parameter is also a `ConfigError`.
+- **Raw input triggers a dual-channel warning:** a value-free `log.warning` AND a `"warning"` field in the tool response. The response warning is an **imperative instruction directing the agent to warn the user** that direct secret input is insecure and to recommend the safer `*_file` channel; it never contains the secret value itself. Raw input is still accepted (accept-and-warn).
+- File-resolved secrets never appear in the tool call arguments, keeping them out of the LLM context entirely.
+- **BREAKING CHANGE (v0.4.9):** the environment-variable channel (`password_env` / `pass_env`) was REMOVED. In multiplex gateway mode Hermes loads `.env` only at startup, so a secret added to `.env` required a full Hermes restart before the plugin could resolve it — impractical for dynamic tool use. Supplying `password_env` / `pass_env` now raises an explicit `ConfigError` ("removed in v0.4.9") pointing to `password_file` / `pass_file` or `generate=true`; it is never silently ignored. Bootstrap secrets (`client_secret_env` / `master_password_env`) are NOT affected.
 
 ```
-# Password from an environment variable (set in ~/.hermes/.env)
-vaultwarden_store(name="GitHub account", username="octocat", password_env="GH_TOKEN")
-
 # Passphrase from an owner-only file (chmod 600)
 vaultwarden_store_ssh(name="SSH - Prod", user="deploy",
                       pass_file="/run/secrets/ssh_pass", file="/home/u/.ssh/id_ed25519")
+
+# Password from an owner-only file (chmod 600)
+vaultwarden_store(name="GitHub account", username="octocat",
+                  password_file="/run/secrets/gh_token")
 
 # Raw password still works, but the response carries a warning
 vaultwarden_store(name="raw-test", username="u", password="hunter2")
 -> {"created": true, ..., "warning": "AGENT INSTRUCTION: A raw secret was
     supplied directly via 'password' in vaultwarden_store. ... You MUST warn
     the user about this now: tell them direct secret input is insecure, and
-    recommend providing it via 'password_env' (an environment variable) or
-    'password_file' (an owner-only file, chmod 600) instead. Do NOT repeat
+    recommend providing it via 'password_file' (an owner-only file, chmod 600)
+    instead. Do NOT repeat
     the secret value in your reply."}
+
+# v0.4.9: the env channel is gone — explicit rejection, never silent
+vaultwarden_store(name="x", username="u", password_env="GH_TOKEN")
+-> {"error_code": "CONFIG_ERROR", "error": "vaultwarden_store: 'password_env'
+    was removed in v0.4.9 — environment secrets require a Hermes restart to
+    load.", "suggestion": "Use 'password_file' (owner-only file, chmod 600)
+    or generate=true instead."}
 ```
 
 ## Security Architecture

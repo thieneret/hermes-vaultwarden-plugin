@@ -142,60 +142,64 @@ _DIRECT_SECRET_WARNING = (
     "{tool}. This value has entered your context window and the chat history, "
     "which is NOT secure. You MUST warn the user about this now: tell them "
     "direct secret input is insecure, and recommend providing it via "
-    "{env_key!r} (an environment variable) or {file_key!r} (an owner-only "
-    "file, chmod 600) instead. Do NOT repeat the secret value in your reply."
+    "{file_key!r} (an owner-only file, chmod 600) instead. Do NOT repeat "
+    "the secret value in your reply."
 )
 
 
+def _reject_removed_env_channel(args: dict, env_key: str, file_key: str,
+                                tool_name: str) -> None:
+    """Explicitly reject the removed *_env secret-input channel (v0.4.9).
+
+    BREAKING CHANGE (v0.4.9): the password_env / pass_env channels were
+    removed — in multiplex gateway mode Hermes loads .env only at startup,
+    so a secret added to .env requires a full Hermes restart before the
+    plugin can resolve it. Callers that still supply the parameter get a
+    clear ConfigError (never silently ignored). Called at the start of each
+    handler body, BEFORE the generate branch, so the rejection fires in
+    both generate and non-generate modes.
+    """
+    if args.get(env_key):
+        raise errors.ConfigError(
+            f"{tool_name}: {env_key!r} was removed in v0.4.9 — "
+            "environment secrets require a Hermes restart to load.",
+            suggestion=f"Use {file_key!r} (owner-only file, chmod 600) "
+                       "or generate=true instead.")
+
+
 def _resolve_secret_input(
-    args: dict, *, direct_key: str, env_key: str, file_key: str,
-    tool_name: str, config: PluginConfig | None = None,
+    args: dict, *, direct_key: str, file_key: str, tool_name: str,
 ) -> tuple[str | None, str | None]:
-    """Resolve a secret from exactly one of: direct value, env var, or file.
+    """Resolve a secret from exactly one of: direct value or file.
 
     v0.4.0 (Feature 1): returns (value, warning). `warning` is a non-secret
     advisory string when a raw secret was passed directly (also emitted to
     the log), else None. Raises ConfigError on conflict (multiple sources)
-    or an unusable env/file source. Raises NotFoundError when a *_file path
+    or an unusable file source. Raises NotFoundError when a *_file path
     does not exist. The file channel is strict: regular file, owner-readable
     (mode & 0o400), no group/other access (mode & 0o077 == 0) — otherwise
     the file is NOT read and ConfigError is raised.
 
-    v0.4.8 (BUGFIX, Defect 4): when `config` is provided, the env channel
-    resolves via config.resolve_secret() (get_secret-first) instead of raw
-    os.environ.get() — in multiplex gateway mode .env values are NOT in
-    os.environ (see config.py module docstring), so the raw lookup made
-    password_env/pass_env from .env falsely report "not set or empty".
+    v0.4.9 (BREAKING CHANGE): the *_env channel (and with it the `env_key`
+    and `config` parameters) was REMOVED from this resolver; handlers
+    reject the removed parameters up front via _reject_removed_env_channel.
     """
-    provided = [k for k in (direct_key, env_key, file_key) if args.get(k)]
+    provided = [k for k in (direct_key, file_key) if args.get(k)]
     if len(provided) > 1:
         raise errors.ConfigError(
-            f"{tool_name}: provide only ONE of {direct_key!r}, {env_key!r}, "
+            f"{tool_name}: provide only ONE of {direct_key!r}, "
             f"{file_key!r}; got {provided}",
             suggestion="Choose a single secret source.",
         )
     if args.get(direct_key):
         warning = _DIRECT_SECRET_WARNING.format(
-            key=direct_key, tool=tool_name, env_key=env_key, file_key=file_key,
+            key=direct_key, tool=tool_name, file_key=file_key,
         )
         log.warning(
-            "%s: raw secret passed directly via %r; prefer %r or %r",
-            tool_name, direct_key, env_key, file_key,
+            "%s: raw secret passed directly via %r; prefer %r",
+            tool_name, direct_key, file_key,
         )
         return str(args[direct_key]), warning
-    if args.get(env_key):
-        var_name = str(args[env_key])
-        if config is not None:
-            val = config.resolve_secret(var_name, required=False)
-        else:
-            val = os.environ.get(var_name, "")
-        if not val:
-            raise errors.ConfigError(
-                f"{tool_name}: environment variable {args[env_key]!r} "
-                f"(from {env_key!r}) is not set or empty",
-                suggestion="Set the variable in ~/.hermes/.env (chmod 600).",
-            )
-        return val, None
     if args.get(file_key):
         path = str(args[file_key])
         if not os.path.isfile(path):
@@ -555,16 +559,20 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     def h_store(args: dict, **kw: Any) -> str:
         def run():
             _require_write(config)
+            # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
+            # password_env channel — fires in generate AND non-generate mode.
+            _reject_removed_env_channel(args, "password_env", "password_file",
+                                        "vaultwarden_store")
             redactor = get_redacting_filter()
 
             generated_pw = None
             generate = bool(args.get("generate", False))
 
             # v0.4.0 (Feature 1): resolve the password via the secret-input
-            # channels (raw / *_env / *_file). In generate mode no password
+            # channels (raw / *_file). In generate mode no password
             # input is allowed — generation takes precedence (v0.3.9 path).
             if generate:
-                for k in ("password", "password_env", "password_file"):
+                for k in ("password", "password_file"):
                     if args.get(k):
                         raise errors.ConfigError(
                             "vaultwarden_store: generate=true conflicts with "
@@ -574,9 +582,8 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                         )
             else:
                 resolved_password, pw_warning = _resolve_secret_input(
-                    args, direct_key="password", env_key="password_env",
-                    file_key="password_file", tool_name="vaultwarden_store",
-                    config=config)
+                    args, direct_key="password",
+                    file_key="password_file", tool_name="vaultwarden_store")
 
             if generate:
                 gen_opts = args.get("generate_options") or {}
@@ -594,7 +601,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             try:
                 item = _build_item(args)
 
-                # v0.4.0: fold the env/file-resolved password into the item
+                # v0.4.0: fold the file-resolved password into the item
                 # (the raw channel is already inside args -> _build_item).
                 if not generate and resolved_password:
                     login = item.get("login") or {}
@@ -640,16 +647,20 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     def h_update(args: dict, **kw: Any) -> str:
         def run():
             _require_write(config)
+            # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
+            # password_env channel — fires in generate AND non-generate mode.
+            _reject_removed_env_channel(args, "password_env", "password_file",
+                                        "vaultwarden_update")
             redactor = get_redacting_filter()
 
             generated_pw = None
             generate = bool(args.get("generate", False))
 
             # v0.4.0 (Feature 1): resolve the password via the secret-input
-            # channels (raw / *_env / *_file). In generate mode no password
+            # channels (raw / *_file). In generate mode no password
             # input is allowed — generation takes precedence (v0.3.9 path).
             if generate:
-                for k in ("password", "password_env", "password_file"):
+                for k in ("password", "password_file"):
                     if args.get(k):
                         raise errors.ConfigError(
                             "vaultwarden_update: generate=true conflicts with "
@@ -659,9 +670,8 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                         )
             else:
                 resolved_password, pw_warning = _resolve_secret_input(
-                    args, direct_key="password", env_key="password_env",
-                    file_key="password_file", tool_name="vaultwarden_update",
-                    config=config)
+                    args, direct_key="password",
+                    file_key="password_file", tool_name="vaultwarden_update")
 
             if generate:
                 gen_opts = args.get("generate_options") or {}
@@ -681,7 +691,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 current = auth.get_item(item_id)
                 merged = _apply_updates(current, args)
 
-                # v0.4.0: fold the env/file-resolved password into the item
+                # v0.4.0: fold the file-resolved password into the item
                 # (the raw channel is already inside args -> _apply_updates).
                 if not generate and resolved_password:
                     login = merged.get("login") or {}
@@ -879,21 +889,28 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
        SSH keypair via ssh-keygen (passphrase delivered on STDIN, never
        argv), stores private key as attachment + passphrase as the item
        password, and returns ONLY the public key + fingerprint (non-secret).
-       pass/pass_env/pass_file/file are FORBIDDEN in this mode.
+       pass/pass_file/file are FORBIDDEN in this mode.
      - upload (default): passphrase resolved via _resolve_secret_input
-       (pass / pass_env / pass_file); raw pass emits a dual-channel warning
+       (pass / pass_file); raw pass emits a dual-channel warning
        (log + response "warning" field).
+
+    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; supplying
+    it raises an explicit ConfigError (see _reject_removed_env_channel).
     """
 
     def run():
         _require_write(config)
+        # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
+        # pass_env channel — fires in generate AND non-generate mode.
+        _reject_removed_env_channel(args, "pass_env", "pass_file",
+                                    "vaultwarden_store_ssh")
         name = str(args["name"])
         generate = bool(args.get("generate", False))
         redactor = get_redacting_filter()
 
         if generate:
             # Generate mode: the plugin supplies pass + file itself.
-            for k in ("pass", "pass_env", "pass_file", "file"):
+            for k in ("pass", "pass_file", "file"):
                 if args.get(k):
                     raise errors.ConfigError(
                         f"vaultwarden_store_ssh: generate=true conflicts with "
@@ -945,12 +962,11 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
 
         # Upload mode: resolve the passphrase from exactly one channel.
         passphrase, pw_warning = _resolve_secret_input(
-            args, direct_key="pass", env_key="pass_env",
-            file_key="pass_file", tool_name="vaultwarden_store_ssh",
-            config=config)
+            args, direct_key="pass",
+            file_key="pass_file", tool_name="vaultwarden_store_ssh")
         if passphrase is None:
             raise errors.ConfigError(
-                "vaultwarden_store_ssh: requires pass, pass_env, pass_file, "
+                "vaultwarden_store_ssh: requires pass, pass_file, "
                 "or generate=true.",
                 suggestion="Provide the passphrase via one channel, or set "
                            "generate=true to create a new keypair.",
@@ -1003,14 +1019,21 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
     vaultwarden_delete_ssh. The new passphrase comes from the same
     _generate_password (`bw generate`) path; the keypair from
     _generate_ssh_keypair (SSH_ASKPASS passphrase delivery). Only the public
-    key + fingerprint are returned. In generate mode pass/pass_env/pass_file/
+    key + fingerprint are returned. In generate mode pass/pass_file/
     file are forbidden. Without generate, the passphrase is resolved via
-    _resolve_secret_input (pass / pass_env / pass_file) with a dual-channel
+    _resolve_secret_input (pass / pass_file) with a dual-channel
     warning on raw input.
+
+    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; supplying
+    it raises an explicit ConfigError (see _reject_removed_env_channel).
     """
 
     def run():
         _require_write(config)
+        # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
+        # pass_env channel — fires in generate AND non-generate mode.
+        _reject_removed_env_channel(args, "pass_env", "pass_file",
+                                    "vaultwarden_update_ssh")
         name = str(args["name"])
         generate = bool(args.get("generate", False))
         redactor = get_redacting_filter()
@@ -1037,7 +1060,7 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                     "the existing keypair and passphrase; explicit "
                     "confirmation required.",
                     suggestion="Re-issue with confirm=true to rotate the key.")
-            for k in ("pass", "pass_env", "pass_file", "file"):
+            for k in ("pass", "pass_file", "file"):
                 if args.get(k):
                     raise errors.ConfigError(
                         f"vaultwarden_update_ssh: generate=true conflicts with "
@@ -1099,9 +1122,8 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
 
         # Non-generate update path (upload semantics).
         resolved_pass, pw_warning = _resolve_secret_input(
-            args, direct_key="pass", env_key="pass_env",
-            file_key="pass_file", tool_name="vaultwarden_update_ssh",
-            config=config)
+            args, direct_key="pass",
+            file_key="pass_file", tool_name="vaultwarden_update_ssh")
 
         updates = {}
         if args.get("user"):

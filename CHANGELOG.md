@@ -5,6 +5,43 @@ Author: **thieneret**
 
 ---
 
+## [0.4.9] - 2026-10-25
+
+### ⚠️ BREAKING CHANGE — `*_env` secret-input channel removed
+
+- **Removed parameters:** the `password_env` / `pass_env` tool parameters
+  (added in v0.4.0) are REMOVED from the schemas of `vaultwarden_store`,
+  `vaultwarden_update`, `vaultwarden_store_ssh`, and
+  `vaultwarden_update_ssh`. Rationale: in multiplex gateway mode Hermes
+  loads `.env` only at startup, so a secret added to `.env` requires a
+  full Hermes restart before the plugin can resolve it — impractical for
+  dynamic tool use.
+- **Explicit rejection (never silently ignored):** callers that still
+  supply `password_env` / `pass_env` now get a clear `ConfigError`
+  ("<tool>: '<param>' was removed in v0.4.9 — environment secrets require
+  a Hermes restart to load.") raised at the very start of each handler
+  body — BEFORE the generate branch — so the rejection fires in both
+  generate and non-generate modes. The error's suggestion points to the
+  supported alternatives.
+- **Supported alternatives (UNCHANGED behavior):** `password_file` /
+  `pass_file` (owner-only file, chmod 600, strict permission validation),
+  `generate=true`, and the raw direct `password` / `pass` channels (still
+  accepted, still warn). The raw-channel advisory no longer mentions the
+  env channel and now recommends only the `*_file` channel.
+- **Implementation:** `_reject_removed_env_channel()` added to `tools.py`;
+  `_resolve_secret_input()` lost its env branch and its `env_key` /
+  `config` parameters (signature is now
+  `_resolve_secret_input(args, *, direct_key, file_key, tool_name)`);
+  generate-mode conflict tuples dropped the env keys.
+- **NOT affected:** bootstrap secrets (`client_secret_env` /
+  `master_password_env` config keys, `config.resolve_secret()`, and
+  `__init__.py::_resolve_secrets()`) keep working exactly as before. VWP-01
+  path pinning, VWP-11 version check, the error taxonomy codes, the
+  12-tool registration, and every security mechanism (RedactingFilter,
+  askpass delivery, temp-file cleanup, 0600/0700 permissions, env
+  isolation) are untouched. The SSH tools' `file` parameter (private key
+  path) is distinct from `pass_file` and remains unchanged.
+
 ## [0.4.8] - 2026-10-24
 
 ### Bugfixes (live-container testing of v0.4.7)
