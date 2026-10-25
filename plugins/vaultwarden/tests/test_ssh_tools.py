@@ -762,11 +762,17 @@ def _store_ssh_tools():
 
 def test_store_ssh_generate_forbids_secret_inputs():
     auth, tools = _store_ssh_tools()
-    for k in ("pass", "pass_env", "pass_file", "file"):
+    # v0.4.9 BREAKING: pass_env is rejected up front (explicit removal
+    # message); the remaining channels hit the generate-conflict check.
+    for k in ("pass", "pass_file", "file"):
         res = tools["vaultwarden_store_ssh"](
             {"name": "SSH - Gen", "generate": True, k: "x"})
         assert res["error_code"] == "CONFIG_ERROR", k
         assert "conflicts with" in res["error"]
+    res = tools["vaultwarden_store_ssh"](
+        {"name": "SSH - Gen", "generate": True, "pass_env": "x"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "removed in v0.4.9" in res["error"]
 
 
 def test_store_ssh_generate_bad_key_type():
@@ -809,7 +815,7 @@ def test_store_ssh_upload_requires_passphrase_channel():
     res = tools["vaultwarden_store_ssh"]({"name": "SSH - Up", "user": "u",
                                           "file": "/tmp/k"})
     assert res["error_code"] == "CONFIG_ERROR"
-    assert "requires pass, pass_env, pass_file" in res["error"]
+    assert "requires pass, pass_file" in res["error"]
 
 
 def test_store_ssh_upload_raw_pass_dual_warning(tmp_path):
@@ -825,31 +831,24 @@ def test_store_ssh_upload_raw_pass_dual_warning(tmp_path):
     assert res["created"] is True          # raw input still ACCEPTED
     assert "warning" in res
     assert "raw-pass-123" not in json.dumps(res)
-    assert "pass_env" in res["warning"] and "pass_file" in res["warning"]
+    assert "pass_env" not in res["warning"] and "pass_file" in res["warning"]
     # v0.4.2: imperative instruction to the agent; response shape unchanged
     assert "MUST warn the user" in res["warning"]
 
 
-def test_store_ssh_upload_pass_env(tmp_path):
+def test_store_ssh_upload_pass_env_rejected(tmp_path):
+    """v0.4.9 BREAKING: pass_env was removed — explicit ConfigError,
+    never silently ignored."""
     key = tmp_path / "id_ed25519"
     key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n"
                    "-----END OPENSSH PRIVATE KEY-----\n")
     auth, tools = _store_ssh_tools()
-    # v0.4.8 (Defect 4): pass_env resolves via config.resolve_secret —
-    # inject through the config env snapshot (.env channel), not os.environ.
-    cfg = auth._config                                   # noqa: SLF001
-    orig_snapshot = dict(cfg.env_snapshot)
-    cfg.env_snapshot["VW_SSH_PASS"] = "env-pass"         # type: ignore[index]
-    try:
-        res = tools["vaultwarden_store_ssh"](
-            {"name": "SSH - Up", "user": "deploy", "file": str(key),
-             "pass_env": "VW_SSH_PASS"})
-    finally:
-        cfg.env_snapshot.clear()
-        cfg.env_snapshot.update(orig_snapshot)
-    assert res["created"] is True
-    assert "warning" not in res
-    assert auth._created_ssh["args"][2] == "env-pass"  # noqa: SLF001
+    res = tools["vaultwarden_store_ssh"](
+        {"name": "SSH - Up", "user": "deploy", "file": str(key),
+         "pass_env": "VW_SSH_PASS"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "removed in v0.4.9" in res["error"]
+    assert "pass_file" in res["suggestion"]
 
 
 def test_store_ssh_upload_pass_file(tmp_path):
@@ -895,30 +894,25 @@ def test_store_ssh_upload_missing_user_raises_config_error():
     assert "'user'" in res["error"] and "required in upload mode" in res["error"]
 
 
-def test_store_ssh_upload_pass_env_resolved_via_config(tmp_path):
-    """v0.4.8 (Defect 4): pass_env resolves via config.resolve_secret —
-    works for values NOT present in os.environ (multiplex gateway mode)."""
+def test_store_ssh_upload_pass_env_rejected_via_config(tmp_path):
+    """v0.4.9 BREAKING: even when the env var IS resolvable (config env
+    snapshot), pass_env is rejected — the channel no longer exists."""
     key = tmp_path / "id_ed25519"
     key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n"
                    "-----END OPENSSH PRIVATE KEY-----\n")
     auth, tools = _store_ssh_tools()
     cfg = auth._config                                    # noqa: SLF001
-    orig_resolve = cfg.resolve_secret
-
-    def fake_resolve(var_name, *, required=True):
-        if var_name == "VW_SSH_MULTIPLEX_PASS":
-            return "multiplex-pass"
-        return orig_resolve(var_name, required=required)
-    cfg.resolve_secret = fake_resolve                     # type: ignore[method-assign]
+    orig_snapshot = dict(cfg.env_snapshot)
+    cfg.env_snapshot["VW_SSH_MULTIPLEX_PASS"] = "multiplex-pass"  # type: ignore[index]
     try:
-        os.environ.pop("VW_SSH_MULTIPLEX_PASS", None)
         res = tools["vaultwarden_store_ssh"](
             {"name": "SSH - Up", "user": "deploy", "file": str(key),
              "pass_env": "VW_SSH_MULTIPLEX_PASS"})
     finally:
-        cfg.resolve_secret = orig_resolve                 # type: ignore[method-assign]
-    assert res.get("created") is True, res
-    assert auth._created_ssh["args"][2] == "multiplex-pass"  # noqa: SLF001
+        cfg.env_snapshot.clear()
+        cfg.env_snapshot.update(orig_snapshot)
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "removed in v0.4.9" in res["error"]
 
 
 
@@ -938,10 +932,16 @@ def test_update_ssh_generate_requires_confirm():
 
 def test_update_ssh_generate_forbids_secret_inputs():
     auth, tools = _update_ssh_tools()
-    for k in ("pass", "pass_env", "pass_file", "file"):
+    # v0.4.9 BREAKING: pass_env rejected up front; others hit the conflict check.
+    for k in ("pass", "pass_file", "file"):
         res = tools["vaultwarden_update_ssh"](
             {"name": "SSH - Rot", "generate": True, "confirm": True, k: "x"})
         assert res["error_code"] == "CONFIG_ERROR", k
+    res = tools["vaultwarden_update_ssh"](
+        {"name": "SSH - Rot", "generate": True, "confirm": True,
+         "pass_env": "x"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "removed in v0.4.9" in res["error"]
 
 
 def test_update_ssh_generate_rotates_key():
@@ -975,17 +975,11 @@ def test_update_ssh_upload_raw_pass_warning():
     assert auth._bw.edited_items[0]["login"]["password"] == "raw-new-pass"  # noqa: SLF001
 
 
-def test_update_ssh_upload_pass_env():
+def test_update_ssh_upload_pass_env_rejected():
+    """v0.4.9 BREAKING: pass_env was removed — explicit ConfigError."""
     auth, tools = _update_ssh_tools()
-    # v0.4.8 (Defect 4): inject through the config env snapshot (.env channel).
-    cfg = auth._config                                   # noqa: SLF001
-    orig_snapshot = dict(cfg.env_snapshot)
-    cfg.env_snapshot["VW_ROT_PASS"] = "env-new-pass"     # type: ignore[index]
-    try:
-        res = tools["vaultwarden_update_ssh"](
-            {"name": "SSH - Rot", "pass_env": "VW_ROT_PASS"})
-    finally:
-        cfg.env_snapshot.clear()
-        cfg.env_snapshot.update(orig_snapshot)
-    assert "warning" not in res
-    assert auth._bw.edited_items[0]["login"]["password"] == "env-new-pass"  # noqa: SLF001
+    res = tools["vaultwarden_update_ssh"](
+        {"name": "SSH - Rot", "pass_env": "VW_ROT_PASS"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "removed in v0.4.9" in res["error"]
+    assert "pass_file" in res["suggestion"]

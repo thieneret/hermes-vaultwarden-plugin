@@ -52,22 +52,20 @@ vaultwarden_store(
 The password is generated and stored in the vault; you only receive a placeholder.
 Requires `allow_write: true`.
 
-## Example 5: Store a Secret via Env Var (safe input)
-
-```
-vaultwarden_store(type="login", name="GitHub", username="myuser", password_env="GH_TOKEN")
-```
-
-The token is read from the `GH_TOKEN` env var (set in `~/.hermes/.env`, chmod 600)
-and never enters your context. No `warning` field in the response.
-
-## Example 6: Store a Secret via Owner-Only File
+## Example 5: Store a Secret via Owner-Only File (safe input)
 
 ```
 vaultwarden_store(type="login", name="DB Prod", username="app", password_file="/run/secrets/db_password")
 ```
 
 The file must be owner-read-only (chmod 600); otherwise the call fails.
+The secret never enters your context. No `warning` field in the response.
+
+> **v0.4.9 BREAKING CHANGE:** the former env-var channel (`password_env`) was
+> removed — Hermes only loads `.env` at startup in multiplex gateway mode, so
+> env secrets required a restart to resolve. Supplying `password_env` now
+> raises an explicit `ConfigError` ("removed in v0.4.9"). Use `password_file`
+> (this example) or `generate=true` instead.
 
 ## Example 7: Raw Password (discouraged — expect a warning)
 

@@ -630,33 +630,13 @@ def test_rsi_direct_returns_value_and_warning():
     with patch("vaultwarden.tools.log.warning") as mock_warn:
         val, warning = _resolve_secret_input(
             {"password": secret}, direct_key="password",
-            env_key="password_env", file_key="password_file",
-            tool_name="vaultwarden_store")
+            file_key="password_file", tool_name="vaultwarden_store")
     assert val == secret
     assert warning is not None
     # dual channel: log.warning fired AND non-secret advisory returned
     mock_warn.assert_called_once()
     assert secret not in warning
-    assert "password_env" in warning and "password_file" in warning
-
-
-def test_rsi_env_set(monkeypatch):
-    monkeypatch.setenv("VW_TEST_PW", "from-env")
-    val, warning = _resolve_secret_input(
-        {"password_env": "VW_TEST_PW"}, direct_key="password",
-        env_key="password_env", file_key="password_file",
-        tool_name="vaultwarden_store")
-    assert val == "from-env"
-    assert warning is None
-
-
-def test_rsi_env_unset(monkeypatch):
-    monkeypatch.delenv("VW_MISSING_VAR", raising=False)
-    with pytest.raises(errors.ConfigError):
-        _resolve_secret_input(
-            {"password_env": "VW_MISSING_VAR"}, direct_key="password",
-            env_key="password_env", file_key="password_file",
-            tool_name="vaultwarden_store")
+    assert "password_file" in warning
 
 
 def test_rsi_file_good_mode(tmp_path):
@@ -665,8 +645,7 @@ def test_rsi_file_good_mode(tmp_path):
     f.chmod(0o600)
     val, warning = _resolve_secret_input(
         {"password_file": str(f)}, direct_key="password",
-        env_key="password_env", file_key="password_file",
-        tool_name="vaultwarden_store")
+        file_key="password_file", tool_name="vaultwarden_store")
     assert val == "file-secret"
     assert warning is None
 
@@ -678,8 +657,7 @@ def test_rsi_file_bad_mode_group_readable(tmp_path):
     with pytest.raises(errors.ConfigError) as exc_info:
         _resolve_secret_input(
             {"password_file": str(f)}, direct_key="password",
-            env_key="password_env", file_key="password_file",
-            tool_name="vaultwarden_store")
+            file_key="password_file", tool_name="vaultwarden_store")
     assert "readable only by the owner" in exc_info.value.message
 
 
@@ -691,8 +669,7 @@ def test_rsi_file_owner_unreadable(tmp_path):
     with pytest.raises(errors.ConfigError) as exc_info:
         _resolve_secret_input(
             {"password_file": str(f)}, direct_key="password",
-            env_key="password_env", file_key="password_file",
-            tool_name="vaultwarden_store")
+            file_key="password_file", tool_name="vaultwarden_store")
     assert "not readable by the owner" in exc_info.value.message
 
 
@@ -700,7 +677,7 @@ def test_rsi_file_missing(tmp_path):
     with pytest.raises(errors.NotFoundError):
         _resolve_secret_input(
             {"password_file": str(tmp_path / "nope.txt")},
-            direct_key="password", env_key="password_env",
+            direct_key="password",
             file_key="password_file", tool_name="vaultwarden_store")
 
 
@@ -711,131 +688,68 @@ def test_rsi_file_empty(tmp_path):
     with pytest.raises(errors.ConfigError) as exc_info:
         _resolve_secret_input(
             {"password_file": str(f)}, direct_key="password",
-            env_key="password_env", file_key="password_file",
-            tool_name="vaultwarden_store")
+            file_key="password_file", tool_name="vaultwarden_store")
     assert "is empty" in exc_info.value.message
 
 
 def test_rsi_conflict_two_sources():
     with pytest.raises(errors.ConfigError) as exc_info:
         _resolve_secret_input(
-            {"password": "x", "password_env": "Y"}, direct_key="password",
-            env_key="password_env", file_key="password_file",
-            tool_name="vaultwarden_store")
+            {"password": "x", "password_file": "Y"}, direct_key="password",
+            file_key="password_file", tool_name="vaultwarden_store")
     assert "provide only ONE of" in exc_info.value.message
 
 
 def test_rsi_none_provided():
     val, warning = _resolve_secret_input(
-        {}, direct_key="password", env_key="password_env",
+        {}, direct_key="password",
         file_key="password_file", tool_name="vaultwarden_store")
     assert val is None and warning is None
 
 
-# ── v0.4.8 (Defect 4): multiplex-aware env resolution via config ───────────
+# ── v0.4.9 (BREAKING CHANGE): *_env channel removed — explicit rejection ──
 
-def test_rsi_env_with_config_uses_resolve_secret(monkeypatch):
-    """v0.4.8: with a config, the env channel resolves via
-    config.resolve_secret() (get_secret-first) — NOT raw os.environ.get().
-    In multiplex gateway mode .env values are absent from os.environ."""
-    from vaultwarden.config import PluginConfig
-
-    monkeypatch.delenv("VW_MULTIPLEX_PW", raising=False)
-    cfg = PluginConfig.__new__(PluginConfig)   # bypass __init__/validation
-    calls: list[tuple[str, bool]] = []
-
-    def fake_resolve(var_name, *, required=True):
-        calls.append((var_name, required))
-        return "from-resolve-secret"
-
-    cfg.resolve_secret = fake_resolve          # type: ignore[method-assign]
-    val, warning = _resolve_secret_input(
-        {"password_env": "VW_MULTIPLEX_PW"}, direct_key="password",
-        env_key="password_env", file_key="password_file",
-        tool_name="vaultwarden_store", config=cfg)
-    assert val == "from-resolve-secret"
-    assert warning is None
-    assert calls == [("VW_MULTIPLEX_PW", False)]
-
-
-def test_rsi_env_with_config_empty_still_raises(monkeypatch):
-    """Empty resolve_secret result keeps the existing ConfigError message."""
-    from vaultwarden.config import PluginConfig
-
-    monkeypatch.delenv("VW_EMPTY_VAR", raising=False)
-    cfg = PluginConfig.__new__(PluginConfig)
-    cfg.resolve_secret = lambda name, *, required=True: ""  # type: ignore
+def test_reject_removed_env_channel_raises():
+    """_reject_removed_env_channel raises ConfigError mentioning v0.4.9."""
+    from vaultwarden.tools import _reject_removed_env_channel
     with pytest.raises(errors.ConfigError) as exc_info:
-        _resolve_secret_input(
-            {"password_env": "VW_EMPTY_VAR"}, direct_key="password",
-            env_key="password_env", file_key="password_file",
-            tool_name="vaultwarden_store", config=cfg)
-    assert "not set or empty" in exc_info.value.message
-
-
-def test_store_password_env_resolved_via_config(write_auth_manager):
-    """v0.4.8 (Defect 4): h_store passes config -> password_env resolves
-    through config.resolve_secret even when NOT in os.environ."""
-    auth = _fake_auth(write_auth_manager)
-    tools = _channel_tools(auth)
-    cfg = auth._config                          # noqa: SLF001
-    captured: dict = {}
-    orig_create = auth.create_item
-
-    def _create(item):
-        captured["item"] = item
-        return orig_create(item)
-    auth.create_item = _create                  # type: ignore[attr-defined]
-    orig_resolve = cfg.resolve_secret
-
-    def fake_resolve(var_name, *, required=True):
-        if var_name == "VW_NOT_IN_OS_ENVIRON":
-            return "multiplex-secret"
-        return orig_resolve(var_name, required=required)
-    cfg.resolve_secret = fake_resolve           # type: ignore[method-assign]
-    try:
-        os.environ.pop("VW_NOT_IN_OS_ENVIRON", None)
-        res = tools["vaultwarden_store"](
-            {"type": "login", "name": "env-test-multiplex",
-             "username": "u", "password_env": "VW_NOT_IN_OS_ENVIRON"})
-    finally:
-        cfg.resolve_secret = orig_resolve       # type: ignore[method-assign]
-    assert res["created"] is True
-    assert captured["item"]["login"]["password"] == "multiplex-secret"
-    assert "multiplex-secret" not in json.dumps(res)
+        _reject_removed_env_channel({"password_env": "VW_X"}, "password_env",
+                                    "password_file", "vaultwarden_store")
+    assert "removed in v0.4.9" in exc_info.value.message
+    assert "password_file" in exc_info.value.suggestion
+    # no-op when the removed key is absent/falsy
+    _reject_removed_env_channel({}, "password_env", "password_file",
+                                "vaultwarden_store")
+    _reject_removed_env_channel({"password_env": ""}, "password_env",
+                                "password_file", "vaultwarden_store")
 
 
 # ── h_store / h_update secret-input channel wiring ────────────────────────────────────────────────
 
 
 
-def test_store_password_env_resolved(write_auth_manager):
+def test_store_password_env_rejected(write_auth_manager):
+    """v0.4.9 BREAKING: password_env now raises an explicit ConfigError."""
     auth = _fake_auth(write_auth_manager)
     tools = _channel_tools(auth)
-    captured: dict = {}
-    orig_create = auth.create_item
+    res = tools["vaultwarden_store"](
+        {"type": "login", "name": "env-test", "username": "u",
+         "password_env": "GH_TOKEN"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "removed in v0.4.9" in res["error"]
+    assert "password_file" in res["suggestion"]
 
-    def _create(item):
-        captured["item"] = item
-        return orig_create(item)
-    auth.create_item = _create                           # type: ignore[attr-defined]
-    # v0.4.8 (Defect 4): password_env resolves via config.resolve_secret —
-    # inject through the config env snapshot (the .env channel), not raw
-    # os.environ, exactly like a multiplex gateway deployment.
-    cfg = auth._config                                   # noqa: SLF001
-    orig_snapshot = dict(cfg.env_snapshot)
-    cfg.env_snapshot["GH_TOKEN"] = "gh-secret-xyz"       # type: ignore[index]
-    try:
-        res = tools["vaultwarden_store"](
-            {"type": "login", "name": "env-test", "username": "u",
-             "password_env": "GH_TOKEN"})
-    finally:
-        cfg.env_snapshot.clear()
-        cfg.env_snapshot.update(orig_snapshot)
-    assert res["created"] is True
-    assert "warning" not in res
-    assert captured["item"]["login"]["password"] == "gh-secret-xyz"
-    assert "gh-secret-xyz" not in json.dumps(res)
+
+def test_store_password_env_rejected_in_generate_mode(write_auth_manager):
+    """v0.4.9: rejection fires BEFORE the generate branch (not silent)."""
+    auth = _fake_auth(write_auth_manager)
+    tools = _channel_tools(auth)
+    res = tools["vaultwarden_store"](
+        {"type": "login", "name": "gen-env", "generate": True,
+         "password_env": "GH_TOKEN"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "removed in v0.4.9" in res["error"]
+
 
 def test_store_password_file_resolved(write_auth_manager, tmp_path):
     auth = _fake_auth(write_auth_manager)
@@ -867,12 +781,13 @@ def test_store_raw_password_response_warning(write_auth_manager):
     assert res["created"] is True          # raw input still ACCEPTED
     assert "warning" in res
     assert "x-raw-secret" not in json.dumps(res)
-    assert "password_env" in res["warning"]
+    assert "password_file" in res["warning"]
+    # v0.4.9: the removed env channel must NOT be recommended anymore
+    assert "password_env" not in res["warning"]
     # v0.4.2: the response warning is an imperative instruction to the agent
     assert "MUST warn the user" in res["warning"]
     expected = _DIRECT_SECRET_WARNING.format(
-        key="password", tool="vaultwarden_store",
-        env_key="password_env", file_key="password_file")
+        key="password", tool="vaultwarden_store", file_key="password_file")
     assert res["warning"] == expected
 
 def test_store_password_conflict(write_auth_manager):
@@ -880,14 +795,14 @@ def test_store_password_conflict(write_auth_manager):
     tools = _channel_tools(auth)
     res = tools["vaultwarden_store"](
         {"type": "login", "name": "c", "username": "u",
-         "password": "p", "password_env": "E"})
+         "password": "p", "password_file": "/tmp/x"})
     assert res["error_code"] == "CONFIG_ERROR"
     assert "provide only ONE of" in res["error"]
 
 def test_store_generate_conflicts_with_password_channels(write_auth_manager):
     auth = _fake_auth(write_auth_manager)
     tools = _channel_tools(auth)
-    for k in ("password", "password_env", "password_file"):
+    for k in ("password", "password_file"):
         res = tools["vaultwarden_store"](
             {"type": "login", "name": "g", "generate": True, k: "x"})
         assert res["error_code"] == "CONFIG_ERROR", k
@@ -896,34 +811,22 @@ def test_store_generate_conflicts_with_password_channels(write_auth_manager):
 def test_update_generate_conflicts_with_password_channels(write_auth_manager):
     auth = _fake_auth(write_auth_manager)
     tools = _channel_tools(auth)
-    for k in ("password", "password_env", "password_file"):
+    for k in ("password", "password_file"):
         res = tools["vaultwarden_update"](
             {"item_id": "i", "generate": True, k: "x"})
         assert res["error_code"] == "CONFIG_ERROR", k
 
-def test_update_password_env_resolved(write_auth_manager):
+def test_update_password_env_rejected(write_auth_manager):
+    """v0.4.9 BREAKING: vaultwarden_update rejects password_env explicitly."""
     auth = _fake_auth(write_auth_manager)
     tools = _channel_tools(auth)
-    captured: dict = {}
-    orig_edit = auth.edit_item
+    res = tools["vaultwarden_update"](
+        {"item_id": "aaaa1111-0000-0000-0000-000000000001",
+         "password_env": "VW_UPD_PW"})
+    assert res["error_code"] == "CONFIG_ERROR"
+    assert "removed in v0.4.9" in res["error"]
+    assert "password_file" in res["suggestion"]
 
-    def _edit(item):
-        captured["item"] = item
-        return orig_edit(item)
-    auth.edit_item = _edit                               # type: ignore[attr-defined]
-    # v0.4.8 (Defect 4): inject through the config env snapshot (.env channel).
-    cfg = auth._config                                   # noqa: SLF001
-    orig_snapshot = dict(cfg.env_snapshot)
-    cfg.env_snapshot["VW_UPD_PW"] = "upd-env-pw"         # type: ignore[index]
-    try:
-        res = tools["vaultwarden_update"](
-            {"item_id": "aaaa1111-0000-0000-0000-000000000001",
-             "password_env": "VW_UPD_PW"})
-    finally:
-        cfg.env_snapshot.clear()
-        cfg.env_snapshot.update(orig_snapshot)
-    assert res["updated"] is True
-    assert captured["item"]["login"]["password"] == "upd-env-pw"
 
 def test_update_raw_password_warning(write_auth_manager):
     auth = _fake_auth(write_auth_manager)
@@ -938,23 +841,25 @@ def test_update_raw_password_warning(write_auth_manager):
 
 def test_direct_warning_template_has_no_value_slot():
     # The template only interpolates parameter NAMES, never values.
-    for slot in ("{key!r}", "{tool}", "{env_key!r}", "{file_key!r}"):
+    for slot in ("{key!r}", "{tool}", "{file_key!r}"):
         assert slot in _DIRECT_SECRET_WARNING
+    # v0.4.9: the removed env channel is no longer referenced.
+    assert "{env_key" not in _DIRECT_SECRET_WARNING
     assert "{}" not in _DIRECT_SECRET_WARNING.replace("{key!r}", "") \
-        .replace("{tool}", "").replace("{env_key!r}", "") \
-        .replace("{file_key!r}", "")
+        .replace("{tool}", "").replace("{file_key!r}", "")
 
 
 def test_direct_warning_is_imperative_and_value_free():
     """v0.4.2: the warning is an explicit instruction for the agent to warn."""
     formatted = _DIRECT_SECRET_WARNING.format(
-        key="password", tool="vaultwarden_store",
-        env_key="password_env", file_key="password_file")
+        key="password", tool="vaultwarden_store", file_key="password_file")
     # imperative directive present
     assert "MUST warn the user" in formatted
     assert "AGENT INSTRUCTION" in formatted
-    # recommends the safe channels
-    assert "password_env" in formatted and "password_file" in formatted
+    # recommends the remaining safe channel
+    assert "password_file" in formatted
+    # v0.4.9: the removed env channel must not appear
+    assert "password_env" not in formatted
     # value-free: no leftover interpolation slots after .format()
     for token in ("{key", "{tool", "{env_key", "{file_key", "{}"):
         assert token not in formatted
