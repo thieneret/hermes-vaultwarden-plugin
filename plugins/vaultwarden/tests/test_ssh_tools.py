@@ -901,16 +901,14 @@ def test_store_ssh_upload_pass_env_rejected_via_config(tmp_path):
     key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n"
                    "-----END OPENSSH PRIVATE KEY-----\n")
     auth, tools = _store_ssh_tools()
-    cfg = auth._config                                    # noqa: SLF001
-    orig_snapshot = dict(cfg.env_snapshot)
-    cfg.env_snapshot["VW_SSH_MULTIPLEX_PASS"] = "multiplex-pass"  # type: ignore[index]
+    import os
+    os.environ["VW_SSH_MULTIPLEX_PASS"] = "multiplex-pass"
     try:
         res = tools["vaultwarden_store_ssh"](
             {"name": "SSH - Up", "user": "deploy", "file": str(key),
              "pass_env": "VW_SSH_MULTIPLEX_PASS"})
     finally:
-        cfg.env_snapshot.clear()
-        cfg.env_snapshot.update(orig_snapshot)
+        os.environ.pop("VW_SSH_MULTIPLEX_PASS", None)
     assert res["error_code"] == "CONFIG_ERROR"
     assert "removed in v0.4.9" in res["error"]
 

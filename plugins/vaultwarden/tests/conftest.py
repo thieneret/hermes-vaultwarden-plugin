@@ -268,12 +268,6 @@ BASE_SECTION = {
 # lookup and no BW_CLI_PATH env override any more. Tests that need a real
 # binary pass it via section={"bw_cli_path": fake_bw}.
 
-BASE_ENV = {
-    "VW_CLIENT_SECRET": "cs-secret",
-    "VW_MASTER_PASSWORD": "mp-secret",
-}
-
-
 class SettingsContext:
     """Simulates the Hermes-native PluginContext.get_config() API (v0.2.0).
 
@@ -289,9 +283,12 @@ class SettingsContext:
 
 
 def make_config(**overrides) -> PluginConfig:
+    # v0.5.0 (BREAKING): the env= parameter is gone — bootstrap secrets are
+    # loaded from secrets.yaml by secrets.py, never from an environment
+    # mapping. An "env" key in overrides is ignored for backward compat.
     section = {**BASE_SECTION, **overrides.pop("section", {})}
-    env = {**BASE_ENV, **overrides.pop("env", {})}
-    cfg = load_config(SettingsContext(section), env=env)
+    overrides.pop("env", None)  # accepted but unused (v0.5.0)
+    cfg = load_config(SettingsContext(section))
     return cfg
 
 
@@ -471,3 +468,25 @@ def write_auth_manager(bw_cli):
 def write_tools_by_name(write_auth_manager, registry):
     cfg = write_auth_manager._config
     return _dict_tools(write_auth_manager, cfg, registry)
+
+
+@pytest.fixture()
+def hermes_home_with_secrets(tmp_path: Path, monkeypatch) -> Path:
+    """v0.5.0: a HERMES_HOME containing a valid, chmod-600 secrets.yaml.
+
+    Mirrors the plugin-private bootstrap file used by secrets.load_secrets():
+    $HERMES_HOME/plugins/vaultwarden/secrets.yaml with the fake-CLI test
+    credentials (cs-secret / mp-secret). Also pins TERMINAL_ENV so the
+    terminal-backend warning does not depend on the developer machine.
+    """
+    home = tmp_path / "hermes-home"
+    plugindir = home / "plugins" / "vaultwarden"
+    plugindir.mkdir(parents=True)
+    secrets_file = plugindir / "secrets.yaml"
+    secrets_file.write_text(
+        "client_secret: cs-secret\nmaster_password: mp-secret\n")
+    secrets_file.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.delenv("BW_CLI_PATH", raising=False)
+    return home

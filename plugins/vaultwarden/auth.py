@@ -294,7 +294,7 @@ class AuthManager:
         except errors.SessionError as exc:
             raise errors.AuthError(
                 "API-key login was rejected.",
-                suggestion="Verify client_id and VW_CLIENT_SECRET in .env.") from exc
+                suggestion="Verify client_id and the client_secret in secrets.yaml (chmod 600).") from exc
         except errors.AuthError:
             raise
         except errors.VaultwardenError as exc:
@@ -314,7 +314,7 @@ class AuthManager:
             if exc.code in ("AUTH_ERROR", "PLUGIN_ERROR"):
                 raise errors.AuthError(
                     "Unlock failed: master password was rejected.",
-                    suggestion="Check VW_MASTER_PASSWORD in your .env file.") from exc
+                    suggestion="Check the master_password in your secrets.yaml file (chmod 600).") from exc
             raise
         self._session_key = key
         self._session_created_at = time.time()

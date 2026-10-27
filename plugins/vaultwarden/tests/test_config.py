@@ -47,8 +47,11 @@ def test_defaults_when_no_settings(no_config_fallback):
     assert not hasattr(cfg, "auto_unlock")
     assert cfg.placeholder_ttl_seconds == 300
     assert cfg.max_placeholders == 50
-    assert cfg.client_secret_env_name == "VW_CLIENT_SECRET"
-    assert cfg.master_password_env_name == "VW_MASTER_PASSWORD"
+    # v0.5.0 (BREAKING): env-based secret accessors are gone entirely.
+    assert not hasattr(cfg, "client_secret_env_name")
+    assert not hasattr(cfg, "master_password_env_name")
+    assert not hasattr(cfg, "resolve_secret")
+    assert not hasattr(cfg, "env_snapshot")
 
 
 def test_none_source_returns_defaults():
@@ -72,13 +75,12 @@ def test_unsupported_object_raises_config_error():
         load_config(NoConfigApi(), env={})
 
 
-def test_resolve_secret_uses_snapshot_not_os_environ(monkeypatch, no_config_fallback):
-    monkeypatch.delenv("VW_CLIENT_SECRET", raising=False)
-    cfg = load_config(FakePluginContext({}),
-                      env={"VW_CLIENT_SECRET": "from-dot-env"})
-    assert cfg.resolve_secret("VW_CLIENT_SECRET") == "from-dot-env"
-    with pytest.raises(ConfigError):
-        cfg.resolve_secret("MISSING_VAR")
+def test_resolve_secret_removed_in_v050(monkeypatch, no_config_fallback):
+    """v0.5.0 BREAKING: the .env/secret_scope resolution channel is gone."""
+    from vaultwarden import config as vw_config
+    cfg = load_config(FakePluginContext({}))
+    assert not hasattr(cfg, "resolve_secret")
+    assert not hasattr(vw_config, "_hermes_get_secret")
 
 
 def test_appdata_dir_default_and_override(tmp_path, no_config_fallback):
@@ -104,15 +106,12 @@ def test_validate_catches_missing_fields():
     cfg3.validate()  # ok
 
 
-def test_validate_accepts_empty_master_password_env():
-    # v0.2.3: master_password_env keeps a sensible default (VW_MASTER_PASSWORD);
-    # an explicit empty value falls back to the default and must NOT fail
-    # validation. The master password VALUE is enforced at resolve_secret() time.
+def test_validate_no_longer_references_env_secret_keys():
+    # v0.5.0: validate() has nothing to say about *_env keys any more — the
+    # secret VALUES are enforced by secrets.load_secrets() at registration.
     cfg = load_config(FakePluginContext({
-        "enabled": True, "server_url": "https://v", "client_id": "user.abc",
-        "master_password_env": ""}), env={})
+        "enabled": True, "server_url": "https://v", "client_id": "user.abc"}))
     cfg.validate()  # ok
-    assert cfg.master_password_env_name == "VW_MASTER_PASSWORD"
 
 
 def test_bool_string_coercion():
@@ -130,7 +129,6 @@ def test_get_config_api_plugin_relative_keys():
         "enabled": True,
         "server_url": "https://vault.example.com",
         "client_id": "user.abc-123",
-        "client_secret_env": "VW_CLIENT_SECRET",
         "allow_write": True,
         "bw_cli_path": "/opt/data/bin/bw",
     })
@@ -201,28 +199,20 @@ def test_auto_unlock_removed():
     assert "auto_unlock" not in text
 
 
-def test_master_password_mandatory_via_resolve():
-    """v0.2.3: missing master password VALUE must fail at resolve_secret()."""
+def test_master_password_mandatory_via_secrets_yaml(tmp_path):
+    """v0.5.0: missing master password VALUE must fail at load_secrets()."""
     from vaultwarden import errors
-    from vaultwarden.config import PluginConfig
+    from vaultwarden.secrets import load_secrets
 
-    cfg = PluginConfig(
-        section={"server_url": "https://vault.example.com",
-                 "client_id": "user.12345678-1234-1234-1234-123456789abc"},
-        env_snapshot={},  # no VW_MASTER_PASSWORD in the snapshot
-    )
-    try:
-        cfg.resolve_secret(cfg.master_password_env_name, required=True)
-        assert False, "Should have raised ConfigError"
-    except errors.ConfigError as e:
-        assert "VW_MASTER_PASSWORD" in str(e.message)
-
-
-def test_master_password_env_name_defaults():
-    """v0.2.3: env var NAME always has a sensible default."""
-    from vaultwarden.config import PluginConfig
-    cfg = PluginConfig(section={})
-    assert cfg.master_password_env_name == "VW_MASTER_PASSWORD"
+    home = tmp_path / "hh"
+    plug = home / "plugins" / "vaultwarden"
+    plug.mkdir(parents=True)
+    f = plug / "secrets.yaml"
+    f.write_text("client_secret: cs\nmaster_password: \"\"\n")
+    f.chmod(0o600)
+    with pytest.raises(errors.ConfigError) as ei:
+        load_secrets(str(home))
+    assert "master_password" in str(ei.value.message)
 
 
 # ---------------------------------------------------------------------------
