@@ -63,10 +63,10 @@ def test_audit_flags_disallowed_keys():
                                 "BW_SESSION", "BW_CLIENTID", "BW_CLIENTSECRET", "BW_MP"}
 
 
-def test_no_bootstrap_secrets_in_os_environ_after_register(monkeypatch, tmp_path, fake_bw):
-    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
-    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def test_no_bootstrap_secrets_in_os_environ_after_register(monkeypatch, tmp_path, fake_bw,
+                                                           hermes_home_with_secrets):
+    """v0.5.0: secrets.yaml bootstrap must not put secret values in os.environ."""
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home_with_secrets))
     import vaultwarden
     from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
@@ -74,6 +74,9 @@ def test_no_bootstrap_secrets_in_os_environ_after_register(monkeypatch, tmp_path
     vaultwarden.register(ctx)
     assert "VW_CLIENT_SECRET" not in os.environ
     assert "VW_MASTER_PASSWORD" not in os.environ
+    # the loaded VALUES never enter the environment either
+    assert "cs-secret" not in os.environ.values()
+    assert "mp-secret" not in os.environ.values()
     assert "BW_SESSION" not in os.environ   # session key NEVER exported globally
 
 
@@ -159,9 +162,10 @@ def test_config_contains_no_secret_values():
     blob = str(_DEFAULTS).lower()
     for forbidden in ("secret-value", "password=", "master_password: "):
         assert forbidden not in blob
-    # defaults store NAMES only:
-    assert _DEFAULTS["client_secret_env"] == "VW_CLIENT_SECRET"
-    assert _DEFAULTS["master_password_env"] == "VW_MASTER_PASSWORD"
+    # v0.5.0 (BREAKING): the env-based secret config keys are gone entirely —
+    # bootstrap secrets come from secrets.yaml, never from .env / OS env.
+    assert "client_secret_env" not in _DEFAULTS
+    assert "master_password_env" not in _DEFAULTS
 
 
 def test_session_key_not_persisted_to_disk(bw_cli, tmp_path):
@@ -558,29 +562,41 @@ def test_middleware_chain_safety_other_plugin_last_word(fake_bw, tmp_path, regis
     assert "sup3r-s3cret-pg!" not in final["command"]  # secret NOT in command
 
 
-def test_register_cleanup_removes_bootstrap_env(monkeypatch, tmp_path, fake_bw):
-    """After register(): VW_* gone from os.environ; values live only in memory."""
+def test_register_loads_secrets_without_touching_env(monkeypatch, tmp_path, fake_bw):
+    """v0.5.0: register() bootstraps from secrets.yaml; secret values live only
+    in plugin memory and NEVER enter os.environ (no cleanup needed because
+    nothing is ever exported)."""
     import os
     import stat
 
     import vaultwarden
-    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
-    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    home = tmp_path / "hermes-home"
+    plugindir = home / "plugins" / "vaultwarden"
+    plugindir.mkdir(parents=True)
+    sf = plugindir / "secrets.yaml"
+    sf.write_text("client_secret: cs-secret\nmaster_password: mp-secret\n")
+    sf.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    # legacy env vars are IRRELEVANT now — even if present they must not be
+    # used or removed by the plugin (there is no _cleanup_bootstrap_env).
+    monkeypatch.setenv("VW_CLIENT_SECRET", "unused-legacy-value")
+    monkeypatch.setenv("VW_MASTER_PASSWORD", "unused-legacy-value")
 
     from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                            "bw_cli_path": fake_bw})
     ok = vaultwarden.register(ctx)
     assert ok is True
-    assert "VW_CLIENT_SECRET" not in os.environ
-    assert "VW_MASTER_PASSWORD" not in os.environ
-    # ...but the plugin still works (values captured before cleanup):
+    # loaded VALUES never entered the environment:
+    assert "cs-secret" not in os.environ.values()
+    assert "mp-secret" not in os.environ.values()
+    # ...but the plugin still works (values captured straight from file):
     # v0.1.9: register() defers authentication; this FIRST tool use triggers
     # the lazy ensure_authenticated() and the vault comes up unlocked.
     status = next(t for t in ctx.tools if t["name"] == "vaultwarden_status")
     assert status["check_fn"]() is True          # lazy auth kicks in here
     res = _dict_tools({"status": status["handler"]})["status"]({})
     assert res["status"]["auth_state"] == "unlocked"
-    bwdata = tmp_path / "plugins" / "vaultwarden" / ".bw-data"
+    bwdata = home / "plugins" / "vaultwarden" / ".bw-data"
     assert bwdata.exists() and stat.S_IMODE(os.stat(bwdata).st_mode) == 0o700

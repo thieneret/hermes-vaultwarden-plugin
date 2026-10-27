@@ -1,7 +1,9 @@
 """Security primitives: log redaction, subprocess-env auditing, escaping.
 
 Design rules (plan §10):
-- Secrets flow ONE WAY: .env -> plugin memory -> subprocess env. NEVER reverse.
+- Secrets flow ONE WAY: secrets.yaml -> plugin memory -> subprocess env.
+  NEVER reverse; they never enter os.environ (v0.5.0 BREAKING: the .env
+  channel was removed — see secrets.py).
 - Only these keys may ever appear in a bw subprocess env carrying secrets:
     BW_SESSION, BW_CLIENTID, BW_CLIENTSECRET, BW_MP
   plus the non-secret plumbing keys PATH, HOME, BITWARDENCLI_APPDATA_DIR.
@@ -29,7 +31,8 @@ BW_ENV_ALLOWLIST = frozenset({
     "BW_MP",
 })
 
-# Keys that must NEVER be present in os.environ after plugin init.
+# Legacy bootstrap env names: since v0.5.0 these must NEVER appear in
+# os.environ at all (secrets come from secrets.yaml, not the environment).
 SECRET_ENV_NAMES = ("VW_CLIENT_SECRET", "VW_MASTER_PASSWORD")
 
 _TOKEN_RE = re.compile(r"__VW_SECRET_([0-9a-f]{12})__")
@@ -226,6 +229,6 @@ def audit_subprocess_env(env: dict) -> list[str]:
     """Return violations: keys present that are not on the allowlist.
 
     Used by tests and (optionally) at runtime to guarantee we never leak the
-    full parent environment (which contains the loaded .env vars) into bw.
+    full parent environment into bw.
     """
     return sorted(k for k in env if k not in BW_ENV_ALLOWLIST)

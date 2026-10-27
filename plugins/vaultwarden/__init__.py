@@ -1,9 +1,10 @@
-"""Hermes Agent — Vaultwarden secrets management plugin (v0.2.3).
+"""Hermes Agent — Vaultwarden secrets management plugin (v0.5.0).
 
 Entry point: ``register(ctx)`` (see plan §4/§12).
 
-Pipeline: .env (bootstrap secrets, loaded by Hermes secret_scope) ->
-plugin-private memory -> isolated bw subprocesses with
+Pipeline: secrets.yaml (bootstrap secrets, chmod 600, read DIRECTLY by
+secrets.py — v0.5.0 BREAKING: never via .env / OS environment / Hermes
+secret_scope) -> plugin-private memory -> isolated bw subprocesses with
 BITWARDENCLI_APPDATA_DIR pointing at this plugin's .bw-data.
 
 The LLM only ever sees metadata and single-use placeholder references
@@ -15,11 +16,13 @@ cleans up + redacts.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
+from . import secrets as _secrets
 from .auth import AuthManager, ensure_appdata_dir
 from .bw_cli import BwCli, find_bw_binary
-from .config import PluginConfig, load_config
+from .config import load_config
 from .hooks import (
     _cleanup_stale_secrets,
     _cleanup_stale_sockets,
@@ -39,23 +42,9 @@ __all__ = ["register", "PLUGIN_STATE"]
 PLUGIN_STATE: dict[str, Any] = {}
 
 
-def _cleanup_bootstrap_env(config: PluginConfig) -> None:
-    """🚫 CRITICAL step 3: explicit removal of bootstrap secrets from os.environ.
-
-    Secrets flow one way: .env -> plugin memory -> subprocess env. NEVER back.
-    """
-    for name in (config.client_secret_env_name, config.master_password_env_name):
-        try:
-            del os.environ[name]
-            log.debug("Removed %s from process environment.", name)
-        except KeyError:
-            pass
-
-
-def _resolve_secrets(config: PluginConfig) -> tuple[str, str]:
-    client_secret = config.resolve_secret(config.client_secret_env_name)
-    master_password = config.resolve_secret(config.master_password_env_name)
-    return client_secret, master_password
+# v0.5.0 (BREAKING): the bootstrap secrets are loaded directly from
+# secrets.yaml by secrets.py and NEVER enter os.environ, so there is no
+# env-cleanup step any more.
 
 
 def _make_check_fn(auth_ref: AuthManager):
@@ -90,6 +79,12 @@ def register(ctx: Any) -> bool:
 
     log.info("Vaultwarden plugin enabled, checking prerequisites...")
 
+    # v0.5.0 (BREAKING): bootstrap secrets are loaded from the plugin-private
+    # secrets.yaml under HERMES_HOME — they never touch os.environ or the
+    # Hermes secret_scope (closes the printenv / cat .env attack surfaces).
+    hermes_home = str(os.environ.get("HERMES_HOME", "")).strip() \
+        or str(Path.home() / ".hermes")
+
     # VWP-01 (v0.4.7 BREAKING): bw is executed ONLY from the pinned,
     # strictly validated bw_cli_path (config.yaml). No PATH lookup and no
     # env override. Fail closed: missing or invalid path ->
@@ -113,15 +108,17 @@ def register(ctx: Any) -> bool:
     log.info("Bitwarden CLI pinned and validated: %s", bw_path)
 
     try:
-        client_secret, master_password = _resolve_secrets(config)
+        client_secret, master_password = _secrets.load_secrets(hermes_home)
     except Exception as exc:
         log.warning("Vaultwarden plugin load FAILED: bootstrap secrets missing: %s", exc)
         return False
-    log.info("Bootstrap secrets resolved successfully")
+    log.info("Bootstrap secrets loaded from %s (never entered OS env)",
+             f"{hermes_home}/plugins/vaultwarden/secrets.yaml")
 
-    # 3. EXPLICIT CLEANUP of bootstrap vars from the process environment
-    _cleanup_bootstrap_env(config)
-    log.debug("Bootstrap environment variables cleaned up")
+    # v0.5.0: privilege-separation advisory — with a 'local' terminal backend
+    # the LLM could still cat secrets.yaml; sandboxed backends cannot.
+    backend = _secrets.check_terminal_backend()
+    log.debug("Terminal backend check completed (backend=%s)", backend or "local")
 
     # 4. isolated appdata dir (chmod 700)
     try:

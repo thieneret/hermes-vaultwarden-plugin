@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 0.4.9
+version: 0.5.0
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key
@@ -34,14 +34,11 @@ config:
   client_id:
     type: string
     description: API-key client id ("user.<uuid>").
-  client_secret_env:
-    type: string
-    default: VW_CLIENT_SECRET
-    description: NAME of the env var holding the client secret (value lives in .env).
-  master_password_env:
-    type: string
-    default: VW_MASTER_PASSWORD
-    description: NAME of the env var holding the master password (value lives in .env).
+  # v0.5.0 (BREAKING): client_secret_env / master_password_env REMOVED.
+  # Bootstrap secrets now live in $HERMES_HOME/plugins/vaultwarden/secrets.yaml
+  # (chmod 600, enforced by the plugin). Copy secret.yaml.template to
+  # secrets.yaml and fill in client_secret / master_password. They never
+  # enter the OS environment or Hermes secret_scope.
   appdata_dir_env:
     type: string
     default: VW_APPDATA_DIR

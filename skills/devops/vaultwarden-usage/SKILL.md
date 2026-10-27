@@ -102,8 +102,11 @@ than one is a `ConfigError`:
 > was REMOVED — in multiplex gateway mode Hermes loads `.env` only at startup,
 > so env secrets required a full restart. Supplying these parameters now raises
 > an explicit `ConfigError` ("removed in v0.4.9"); use `*_file` or
-> `generate=true` instead. Bootstrap secrets (`client_secret_env` /
-> `master_password_env`) are unaffected.
+> `generate=true` instead. Bootstrap secrets are also unaffected by that
+> change, but note **v0.5.0**: they now load from
+> `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` (chmod 600), not from
+> `.env` — the `client_secret_env` / `master_password_env` config keys were
+> removed.
 
 ## Standard Workflow (3 Steps)
 

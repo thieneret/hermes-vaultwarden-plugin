@@ -47,7 +47,8 @@ class VaultwardenError(Exception):
 class ConfigError(VaultwardenError):
     code = "CONFIG_ERROR"
     recoverable = False
-    suggestion = "Fix the vaultwarden section of config.yaml or the .env file."
+    suggestion = ("Fix the vaultwarden section of config.yaml or the "
+                  "plugin-private secrets.yaml file (chmod 600).")
 
 
 # v0.4.8 (BUGFIX): auth._configure_server raises errors.PluginError, which
@@ -72,7 +73,8 @@ class BinaryError(VaultwardenError):
 class AuthError(VaultwardenError):
     code = "AUTH_ERROR"
     recoverable = False
-    suggestion = "Check VW_CLIENT_SECRET / VW_MASTER_PASSWORD in your .env file."
+    suggestion = ("Check client_secret / master_password in "
+                  "$HERMES_HOME/plugins/vaultwarden/secrets.yaml (chmod 600).")
 
 
 class SessionError(VaultwardenError):

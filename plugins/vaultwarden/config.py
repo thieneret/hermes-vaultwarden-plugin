@@ -2,8 +2,10 @@
 
 Layers:
 - Hermes config (via PluginContext.get_config()) -> non-secret settings
-  (URLs, ids, flags, ENV VAR NAMES)
-- .env              -> secret VALUES (chmod 600; loaded by Hermes secret_scope)
+  (URLs, ids, flags)
+- secrets.yaml      -> bootstrap secret VALUES (chmod 600; read directly by
+  secrets.py — v0.5.0 BREAKING: the .env / resolve_secret() channel is gone,
+  secrets never enter the OS environment or Hermes secret_scope)
 - plugin memory     -> resolved values, never written back to os.environ
 - .bw-data/         -> isolated bw CLI state (chmod 700)
 
@@ -26,24 +28,16 @@ from . import errors
 
 log = logging.getLogger("hermes.plugins.vaultwarden.config")
 
-# Hermes internal API for multiplex-aware secret resolution (v0.1.7).
-# In multiplex gateway mode, .env values are NOT in os.environ; they live
-# in a context-local scope accessible only via get_secret(). This import
-# is optional: older Hermes versions or non-gateway modes fall back to
-# os.environ.
-try:
-    from agent.secret_scope import get_secret as _hermes_get_secret
-except ImportError:
-    _hermes_get_secret = None
-
 PLUGIN_DIR = Path(__file__).resolve().parent
 
 _DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "server_url": "",
     "client_id": "",
-    "client_secret_env": "VW_CLIENT_SECRET",
-    "master_password_env": "VW_MASTER_PASSWORD",
+    # v0.5.0 (BREAKING): client_secret_env / master_password_env REMOVED —
+    # bootstrap secrets now live in $HERMES_HOME/plugins/vaultwarden/
+    # secrets.yaml (chmod 600), loaded directly by secrets.py. They never
+    # enter the OS environment or Hermes secret_scope.
     "appdata_dir_env": "VW_APPDATA_DIR",
     "allow_write": False,
     "allow_startup_secret_injection": False,
@@ -130,9 +124,19 @@ def _extract_section(source: Any) -> dict:
         log.warning("Fallback 2: trying direct read from %s (exists=%s)",
                     config_path, config_path.exists())
         if config_path.exists():
-            import yaml
-            with open(config_path, encoding="utf-8-sig") as f:
-                data = yaml.safe_load(f) or {}
+            # The project has ZERO runtime dependencies — PyYAML may be
+            # absent (e.g. CI venvs).  Fall back to the stdlib parser in
+            # secrets.py when the optional import fails.
+            try:
+                import yaml
+            except ImportError:
+                yaml = None
+            if yaml is not None:
+                with open(config_path, encoding="utf-8-sig") as f:
+                    data = yaml.safe_load(f) or {}
+            else:
+                from .secrets import _load_yaml_mapping
+                data = _load_yaml_mapping(config_path)
             entry = data.get("plugins", {}).get("entries", {}).get("vaultwarden", {})
             section = entry.get("settings") or entry.get("config") or {}
             if section:
@@ -158,7 +162,20 @@ def _extract_section(source: Any) -> dict:
 @dataclass
 class PluginConfig:
     section: dict = field(default_factory=dict)
-    env_snapshot: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
+    # v0.5.0 (BREAKING): env_snapshot removed — the plugin no longer reads
+    # secret VALUES from the environment. The optional ``env`` mapping passed
+    # to load_config() is consulted ONLY for non-secret path overrides
+    # (VW_APPDATA_DIR / HERMES_HOME); when absent, os.environ is used.
+    # NOTE: the field name is underscored so PluginConfig(section=...) keeps
+    # working unchanged; load_config() assigns it after construction.
+    _env: Mapping[str, str] | None = field(default=None, repr=False,
+                                           compare=False)
+
+    def _lookup_env(self, key: str) -> str:
+        """Non-secret env lookup: explicit mapping first, then os.environ."""
+        if self._env is not None:
+            return str(self._env.get(key, "") or "").strip()
+        return str(os.environ.get(key, "") or "").strip()
 
     def _raw(self, key: str) -> Any:
         return self.section.get(key, _DEFAULTS[key])
@@ -175,14 +192,6 @@ class PluginConfig:
     @property
     def client_id(self) -> str:
         return str(self._raw("client_id") or "")
-
-    @property
-    def client_secret_env_name(self) -> str:
-        return str(self._raw("client_secret_env") or "VW_CLIENT_SECRET")
-
-    @property
-    def master_password_env_name(self) -> str:
-        return str(self._raw("master_password_env") or "VW_MASTER_PASSWORD")
 
     @property
     def appdata_dir_env_name(self) -> str:
@@ -229,6 +238,12 @@ class PluginConfig:
     def bw_cli_path(self) -> str:
         # VWP-01 (v0.4.7 BREAKING): the former environment-variable
         # override is REMOVED — config.yaml is the single source of truth.
+        # v0.5.0 keeps a MINIMAL os.environ check here solely so an empty
+        # BW_CLI_PATH env var cannot resurrect the override; secrets never
+        # flow through this channel (bootstrap secrets live in secrets.yaml).
+        if os.environ.get("BW_CLI_PATH", "").strip():
+            log.warning("BW_CLI_PATH is set but IGNORED (VWP-01): "
+                        "bw_cli_path in config.yaml is the only source.")
         return str(self._raw("bw_cli_path") or "")
 
     # v0.2.2 (BUGFIX): configurable terminal tool names / command keys.
@@ -268,41 +283,15 @@ class PluginConfig:
             return [str(k) for k in raw]
         return []
 
-    # --- resolved secret values (memory only!) --------------------------
-    def resolve_secret(self, var_name: str, *, required: bool = True) -> str:
-        """Resolve a secret value by env-var name.
-
-        Resolution order (v0.1.7):
-        1. Hermes internal API (agent.secret_scope.get_secret) — multiplex-aware,
-           fail-closed, respects profile isolation and external secret sources.
-        2. Fallback to env_snapshot (os.environ copy) — for non-multiplex modes
-           or older Hermes versions without secret_scope.
-        """
-        # 1. Hermes internal API (primary)
-        if _hermes_get_secret is not None:
-            try:
-                value = _hermes_get_secret(var_name)
-                if value is not None:
-                    return str(value).strip()
-            except Exception:
-                # UnscopedSecretError or other scope issues — fall through
-                pass
-
-        # 2. Fallback to env_snapshot
-        value = str(self.env_snapshot.get(var_name, "")).strip()
-        if not value and required:
-            raise errors.ConfigError(
-                f"Secret environment variable '{var_name}' is not set.",
-                suggestion=f"Add {var_name}=... to ~/.hermes/.env (chmod 600). "
-                           "The NAME is configured in config.yaml, the VALUE lives in .env.",
-            )
-        return value
-
+    # --- appdata dir -----------------------------------------------------
+    # v0.5.0 (BREAKING): resolve_secret() REMOVED entirely. Bootstrap secret
+    # values no longer come from the environment / Hermes secret_scope; they
+    # are loaded directly from secrets.yaml by secrets.load_secrets().
     def appdata_dir(self) -> Path:
-        override = str(self.env_snapshot.get(self.appdata_dir_env_name, "")).strip()
+        override = self._lookup_env(self.appdata_dir_env_name)
         if override:
             return Path(override).expanduser()
-        hermes_home = str(self.env_snapshot.get("HERMES_HOME", "")).strip()
+        hermes_home = self._lookup_env("HERMES_HOME")
         if hermes_home:
             return Path(hermes_home).expanduser() / "plugins" / "vaultwarden" / ".bw-data"
         return PLUGIN_DIR / ".bw-data"
@@ -315,10 +304,9 @@ class PluginConfig:
         if not self.client_id.startswith("user."):
             raise errors.ConfigError(
                 "client_id must be an API-key client id of the form 'user.<uuid>'.")
-        # v0.2.3: master_password_env keeps its sensible default
-        # ('VW_MASTER_PASSWORD') and the property fallback — no name check here.
-        # The master password VALUE is enforced at resolve_secret(required=True)
-        # time during unlock, which fails closed if it is missing.
+        # v0.5.0: the master password VALUE is enforced by
+        # secrets.load_secrets() at registration time (fail closed if the
+        # key is missing/empty in secrets.yaml) — nothing to check here.
         if self.placeholder_ttl_seconds <= 0:
             raise errors.ConfigError("placeholder_ttl_seconds must be > 0.")
         if self.max_placeholders <= 0:
@@ -326,7 +314,14 @@ class PluginConfig:
 
 
 def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> PluginConfig:
-    """Build a PluginConfig from a Hermes PluginContext (see module doc)."""
+    """Build a PluginConfig from a Hermes PluginContext (see module doc).
+
+    The ``env`` keyword argument is consulted ONLY for non-secret path
+    overrides (VW_APPDATA_DIR / BW_CLI_PATH / HERMES_HOME). v0.5.0 BREAKING:
+    secret VALUES are never read from any environment mapping — they live in
+    secrets.yaml, loaded by secrets.py. When ``env`` is omitted, os.environ
+    is used for the remaining path overrides.
+    """
     section = _extract_section(source)
     if not section:
         log.warning(
@@ -334,10 +329,6 @@ def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> 
             "PluginContext.get_config(). Add your configuration to "
             "plugins.entries.vaultwarden.settings in config.yaml. "
             "Plugin will use defaults (enabled=false) and will not load.")
-    # v0.4.8: when no explicit env mapping is given, keep a LIVE view of
-    # os.environ instead of a static copy — env values injected after config
-    # load time (e.g. gateway exports, unit tests using monkeypatch.setenv /
-    # patch.dict) must remain reachable through resolve_secret()'s fallback.
-    # An explicitly provided mapping (tests with env={...}) stays isolated.
-    snapshot = os.environ if env is None else dict(env)
-    return PluginConfig(section=section, env_snapshot=snapshot)
+    cfg = PluginConfig(section=section)
+    cfg._env = env  # non-secret path overrides only (see load_config doc)
+    return cfg

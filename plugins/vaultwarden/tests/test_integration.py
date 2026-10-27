@@ -26,13 +26,25 @@ def _dict_tools(raw):
     return {k: wrap(h) for k, h in raw.items()}
 
 
+def _write_secrets_yaml(home, client_secret="cs-secret", master_password="mp-secret"):
+    """v0.5.0 (BREAKING): bootstrap secrets come from a plugin-private
+    secrets.yaml (chmod 600), never from .env / OS environment."""
+    plugdir = home / "plugins" / "vaultwarden"
+    plugdir.mkdir(parents=True, exist_ok=True)
+    f = plugdir / "secrets.yaml"
+    f.write_text(f"client_secret: {client_secret}\nmaster_password: {master_password}\n")
+    f.chmod(0o600)
+    return f
+
+
 def _register_ok(monkeypatch, tmp_path, fake_bw, section_extra=None, env_extra=None):
-    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
-    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
+    # v0.5.0: no VW_* env vars any more — write secrets.yaml instead.
+    _write_secrets_yaml(tmp_path)
     # VWP-01 (v0.4.7 BREAKING): BW_CLI_PATH env override removed — the path
     # must be pinned via the bw_cli_path setting in config.yaml.
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")  # sandboxed backend -> INFO
     for k, v in (env_extra or {}).items():
         monkeypatch.setenv(k, v)
     section = {**BASE_SECTION, "bw_cli_path": fake_bw, **(section_extra or {})}
@@ -76,8 +88,7 @@ def test_graceful_degradation_missing_bw(monkeypatch, tmp_path):
     VWP-01 (v0.4.7 BREAKING): even with a valid 'bw' on PATH and BW_CLI_PATH
     set, the plugin must NOT discover it — config.yaml is the only source.
     """
-    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
-    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
+    _write_secrets_yaml(tmp_path)
     planted = tmp_path / "bw"
     planted.write_text("#!/bin/sh\necho ok\n")
     planted.chmod(0o755)
@@ -90,8 +101,7 @@ def test_graceful_degradation_missing_bw(monkeypatch, tmp_path):
 
 def test_register_fails_closed_invalid_bw_cli_path(monkeypatch, tmp_path):
     """Configured but invalid bw_cli_path -> register() returns False."""
-    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
-    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
+    _write_secrets_yaml(tmp_path)
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
@@ -119,7 +129,8 @@ def test_bw_cli_path_env_no_longer_overrides_config(monkeypatch):
     assert cfg2.bw_cli_path == ""
 
 
-def test_graceful_degradation_missing_env(monkeypatch, tmp_path, fake_bw):
+def test_graceful_degradation_missing_secrets_yaml(monkeypatch, tmp_path, fake_bw):
+    """v0.5.0: no secrets.yaml under HERMES_HOME -> register() returns False."""
     monkeypatch.delenv("VW_CLIENT_SECRET", raising=False)
     monkeypatch.delenv("VW_MASTER_PASSWORD", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -479,8 +490,7 @@ def test_register_raises_when_middleware_registration_fails(monkeypatch, tmp_pat
     def _boom(kind, fn):
         raise RuntimeError("Hermes API mismatch")
 
-    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
-    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
+    _write_secrets_yaml(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                            "bw_cli_path": fake_bw})
@@ -491,8 +501,7 @@ def test_register_raises_when_middleware_registration_fails(monkeypatch, tmp_pat
 
 def test_register_raises_when_middleware_registration_returns_false(monkeypatch, tmp_path, fake_bw):
     """A False return (instead of an exception) must also abort loading."""
-    monkeypatch.setenv("VW_CLIENT_SECRET", "cs-secret")
-    monkeypatch.setenv("VW_MASTER_PASSWORD", "mp-secret")
+    _write_secrets_yaml(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                            "bw_cli_path": fake_bw})
