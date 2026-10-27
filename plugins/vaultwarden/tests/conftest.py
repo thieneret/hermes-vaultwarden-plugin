@@ -318,32 +318,27 @@ def registry() -> PlaceholderRegistry:
 
 @pytest.fixture
 def no_config_fallback(monkeypatch):
-    """Disable the v0.2.3 direct-config.yaml fallback for tests that
-    expect pure get_config()/defaults behavior.
+    """Isolate tests from any on-disk config.yaml / hermes_cli state.
 
-    The production fallback in config.py::_extract_section() reads the real
-    config.yaml when ctx.get_config() returns empty. Unit tests run in
-    isolation (no real ~/.hermes/config.yaml, possibly no hermes_cli module),
-    so the fallback would leak environment-dependent values into tests that
-    assert on pure defaults. This fixture neutralizes BOTH fallback arms:
+    VWP-05 (v0.5.2): the production config fallback layers
+    (hermes_cli.config.read_user_config_raw and the direct
+    HERMES_HOME/config.yaml read) have been REMOVED — config.py now uses
+    ONLY the native PluginContext.get_config() API, so an empty-settings
+    context yields pure defaults without any patching of the extraction
+    logic itself.
 
-      1. hermes_cli.config.read_user_config_raw()  -> returns {}
-         (patched at the SOURCE module so both `import X` and
-          `from X import Y` import styles see the patched object)
-      2. direct HERMES_HOME/config.yaml file read  -> open() raises
-         FileNotFoundError; additionally HERMES_HOME / Path.home() are pointed
-         at an empty isolated dir because production checks
-         ``config_path.exists()`` BEFORE calling open().
-
-    On top of that, vaultwarden.config._extract_section is replaced with a
-    faithful copy of the production logic WITHOUT the two fallback arms
-    (get_config() extraction and object-style unwrapping behave identically),
-    so an empty settings context yields pure defaults exactly like it did
-    before the v0.2.3 fallback mechanism was introduced. Production code is
-    NOT modified — the patch lives entirely in the test layer and is undone
+    What remains here is defense-in-depth for the test environment:
+      1. hermes_cli.config.read_user_config_raw() -> returns {}
+         (in case a stale hermes_cli module is importable in the venv;
+          production never calls it since v0.5.2)
+      2. open()/Path.read_text()/read_bytes() guards for config.yaml paths
+      3. HERMES_HOME / Path.home() pointed at an empty isolated dir
+    so that any residual code path cannot leak environment-dependent values
+    into tests that assert on pure defaults. Production code is NOT
+    modified — the patch lives entirely in the test layer and is undone
     automatically by monkeypatch.
     """
-    # Arm 1: neutralize the hermes_cli raw-YAML reader (source-module patch).
+    # Arm 1: neutralize the (no-longer-used) hermes_cli raw-YAML reader.
     try:
         import hermes_cli.config as _hermes_cfg
         monkeypatch.setattr(
@@ -351,8 +346,7 @@ def no_config_fallback(monkeypatch):
     except ImportError:
         pass  # hermes_cli absent in the test env — arm 1 is already inert
 
-    # Arm 2: block the direct config.yaml file read so the code takes its
-    # FileNotFoundError branch instead of reading a real file.
+    # Arm 2: block any direct config.yaml file read (defense-in-depth).
     import builtins
     _real_open = builtins.open
 
@@ -363,11 +357,6 @@ def no_config_fallback(monkeypatch):
 
     monkeypatch.setattr(builtins, "open", _guarded_open)
 
-    # v0.5.0 note: config.py's FALLBACK 2 may parse config.yaml through
-    # secrets._load_yaml_mapping(), which calls ``Path.read_text()`` directly
-    # (stdlib-only path, used when PyYAML is absent — e.g. the CI venv has
-    # zero runtime deps).  That bypasses the builtins.open guard above, so
-    # block read_text/read_bytes for config.yaml too.
     _real_read_text = Path.read_text
     _real_read_bytes = Path.read_bytes
 
@@ -387,35 +376,6 @@ def no_config_fallback(monkeypatch):
     iso_home = Path(tempfile.mkdtemp(prefix="vw-no-config-fallback-"))
     monkeypatch.setenv("HERMES_HOME", str(iso_home))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: iso_home))
-
-    # Belt & braces: wrap vaultwarden.config._extract_section so that the
-    # empty-settings case (get_config() present but returning no values)
-    # yields pure defaults instead of falling through to the v0.2.3 arms —
-    # exactly the pre-v0.2.3 behaviour these tests were written against.
-    # Every other input is delegated UNCHANGED to the real production
-    # function, so no functional assertion is weakened.
-    from vaultwarden import config as _vw_config
-
-    _real_extract = _vw_config._extract_section
-
-    def _extract_section_no_fallback(source):
-        getter = getattr(source, "get_config", None)
-        if callable(getter):
-            result = {}
-            for key in _vw_config._DEFAULTS:
-                try:
-                    value = getter(key, None)
-                except Exception:
-                    continue
-                if value is not None:
-                    result[key] = value
-            if not result:
-                # Empty settings => pure defaults (fallbacks neutralized).
-                return {}
-        return _real_extract(source)
-
-    monkeypatch.setattr(_vw_config, "_extract_section",
-                        _extract_section_no_fallback)
 
     yield
 

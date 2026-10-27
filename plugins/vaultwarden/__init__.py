@@ -1,4 +1,4 @@
-"""Hermes Agent — Vaultwarden secrets management plugin (v0.5.0).
+"""Hermes Agent — Vaultwarden secrets management plugin (v0.5.2).
 
 Entry point: ``register(ctx)`` (see plan §4/§12).
 

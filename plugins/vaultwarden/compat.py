@@ -1,16 +1,20 @@
 """Centralized compatibility layer for Hermes API versions, bw CLI versions,
 and Python version differences (VWP-17).
 
-Every fallback that used to be scattered across __init__.py (register_tool /
-register_hook signatures), config.py (config-loading fallbacks, YAML import
-fallback), bw_cli.py (version parsing / minimum-version enforcement) and
-auth.py (exception code extraction) lives here so auditors can review all
-version-specific behaviour in a single module.
+All Hermes-API capability detection lives here so auditors can review
+version-specific behaviour in a single module:
+- register_tool / register_hook: explicit capability detection (VWP-06) —
+  inspect.signature() / hasattr(), NOT exception-based probing.
+- Config extraction: native PluginContext.get_config() ONLY (VWP-05) —
+  the former fallback layers (read_user_config_raw, direct YAML read) were
+  removed after diagnostic testing confirmed the native API works.
+- bw CLI version parsing / minimum-version enforcement.
+- Exception code extraction.
 """
 from __future__ import annotations
 
+import inspect
 import logging
-from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("hermes.plugins.vaultwarden.compat")
@@ -20,120 +24,68 @@ log = logging.getLogger("hermes.plugins.vaultwarden.compat")
 
 def register_tool_compat(ctx: Any, *, name: str, toolset: str, schema: dict,
                          handler: Any, check_fn: Any = None) -> None:
-    """Register a tool with Hermes, handling both old and new register_tool signatures.
+    """Register a tool with Hermes using capability detection (VWP-06).
 
-    Tries the new signature with check_fn first; falls back to the old signature
-    without check_fn on TypeError.
+    Inspects the register_tool signature to determine whether check_fn is
+    supported. Fails closed if the API is unavailable.
     """
-    try:
-        ctx.register_tool(name=name, toolset=toolset, schema=schema,
-                          handler=handler, check_fn=check_fn)
-    except TypeError:
-        # older/newer register_tool signature without check_fn
-        ctx.register_tool(name=name, toolset=toolset, schema=schema, handler=handler)
+    register_fn = getattr(ctx, "register_tool", None)
+    if not callable(register_fn):
+        raise RuntimeError(
+            "Hermes PluginContext.register_tool is not available. "
+            "Check Hermes plugin API compatibility.")
+    sig = inspect.signature(register_fn)
+    if "check_fn" in sig.parameters:
+        register_fn(name=name, toolset=toolset, schema=schema,
+                    handler=handler, check_fn=check_fn)
+    else:
+        register_fn(name=name, toolset=toolset, schema=schema,
+                    handler=handler)
 
 
 def register_hook_if_available(ctx: Any, hook_name: str, hook_fn: Any) -> bool:
-    """Register a hook if the context supports it.
-
-    Returns True if registered, False if the context lacks register_hook.
-    """
+    """Register a hook if supported (VWP-06). Returns True if registered."""
+    if not hasattr(ctx, "register_hook"):
+        log.warning("Context lacks register_hook; %s not installed.", hook_name)
+        return False
     try:
         ctx.register_hook(hook_name, hook_fn)
         return True
-    except AttributeError:
-        log.warning("Context lacks register_hook; %s not installed.", hook_name)
+    except Exception as exc:
+        log.error("register_hook(%r) failed: %s", hook_name, exc)
         return False
 
 # ── Config loading compatibility ─────────────────────────────────────
 
 
 def extract_plugin_section(source: Any, *, plugin_id: str = "vaultwarden") -> dict:
-    """Extract plugin config section with multi-layer fallback.
+    """Extract plugin config section using ONLY the native Hermes API.
 
-    Tries:
-    1. PluginContext.get_config() (Hermes-native)
-    2. read_user_config_raw() (Hermes raw YAML reader)
-    3. Direct YAML file read from HERMES_HOME/config.yaml
-
-    Returns empty dict if all fail. NOTE: layer 1 is handled by
-    config.py::_extract_section itself (it needs the plugin's _DEFAULTS key
-    list); this function provides the FALLBACK layers only and returns an
-    empty dict to signal "no fallback data found".
+    VWP-05: fallbacks removed. Diagnostic testing confirmed the native
+    PluginContext.get_config() API resolves config values correctly, so the
+    former FALLBACK layers (hermes_cli.config.read_user_config_raw and the
+    direct HERMES_HOME/config.yaml read) are gone. Returns the section dict,
+    or empty dict if the native API yields no values. The caller decides
+    fail-closed.
     """
     if source is None:
         return {}
-
-    # Layer 1: Hermes-native PluginContext.get_config()
     getter = getattr(source, "get_config", None)
-    if callable(getter):
-        # This is handled by config.py's _extract_section; compat.py provides
-        # the fallback layers only. Return empty to signal "try next layer".
-        pass
-
-    # Layer 2: read_user_config_raw()
-    try:
-        from hermes_cli.config import read_user_config_raw
-        data = read_user_config_raw()
-        if data:
-            entry = data.get("plugins", {}).get("entries", {}).get(plugin_id, {})
-            section = entry.get("settings") or entry.get("config") or {}
-            if section:
-                log.warning(
-                    "Fallback 1: read %d keys from plugins.entries.%s.settings "
-                    "via read_user_config_raw().", len(section), plugin_id)
-                return section
-            log.warning("Fallback 1: read_user_config_raw() loaded but "
-                        "plugins.entries.%s is empty. "
-                        "plugins keys: %s", plugin_id,
-                        list(data.get("plugins", {}).keys()))
-        else:
-            log.warning("Fallback 1: read_user_config_raw() returned empty dict.")
-    except Exception as exc:
-        log.warning("Fallback 1 failed: %s: %s", type(exc).__name__, exc)
-
-    # Layer 3: Direct YAML file read
-    try:
-        import os
-        hermes_home = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
-        config_path = Path(hermes_home) / "config.yaml"
-        log.warning("Fallback 2: trying direct read from %s (exists=%s)",
-                    config_path, config_path.exists())
-        if config_path.exists():
-            data = safe_load_yaml(config_path)
-            if data:
-                entry = data.get("plugins", {}).get("entries", {}).get(plugin_id, {})
-                section = entry.get("settings") or entry.get("config") or {}
-                if section:
-                    log.warning("Fallback 2: read %d keys directly from %s.",
-                                len(section), config_path)
-                    return section
-                log.warning("Fallback 2: file loaded but %s entry empty. "
-                            "Top keys: %s", plugin_id, list(data.keys())[:15])
-    except Exception as exc:
-        log.warning("Fallback 2 failed: %s: %s", type(exc).__name__, exc)
-
-    return {}
-
-
-def safe_load_yaml(path: Path) -> dict | None:
-    """Load YAML file with fallback to stdlib parser if PyYAML is unavailable.
-
-    The project has ZERO runtime dependencies, so PyYAML may be absent (e.g. CI venvs).
-    Falls back to secrets._load_yaml_mapping() when the optional import fails.
-    """
-    try:
-        import yaml
-    except ImportError:
-        yaml = None
-
-    if yaml is not None:
-        with open(path, encoding="utf-8-sig") as f:
-            return yaml.safe_load(f) or {}
-    else:
-        # Fallback to stdlib parser in secrets.py
-        from .secrets import _load_yaml_mapping
-        return _load_yaml_mapping(path)
+    if not callable(getter):
+        log.warning("source.get_config is not callable; returning empty dict.")
+        return {}
+    # Late import avoids a circular dependency (config.py imports compat).
+    from .config import _DEFAULTS
+    result: dict[str, Any] = {}
+    for key in _DEFAULTS:
+        try:
+            value = getter(key, None)
+        except Exception as exc:
+            log.warning("get_config(%r) raised %s; skipping.", key, exc)
+            continue
+        if value is not None:
+            result[key] = value
+    return result
 
 # ── bw CLI compatibility ─────────────────────────────────────────────
 

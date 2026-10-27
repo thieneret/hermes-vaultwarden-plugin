@@ -11,10 +11,11 @@ Layers:
 
 ``load_config`` accepts a Hermes ``PluginContext`` exposing
 ``get_config(key, default)`` — the ONLY supported configuration path
-(since v0.2.0; current version v0.2.3). Object-style contexts with
-``.config`` / ``.plugin_config`` attributes are also accepted and
-unwrapped until a ``get_config()`` API is found. There is NO fallback
-to reading config.yaml directly.
+(since v0.2.0; VWP-05 in v0.5.2 removed the former config fallback layers
+after diagnostic testing confirmed the native API resolves config values
+correctly). Object-style contexts with ``.config`` / ``.plugin_config``
+attributes are also accepted and unwrapped until a ``get_config()`` API is
+found. There is NO fallback to reading config.yaml directly.
 """
 from __future__ import annotations
 
@@ -77,27 +78,23 @@ def _as_int(value: Any, default: int) -> int:
 
 
 def _extract_section(source: Any) -> dict:
-    """Extract plugin config — tries Hermes API first, falls back to direct YAML read."""
+    """Extract plugin config — native Hermes API only (VWP-05)."""
     if source is None:
         return {}
 
-    # Hermes-native PluginContext.get_config() — plugin-relative keys
+    # Hermes-native PluginContext.get_config() — plugin-relative keys.
+    # VWP-05: the former config fallback layers (hermes_cli raw-YAML reader,
+    # direct YAML file read) are REMOVED; the native API resolves config
+    # correctly.
     getter = getattr(source, "get_config", None)
     if callable(getter):
-        result: dict[str, Any] = {}
-        for key in _DEFAULTS:
-            try:
-                value = getter(key, None)
-            except Exception:
-                continue
-            if value is not None:
-                result[key] = value
-        if result:
-            return result
-
-    # FALLBACK 1 & 2: handled by compat.extract_plugin_section() (VWP-17)
-    section = compat.extract_plugin_section(source, plugin_id="vaultwarden")
-    if section:
+        section = compat.extract_plugin_section(source, plugin_id="vaultwarden")
+        if not section:
+            log.warning(
+                "Vaultwarden plugin config is EMPTY: no settings found via "
+                "PluginContext.get_config(). Add your configuration to "
+                "plugins.entries.vaultwarden.settings in config.yaml. "
+                "Plugin will use defaults (enabled=false) and will not load.")
         return section
 
     # Object-style contexts (.config / .plugin_config)
@@ -274,13 +271,9 @@ def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> 
     secrets.yaml, loaded by secrets.py. When ``env`` is omitted, os.environ
     is used for the remaining path overrides.
     """
+    # NOTE: _extract_section() logs the "config is EMPTY" warning itself
+    # (VWP-05: native API only, no fallback layers).
     section = _extract_section(source)
-    if not section:
-        log.warning(
-            "Vaultwarden plugin config is EMPTY: no settings found via "
-            "PluginContext.get_config(). Add your configuration to "
-            "plugins.entries.vaultwarden.settings in config.yaml. "
-            "Plugin will use defaults (enabled=false) and will not load.")
     cfg = PluginConfig(section=section)
     cfg._env = env  # non-secret path overrides only (see load_config doc)
     return cfg

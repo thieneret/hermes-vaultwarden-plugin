@@ -1,9 +1,10 @@
 """Unit tests for the centralized compatibility layer (VWP-17, compat.py).
 
 Covers every function in vaultwarden.compat:
-  - Hermes API fallbacks: register_tool_compat / register_hook_if_available
-  - Config-loading fallbacks: extract_plugin_section (layers 1-3)
-  - YAML import fallback: safe_load_yaml (PyYAML + stdlib parser)
+  - Hermes API capability detection: register_tool_compat (inspect.signature)
+    / register_hook_if_available (hasattr) — VWP-06
+  - Config extraction: extract_plugin_section — native get_config() ONLY
+    (VWP-05: fallback layers removed)
   - bw CLI compatibility: parse_bw_version / require_min_bw_version
   - Exception code extraction: get_error_code
 Plus regression guards proving __init__.py / config.py / bw_cli.py / auth.py
@@ -12,7 +13,6 @@ now delegate to these functions instead of carrying inline fallback code.
 from __future__ import annotations
 
 import logging
-import sys
 
 import pytest
 
@@ -32,8 +32,8 @@ class _CtxWithCheckFn:
 
 
 class _CtxWithoutCheckFn:
-    """Old-style context: register_tool has NO check_fn parameter — passing
-    it raises TypeError, exactly like the real old Hermes API."""
+    """Old-style context: register_tool has NO check_fn parameter —
+    inspect.signature() must detect this and omit the kwarg entirely."""
 
     def __init__(self):
         self.calls: list[dict] = []
@@ -62,10 +62,10 @@ def _handler(args, **kw):  # pragma: no cover - never invoked
     return "ok"
 
 
-# ── register_tool_compat ─────────────────────────────────────────────
+# ── register_tool_compat (VWP-06: inspect.signature capability detection) ──
 
 def test_register_tool_compat_with_check_fn():
-    """New signature is TRIED FIRST: check_fn reaches the context."""
+    """inspect.signature() sees check_fn -> the kwarg IS passed."""
     ctx = _CtxWithCheckFn()
     check = lambda: True  # noqa: E731
     compat.register_tool_compat(ctx, name="vaultwarden_demo",
@@ -79,7 +79,8 @@ def test_register_tool_compat_with_check_fn():
 
 
 def test_register_tool_compat_without_check_fn():
-    """Old signature (no check_fn kwarg) -> TypeError -> graceful retry."""
+    """inspect.signature() sees NO check_fn param -> kwarg omitted entirely
+    (the old-signature call never receives it)."""
     ctx = _CtxWithoutCheckFn()
     compat.register_tool_compat(ctx, name="vaultwarden_demo",
                                 toolset="vaultwarden", schema=_SCHEMA,
@@ -88,7 +89,23 @@ def test_register_tool_compat_without_check_fn():
     assert "check_fn" not in ctx.calls[0]
 
 
-# ── register_hook_if_available ───────────────────────────────────────
+def test_register_tool_compat_missing_api_fails_closed():
+    """VWP-06 fail-closed: no callable register_tool -> RuntimeError."""
+    class NoRegisterTool:
+        pass
+
+    with pytest.raises(RuntimeError, match="register_tool"):
+        compat.register_tool_compat(NoRegisterTool(), name="x",
+                                    toolset="vaultwarden", schema=_SCHEMA,
+                                    handler=_handler)
+
+    with pytest.raises(RuntimeError, match="register_tool"):
+        compat.register_tool_compat(object(), name="x",
+                                    toolset="vaultwarden", schema=_SCHEMA,
+                                    handler=_handler)
+
+
+# ── register_hook_if_available (VWP-06: hasattr capability detection) ──
 
 def test_register_hook_if_available_success():
     ctx = _CtxWithHooks()
@@ -107,93 +124,100 @@ def test_register_hook_if_available_missing(caplog):
     assert any("register_hook" in r.getMessage() for r in caplog.records)
 
 
-# ── extract_plugin_section ───────────────────────────────────────────
+def test_register_hook_if_available_failure_reported(caplog):
+    """VWP-06 explicit failure reporting: register_hook raising -> error log,
+    False returned, no exception propagates."""
+    class ExplodingCtx:
+        def register_hook(self, kind, fn):
+            raise RuntimeError("hook registry broken")
+
+    with caplog.at_level(logging.ERROR,
+                         logger="hermes.plugins.vaultwarden.compat"):
+        assert compat.register_hook_if_available(
+            ExplodingCtx(), "post_tool_call", lambda *a: None) is False
+    assert any("register_hook" in r.getMessage() for r in caplog.records)
+
+
+# ── extract_plugin_section (VWP-05: native API only, fallbacks removed) ──
+
+class _RecordingGetConfigCtx:
+    """get_config() records every key it is asked for and returns values
+    from a fixed settings dict."""
+
+    def __init__(self, settings=None):
+        self._settings = dict(settings or {})
+        self.requested: list[str] = []
+
+    def get_config(self, key, default=None):
+        self.requested.append(key)
+        return self._settings.get(key, default)
+
 
 class _EmptyGetConfigCtx:
-    """get_config() exists but yields nothing (layer 1 handled by config.py)."""
+    """get_config() exists but yields nothing."""
 
     def get_config(self, key, default=None):
         return default
 
 
-def test_extract_plugin_section_layer1(monkeypatch):
-    """A PluginContext exposing get_config(): compat itself contributes no
-    data (config.py owns that path) and both fallback layers are inert ->
-    empty dict signals 'try next layer'."""
-    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
-    monkeypatch.delitem(sys.modules, "hermes_cli.config", raising=False)
-    monkeypatch.setenv("HERMES_HOME", "/nonexistent-hermes-home-vwp17")
-    result = compat.extract_plugin_section(_EmptyGetConfigCtx())
-    assert result == {}
-    # None source short-circuits before any layer runs.
+def test_extract_plugin_section_native_only():
+    """The function calls ctx.get_config() for EVERY default key and
+    assembles only the non-None values into the result dict."""
+    from vaultwarden.config import _DEFAULTS
+
+    ctx = _RecordingGetConfigCtx({
+        "enabled": True,
+        "server_url": "https://native-only",
+        "bw_cli_path": "/usr/local/bin/bw",
+    })
+    result = compat.extract_plugin_section(ctx)
+    assert set(ctx.requested) == set(_DEFAULTS)
+    assert result == {
+        "enabled": True,
+        "server_url": "https://native-only",
+        "bw_cli_path": "/usr/local/bin/bw",
+    }
+
+
+def test_extract_plugin_section_empty_and_none_sources():
+    """Empty native results and None sources yield {} — the caller decides
+    fail-closed. No fallback file/env reads happen any more (VWP-05)."""
+    assert compat.extract_plugin_section(_EmptyGetConfigCtx()) == {}
     assert compat.extract_plugin_section(None) == {}
 
 
-def test_extract_plugin_section_layer2(monkeypatch):
-    """read_user_config_raw() fallback returns the plugin settings section."""
-    import types
-
-    mod = types.ModuleType("hermes_cli.config")
-    mod.read_user_config_raw = lambda: {
-        "plugins": {"entries": {"vaultwarden": {
-            "settings": {"server_url": "https://from-layer2"}}}}}
-    pkg = types.ModuleType("hermes_cli")
-    pkg.config = mod
-    monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
-    monkeypatch.setitem(sys.modules, "hermes_cli.config", mod)
-    try:
-        section = compat.extract_plugin_section(_EmptyGetConfigCtx(),
-                                                plugin_id="vaultwarden")
-        assert section == {"server_url": "https://from-layer2"}
-    finally:
-        monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
-        monkeypatch.delitem(sys.modules, "hermes_cli.config", raising=False)
+def test_extract_plugin_section_no_get_config(monkeypatch, caplog):
+    """Source without a callable get_config: warning + empty dict. If any
+    fallback remained, hermes_cli / HERMES_HOME would be consulted — they
+    are not (VWP-05)."""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    with caplog.at_level(logging.WARNING,
+                         logger="hermes.plugins.vaultwarden.compat"):
+        assert compat.extract_plugin_section(object()) == {}
+    assert any("get_config" in r.getMessage() for r in caplog.records)
 
 
-def test_extract_plugin_section_layer3(monkeypatch, tmp_path):
-    """Direct HERMES_HOME/config.yaml read fallback."""
-    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
-    monkeypatch.delitem(sys.modules, "hermes_cli.config", raising=False)
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text(
-        "plugins:\n  entries:\n    vaultwarden:\n      settings:\n"
-        "        server_url: https://from-layer3\n"
-        "        client_id: user.aaaa\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    section = compat.extract_plugin_section(_EmptyGetConfigCtx())
-    assert section.get("server_url") == "https://from-layer3"
-    assert section.get("client_id") == "user.aaaa"
+def test_extract_plugin_section_get_config_raises_is_tolerated():
+    """A raising get_config(key) is skipped per-key; other keys still work."""
+    class PartiallyBrokenCtx:
+        def get_config(self, key, default=None):
+            if key == "server_url":
+                raise RuntimeError("no manifest")
+            return {"client_id": "user.aaaa"}.get(key, default)
+
+    result = compat.extract_plugin_section(PartiallyBrokenCtx())
+    assert result == {"client_id": "user.aaaa"}
 
 
-# ── safe_load_yaml ───────────────────────────────────────────────────
+def test_compat_has_no_fallback_symbols():
+    """VWP-05 regression guard: safe_load_yaml and the read_user_config_raw
+    fallback are gone from compat.py."""
+    assert not hasattr(compat, "safe_load_yaml")
+    import inspect as _inspect
 
-_YAML_TEXT = ("plugins:\n  entries:\n    vaultwarden:\n      settings:\n"
-              "        enabled: true\n")
-
-
-def test_safe_load_yaml_with_pyyaml(tmp_path):
-    """PyYAML present -> yaml.safe_load path."""
-    pytest.importorskip("yaml")
-    f = tmp_path / "config.yaml"
-    f.write_text(_YAML_TEXT, encoding="utf-8")
-    data = compat.safe_load_yaml(f)
-    assert isinstance(data, dict)
-    entry = data["plugins"]["entries"]["vaultwarden"]
-    assert entry["settings"]["enabled"] is True
-
-
-def test_safe_load_yaml_without_pyyaml(monkeypatch, tmp_path):
-    """PyYAML absent -> stdlib parser fallback via secrets._load_yaml_mapping."""
-    # sys.modules["yaml"] = None makes ``import yaml`` raise ImportError even
-    # when PyYAML IS installed in the interpreter running the tests.
-    monkeypatch.setitem(sys.modules, "yaml", None)
-    f = tmp_path / "config.yaml"
-    f.write_text(_YAML_TEXT, encoding="utf-8")
-    data = compat.safe_load_yaml(f)
-    assert isinstance(data, dict)
-    entry = data["plugins"]["entries"]["vaultwarden"]
-    # stdlib parser yields string scalars ("true", not True)
-    assert entry["settings"]["enabled"] == "true"
+    src = _inspect.getsource(compat)
+    assert "read_user_config_raw()" not in src
+    assert "from hermes_cli.config import" not in src
 
 
 # ── parse_bw_version / require_min_bw_version ────────────────────────
@@ -278,7 +302,8 @@ def test_register_tool_compat_used_by_register(fake_bw, appdata,
                                                hermes_home_with_secrets,
                                                monkeypatch):
     """End-to-end: register() through compat still lands check_fn on the
-    RecordingCtx (new-signature path) — behaviour unchanged by VWP-17."""
+    RecordingCtx (signature-introspection path) — behaviour unchanged by
+    VWP-05/VWP-06."""
     from vaultwarden.tests.conftest import RecordingCtx
 
     monkeypatch.setenv("BW_TEST_VERSION", "2026.9.1")
@@ -295,33 +320,26 @@ def test_register_tool_compat_used_by_register(fake_bw, appdata,
     assert [h[0] for h in ctx.hooks] == ["post_tool_call", "on_session_end"]
 
 
-def _force_no_yaml(monkeypatch):
-    """Make ``import yaml`` fail inside compat.py regardless of environment."""
-    monkeypatch.setitem(sys.modules, "yaml", None)
-
-
-def test_config_fallback_still_works_through_compat(monkeypatch, tmp_path):
-    """Regression: config.py's FALLBACK 2 now flows through
-    compat.extract_plugin_section + compat.safe_load_yaml — verify the
-    direct-YAML arm end to end WITHOUT PyYAML (stdlib parser path)."""
-    _force_no_yaml(monkeypatch)
-    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
-    monkeypatch.delitem(sys.modules, "hermes_cli.config", raising=False)
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text(
-        "plugins:\n  entries:\n    vaultwarden:\n      settings:\n"
-        "        server_url: https://via-compat-fallback\n", encoding="utf-8")
+def test_config_native_only_through_compat(monkeypatch, tmp_path):
+    """VWP-05 regression: a context whose get_config() raises now yields
+    PURE DEFAULTS — the former direct-YAML FALLBACK is gone, so the
+    config.yaml file next door is NEVER read."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "plugins:\n  entries:\n    vaultwarden:\n      settings:\n"
+        "        server_url: https://should-not-load\n", encoding="utf-8")
 
     class _BrokenCtx:
-        """get_config present but raises -> layer 1 empty -> fallback layers."""
+        """get_config present but raises for every key -> empty section."""
 
         def get_config(self, key, default=None):
             raise RuntimeError("no manifest")
 
     from vaultwarden.config import load_config
     cfg_obj = load_config(_BrokenCtx(), env={})
-    assert cfg_obj.server_url == "https://via-compat-fallback"
+    assert cfg_obj.server_url == ""       # default, NOT the YAML value
+    assert cfg_obj.enabled is False
 
 
 def test_plugin_error_class_exists():
