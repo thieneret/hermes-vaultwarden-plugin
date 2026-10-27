@@ -75,7 +75,7 @@ def test_unsupported_object_raises_config_error():
         load_config(NoConfigApi(), env={})
 
 
-def test_resolve_secret_removed_in_v050(monkeypatch, no_config_fallback):
+def test_resolve_secret_removed_in_breaking_release(monkeypatch, no_config_fallback):
     """v0.5.0 BREAKING: the .env/secret_scope resolution channel is gone."""
     from vaultwarden import config as vw_config
     cfg = load_config(FakePluginContext({}))

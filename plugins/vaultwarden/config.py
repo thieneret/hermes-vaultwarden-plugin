@@ -153,8 +153,19 @@ def _extract_section(source: Any) -> dict:
 class PluginConfig:
     section: dict = field(default_factory=dict)
     # v0.5.0 (BREAKING): env_snapshot removed — the plugin no longer reads
-    # secret VALUES from the environment. appdata_dir() consults os.environ
-    # directly for its optional override.
+    # secret VALUES from the environment. The optional ``env`` mapping passed
+    # to load_config() is consulted ONLY for non-secret path overrides
+    # (VW_APPDATA_DIR / HERMES_HOME); when absent, os.environ is used.
+    # NOTE: the field name is underscored so PluginConfig(section=...) keeps
+    # working unchanged; load_config() assigns it after construction.
+    _env: Mapping[str, str] | None = field(default=None, repr=False,
+                                           compare=False)
+
+    def _lookup_env(self, key: str) -> str:
+        """Non-secret env lookup: explicit mapping first, then os.environ."""
+        if self._env is not None:
+            return str(self._env.get(key, "") or "").strip()
+        return str(os.environ.get(key, "") or "").strip()
 
     def _raw(self, key: str) -> Any:
         return self.section.get(key, _DEFAULTS[key])
@@ -267,10 +278,10 @@ class PluginConfig:
     # values no longer come from the environment / Hermes secret_scope; they
     # are loaded directly from secrets.yaml by secrets.load_secrets().
     def appdata_dir(self) -> Path:
-        override = str(os.environ.get(self.appdata_dir_env_name, "")).strip()
+        override = self._lookup_env(self.appdata_dir_env_name)
         if override:
             return Path(override).expanduser()
-        hermes_home = str(os.environ.get("HERMES_HOME", "")).strip()
+        hermes_home = self._lookup_env("HERMES_HOME")
         if hermes_home:
             return Path(hermes_home).expanduser() / "plugins" / "vaultwarden" / ".bw-data"
         return PLUGIN_DIR / ".bw-data"
@@ -295,12 +306,12 @@ class PluginConfig:
 def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> PluginConfig:
     """Build a PluginConfig from a Hermes PluginContext (see module doc).
 
-    The ``env`` keyword argument is accepted for backward compatibility with
-    existing callers/tests but is IGNORED since v0.5.0: the plugin no longer
-    reads secret values from any environment mapping (they live in
-    secrets.yaml, loaded by secrets.py).
+    The ``env`` keyword argument is consulted ONLY for non-secret path
+    overrides (VW_APPDATA_DIR / BW_CLI_PATH / HERMES_HOME). v0.5.0 BREAKING:
+    secret VALUES are never read from any environment mapping — they live in
+    secrets.yaml, loaded by secrets.py. When ``env`` is omitted, os.environ
+    is used for the remaining path overrides.
     """
-    _ = env  # intentionally unused (v0.5.0 BREAKING: env-based secrets gone)
     section = _extract_section(source)
     if not section:
         log.warning(
@@ -308,4 +319,6 @@ def load_config(source: Any = None, *, env: Mapping[str, str] | None = None) -> 
             "PluginContext.get_config(). Add your configuration to "
             "plugins.entries.vaultwarden.settings in config.yaml. "
             "Plugin will use defaults (enabled=false) and will not load.")
-    return PluginConfig(section=section)
+    cfg = PluginConfig(section=section)
+    cfg._env = env  # non-secret path overrides only (see load_config doc)
+    return cfg
