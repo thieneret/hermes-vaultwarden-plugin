@@ -101,15 +101,30 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
         if not key or key.startswith(("-", "*")):
             continue
         value = value.strip()
-        if value.startswith(("'", '"')) and len(value) >= 2 \
-                and value[-1] == value[0]:
-            value = value[1:-1]
+        # Unquote scalar values (single- or double-quoted).  The open quote,
+        # the closing quote at end-of-line, and any trailing " # comment" are
+        # all handled — an empty quoted string correctly yields "".
+        if len(value) >= 2 and value[0] in ("'", '"'):
+            quote = value[0]
+            end = value.find(quote, 1)
+            if end != -1:
+                rest = value[end + 1:].strip()
+                if rest == "" or rest.startswith("#"):
+                    value = value[1:end]
+                else:
+                    hash_pos = value.find(" #")
+                    if hash_pos != -1:
+                        value = value[:hash_pos].rstrip()
+            else:
+                hash_pos = value.find(" #")
+                if hash_pos != -1:
+                    value = value[:hash_pos].rstrip()
         else:
             hash_pos = value.find(" #")
             if hash_pos != -1:
                 value = value[:hash_pos].rstrip()
         indented = raw_line[:1] in (" ", "\t")
-        if not indented and not value:
+        if not indented and value == "":
             # parent mapping key with no inline value -> start a nested dict
             current_parent = key
             data.setdefault(key, {})
