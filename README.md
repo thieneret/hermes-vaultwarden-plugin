@@ -349,8 +349,8 @@ vaultwarden_store(name="x", username="u", password_env="GH_TOKEN")
 plugins/vaultwarden/
 ├── __init__.py      # Plugin registration (register(ctx))
 ├── plugin.yaml      # Plugin manifest (name, version, tools)
-├── compat.py        # Centralized compatibility layer (VWP-17): Hermes API fallbacks, config-loading fallbacks, YAML import fallback, bw version parsing, error-code extraction
-├── config.py        # Settings load, config fallback (no env secret resolution since v0.5.0)
+├── compat.py        # Centralized compatibility layer (VWP-17): Hermes API capability detection (VWP-06), native-only config extraction (VWP-05), bw version parsing, error-code extraction
+├── config.py        # Settings load via native Hermes API (VWP-05; no env secret resolution since v0.5.0)
 ├── auth.py          # AuthManager: state machine, session, recovery
 ├── bw_cli.py        # BwCli: subprocess wrapper, base64 encoding, attachments
 ├── tools.py         # 12 tool handlers
@@ -374,12 +374,13 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **395 tests** (functional files only — test filenames and
+Current suite: **397 tests** (functional files only — test filenames and
 markers must never embed a plugin version; enforced by
 `test_no_version_coupling.py`). Includes positive-control suites for
 concurrency (VWP-18), subprocess env isolation (VWP-19), crash recovery
-(VWP-20), bootstrap-secret loading from `secrets.yaml` (v0.5.0), and the
-centralized compatibility layer (VWP-17, v0.5.1).
+(VWP-20), bootstrap-secret loading from `secrets.yaml` (v0.5.0), the
+centralized compatibility layer (VWP-17, v0.5.1), and native-API config
+extraction + capability detection (VWP-05/VWP-06, v0.5.2).
 
 Audit remediation status (handoff): **17/20 findings complete** — VWP-01
 remains OPEN for binary hash/authenticity verification (path pinning landed

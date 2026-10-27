@@ -5,6 +5,27 @@ Author: **thieneret**
 
 ---
 
+## [0.5.2] - 2026-10-27
+
+### Refactor
+- **VWP-05**: Remove config fallback layers (read_user_config_raw, direct
+  YAML read). Diagnostic testing confirmed the native Hermes
+  PluginContext.get_config() API resolves config values correctly; the
+  fallbacks were unnecessary and are removed.
+- **VWP-06**: Replace exception-based API detection with explicit capability
+  detection:
+  * register_tool: use inspect.signature() to detect the check_fn parameter
+  * register_hook: use hasattr() for capability detection
+  * Fail closed (RuntimeError) if the required API is unavailable
+- Diagnostic testing confirmed ctx.api_version does not exist, so
+  signature/hasattr introspection is the correct capability-detection
+  approach (version-based detection is impossible).
+
+NOT a breaking change: VWP-01 path pinning, VWP-11 version check, error
+taxonomy codes, the 12-tool registration, and all security mechanisms
+(RedactingFilter, askpass delivery, temp-file cleanup, 0600/0700 permissions,
+env isolation) are unchanged. Tool schemas and handler behavior are unchanged.
+
 ## [0.5.1] - 2026-10-27
 
 ### Refactor
