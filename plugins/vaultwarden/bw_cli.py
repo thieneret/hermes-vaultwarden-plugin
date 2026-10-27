@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
-from . import errors
+from . import compat, errors
 from .security import audit_subprocess_env, get_logger
 
 log = get_logger("bw_cli")
@@ -30,7 +30,9 @@ log = get_logger("bw_cli")
 # The plugin was developed and tested against bw 2026.9.1. Versions below
 # this are unsupported: the marker-based error classification cannot be
 # guaranteed to work against an unknown bw build. There is no override.
-_MIN_BW_VERSION = (2026, 9, 1)
+# VWP-17: the constant now lives in compat.MIN_BW_VERSION; this module
+# re-exports it as _MIN_BW_VERSION so existing imports keep working.
+_MIN_BW_VERSION = compat.MIN_BW_VERSION
 
 # ── VWP-09: Error markers by source category ──────────────────────
 # Priority order in _classify_error(): Cat-2 → rate_limit → Cat-1 → Cat-3
@@ -231,15 +233,12 @@ class BwCli:
             )
 
         version_str = (proc.stdout or "").strip()
-        min_str = ".".join(str(x) for x in _MIN_BW_VERSION)
+        min_str = ".".join(str(x) for x in compat.MIN_BW_VERSION)
 
-        # Parse calendar versioning: YYYY.M.P (manual, no packaging dep)
+        # VWP-17: parsing + minimum enforcement centralized in compat.py
         try:
-            parts = version_str.split(".")
-            if len(parts) < 2:
-                raise ValueError(f"too few components: {version_str!r}")
-            nums = tuple(int(p) for p in parts[:3])
-        except (ValueError, AttributeError) as exc:
+            nums = compat.parse_bw_version(version_str)
+        except ValueError as exc:
             log.error(
                 "bw version %r cannot be parsed; plugin requires >= %s. "
                 "Upgrade the Bitwarden CLI.", version_str, min_str,
@@ -248,16 +247,14 @@ class BwCli:
                 f"Cannot parse bw version: {version_str!r}"
             ) from exc
 
-        if nums < _MIN_BW_VERSION:
+        if nums < compat.MIN_BW_VERSION:
             log.error(
                 "bw version %s is below the minimum supported version %s. "
                 "Upgrade the Bitwarden CLI. Plugin will not start.",
                 version_str, min_str,
             )
-            raise errors.UnsupportedBwVersionError(
-                f"bw version {version_str} is below the minimum supported "
-                f"version {min_str}. Upgrade the Bitwarden CLI."
-            )
+
+        compat.require_min_bw_version(version_str)
 
         log.info("bw CLI version %s validated (minimum: %s)", version_str, min_str)
         return version_str

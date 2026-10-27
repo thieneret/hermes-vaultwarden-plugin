@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from . import compat
 from . import secrets as _secrets
 from .auth import AuthManager, ensure_appdata_dir
 from .bw_cli import BwCli, find_bw_binary
@@ -152,7 +153,7 @@ def register(ctx: Any) -> bool:
         # login and unlock all happen inside ensure_authenticated(), which
         # is triggered lazily by is_available()/check_fn on first tool use.
     except Exception as exc:
-        code = getattr(exc, "code", type(exc).__name__)
+        code = compat.get_error_code(exc)
         log.warning("Vaultwarden plugin load FAILED: init error (%s): %s",
                     code, exc)
         return False
@@ -163,20 +164,11 @@ def register(ctx: Any) -> bool:
     # 8. register tools on the 'vaultwarden' toolset
     registered = 0
     for schema, handler in get_tools(auth, config, registry):
-        try:
-            ctx.register_tool(
-                name=schema["name"],
-                toolset="vaultwarden",
-                schema=schema,
-                handler=handler,
-                check_fn=_make_check_fn(auth),  # BUG-9: proper closure
-            )
-            registered += 1
-        except TypeError:
-            # older/newer register_tool signature without check_fn
-            ctx.register_tool(name=schema["name"], toolset="vaultwarden",
-                              schema=schema, handler=handler)
-            registered += 1
+        # VWP-17: signature compatibility handled centrally in compat.py
+        compat.register_tool_compat(
+            ctx, name=schema["name"], toolset="vaultwarden", schema=schema,
+            handler=handler, check_fn=_make_check_fn(auth))
+        registered += 1
     log.info("Registered %d vaultwarden_* tools.", registered)
 
     # middleware + hooks (chain-safe resolver is NOT pre_tool_call)
@@ -196,12 +188,13 @@ def register(ctx: Any) -> bool:
             "Check Hermes plugin API compatibility."
         )
     log.info("File-injection middleware registered")
-    try:
-        ctx.register_hook("post_tool_call", make_post_cleanup_hook(auth, registry, config))
-        ctx.register_hook("on_session_end", make_session_end_hook(auth, registry))
+    # VWP-17: register_hook availability handled centrally in compat.py
+    hooks_ok = compat.register_hook_if_available(
+        ctx, "post_tool_call", make_post_cleanup_hook(auth, registry, config))
+    hooks_ok &= compat.register_hook_if_available(
+        ctx, "on_session_end", make_session_end_hook(auth, registry))
+    if hooks_ok:
         log.info("Cleanup hooks registered")
-    except AttributeError:
-        log.warning("Context lacks register_hook; cleanup hooks not installed.")
 
     # optional SecretSource (disabled by default)
     if config.allow_startup_secret_injection:
