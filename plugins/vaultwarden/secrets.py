@@ -39,38 +39,6 @@ log = logging.getLogger("hermes.plugins.vaultwarden.secrets")
 _REQUIRED_KEYS = ("client_secret", "master_password")
 
 
-def _parse_simple_yaml(text: str) -> dict[str, str]:
-    """Minimal flat ``key: value`` YAML parser (fallback when PyYAML is absent).
-
-    Handles exactly the shape of ``secret.yaml.template``: single-level
-    mappings, ``#`` comments, quoted or bare scalar values. Anything more
-    complex is ignored (the caller then reports the keys as missing).
-    """
-    data: dict[str, str] = {}
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        key = key.strip()
-        if not key or key.startswith(("-", "*")):
-            continue  # not a plain mapping line
-        value = value.strip()
-        # Strip trailing " # comment" FIRST (comments are only recognised
-        # when preceded by whitespace), THEN strip matching surrounding
-        # quotes.  This ordering keeps quoted values that contain '#'
-        # (e.g. master_password: "p#ssw0rd") intact — stripping the quote
-        # characters before comment removal would corrupt them and let an
-        # empty quoted value ("") slip through validation.
-        hash_pos = value.find(" #")
-        if hash_pos != -1:
-            value = value[:hash_pos].rstrip()
-        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
-            value = value[1:-1]
-        data[key] = value
-    return data
-
-
 def _scalar_or_empty(raw_value: str) -> tuple[bool, str]:
     """Normalise one inline YAML scalar.
 
