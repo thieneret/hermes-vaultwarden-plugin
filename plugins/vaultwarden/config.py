@@ -124,9 +124,19 @@ def _extract_section(source: Any) -> dict:
         log.warning("Fallback 2: trying direct read from %s (exists=%s)",
                     config_path, config_path.exists())
         if config_path.exists():
-            import yaml
-            with open(config_path, encoding="utf-8-sig") as f:
-                data = yaml.safe_load(f) or {}
+            # The project has ZERO runtime dependencies — PyYAML may be
+            # absent (e.g. CI venvs).  Fall back to the stdlib parser in
+            # secrets.py when the optional import fails.
+            try:
+                import yaml
+            except ImportError:
+                yaml = None
+            if yaml is not None:
+                with open(config_path, encoding="utf-8-sig") as f:
+                    data = yaml.safe_load(f) or {}
+            else:
+                from .secrets import _load_yaml_mapping
+                data = _load_yaml_mapping(config_path)
             entry = data.get("plugins", {}).get("entries", {}).get("vaultwarden", {})
             section = entry.get("settings") or entry.get("config") or {}
             if section:

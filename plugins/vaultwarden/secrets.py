@@ -56,13 +56,17 @@ def _parse_simple_yaml(text: str) -> dict[str, str]:
         if not key or key.startswith(("-", "*")):
             continue  # not a plain mapping line
         value = value.strip()
-        if value.startswith(("'", '"')) and len(value) >= 2 and value[-1] == value[0]:
+        # Strip trailing " # comment" FIRST (comments are only recognised
+        # when preceded by whitespace), THEN strip matching surrounding
+        # quotes.  This ordering keeps quoted values that contain '#'
+        # (e.g. master_password: "p#ssw0rd") intact — stripping the quote
+        # characters before comment removal would corrupt them and let an
+        # empty quoted value ("") slip through validation.
+        hash_pos = value.find(" #")
+        if hash_pos != -1:
+            value = value[:hash_pos].rstrip()
+        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
             value = value[1:-1]
-        else:
-            # strip trailing " # comment" from unquoted scalars
-            hash_pos = value.find(" #")
-            if hash_pos != -1:
-                value = value[:hash_pos].rstrip()
         data[key] = value
     return data
 
@@ -101,28 +105,14 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
         if not key or key.startswith(("-", "*")):
             continue
         value = value.strip()
-        # Unquote scalar values (single- or double-quoted).  The open quote,
-        # the closing quote at end-of-line, and any trailing " # comment" are
-        # all handled — an empty quoted string correctly yields "".
-        if len(value) >= 2 and value[0] in ("'", '"'):
-            quote = value[0]
-            end = value.find(quote, 1)
-            if end != -1:
-                rest = value[end + 1:].strip()
-                if rest == "" or rest.startswith("#"):
-                    value = value[1:end]
-                else:
-                    hash_pos = value.find(" #")
-                    if hash_pos != -1:
-                        value = value[:hash_pos].rstrip()
-            else:
-                hash_pos = value.find(" #")
-                if hash_pos != -1:
-                    value = value[:hash_pos].rstrip()
-        else:
-            hash_pos = value.find(" #")
-            if hash_pos != -1:
-                value = value[:hash_pos].rstrip()
+        # Strip trailing " # comment" first, THEN strip matching surrounding
+        # quotes — so quoted values containing '#' survive and an empty
+        # quoted string ("") correctly yields "".
+        hash_pos = value.find(" #")
+        if hash_pos != -1:
+            value = value[:hash_pos].rstrip()
+        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
+            value = value[1:-1]
         indented = raw_line[:1] in (" ", "\t")
         if not indented and value == "":
             # parent mapping key with no inline value -> start a nested dict
