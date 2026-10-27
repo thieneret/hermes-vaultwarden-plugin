@@ -91,8 +91,8 @@ plugins:
         enabled: true
         server_url: "https://vault.example.com"
         client_id: "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-        client_secret_env: VW_CLIENT_SECRET
-        master_password_env: VW_MASTER_PASSWORD
+        # v0.5.0 (BREAKING): client_secret / master_password are NO LONGER
+        # configured here. They live in secrets.yaml — see below.
         allow_write: false
         allow_startup_secret_injection: false
         auto_sync: true
@@ -107,14 +107,42 @@ plugins:
         bw_max_delay: 10.0
 ```
 
-### `.env` (secrets)
+### `secrets.yaml` (bootstrap secrets — v0.5.0, BREAKING)
 
-Secret values are resolved from environment variables and stored in `~/.hermes/.env` (chmod 600):
+Since v0.5.0 the bootstrap secrets are loaded from a plugin-private YAML file
+that the plugin reads directly — **never** from `.env` or OS environment
+variables:
+
+```
+$HERMES_HOME/plugins/vaultwarden/secrets.yaml   # chmod 600 (enforced)
+```
+
+Setup: copy the shipped template, fill in the values, and lock down
+permissions:
 
 ```bash
-VW_CLIENT_SECRET="your-client-secret"
-VW_MASTER_PASSWORD="your-master-password"
+mkdir -p ~/.hermes/plugins/vaultwarden
+cp plugins/vaultwarden/secret.yaml.template ~/.hermes/plugins/vaultwarden/secrets.yaml
+chmod 600 ~/.hermes/plugins/vaultwarden/secrets.yaml
+# then edit secrets.yaml:
+#   client_secret: "your-client-secret"
+#   master_password: "your-master-password"
 ```
+
+The plugin validates the file at startup: it must exist, be exactly mode
+`0600`, and contain non-empty `client_secret` and `master_password` values;
+otherwise it fails closed with a `ConfigError`.
+
+> **Migration from ≤0.4.9:** remove `VW_CLIENT_SECRET` / `VW_MASTER_PASSWORD`
+> from `~/.hermes/.env` and the `client_secret_env` / `master_password_env`
+> keys from `config.yaml` — those channels were REMOVED. The secrets now never
+> enter the OS environment or the Hermes secret_scope, which closes the
+> `printenv` and `cat .env` attack surfaces.
+>
+> **Residual risk:** if the terminal backend is `local`, the LLM runs as the
+> same OS user and could still `cat` `secrets.yaml`. The plugin logs a WARNING
+> in that case — for production, use a sandboxed backend (`docker` / `ssh` /
+> `modal`) for privilege separation.
 
 ### Key settings
 
@@ -267,7 +295,8 @@ Rules:
 - **Conflicting sources are an error.** Providing more than one of the pair raises `ConfigError` (no silent precedence). In generate mode, supplying any secret/file parameter is also a `ConfigError`.
 - **Raw input triggers a dual-channel warning:** a value-free `log.warning` AND a `"warning"` field in the tool response. The response warning is an **imperative instruction directing the agent to warn the user** that direct secret input is insecure and to recommend the safer `*_file` channel; it never contains the secret value itself. Raw input is still accepted (accept-and-warn).
 - File-resolved secrets never appear in the tool call arguments, keeping them out of the LLM context entirely.
-- **BREAKING CHANGE (v0.4.9):** the environment-variable channel (`password_env` / `pass_env`) was REMOVED. In multiplex gateway mode Hermes loads `.env` only at startup, so a secret added to `.env` required a full Hermes restart before the plugin could resolve it — impractical for dynamic tool use. Supplying `password_env` / `pass_env` now raises an explicit `ConfigError` ("removed in v0.4.9") pointing to `password_file` / `pass_file` or `generate=true`; it is never silently ignored. Bootstrap secrets (`client_secret_env` / `master_password_env`) are NOT affected.
+- **BREAKING CHANGE (v0.4.9):** the environment-variable channel (`password_env` / `pass_env`) was REMOVED. In multiplex gateway mode Hermes loads `.env` only at startup, so a secret added to `.env` required a full Hermes restart before the plugin could resolve it — impractical for dynamic tool use. Supplying `password_env` / `pass_env` now raises an explicit `ConfigError` ("removed in v0.4.9") pointing to `password_file` / `pass_file` or `generate=true`; it is never silently ignored. At the time, bootstrap secrets were still on the `.env` channel — that channel was removed entirely in v0.5.0 (see below).
+- **BREAKING CHANGE (v0.5.0):** bootstrap secrets (`client_secret`, `master_password`) are no longer loaded from `.env` / OS environment variables (`client_secret_env` / `master_password_env` config keys REMOVED). They are read directly from `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` (chmod 600 enforced), so they never enter the environment or the Hermes secret_scope — closing the `printenv` and `cat .env` attack surfaces. Copy `secret.yaml.template` to `secrets.yaml`, fill in the values, `chmod 600`. The plugin logs a WARNING when the terminal backend is `local` (the LLM could then still `cat` the file); use `docker` / `ssh` for production.
 
 ```
 # Passphrase from an owner-only file (chmod 600)
@@ -310,6 +339,7 @@ vaultwarden_store(name="x", username="u", password_env="GH_TOKEN")
 | Structured error classification | Errors classified by source stability (Node.js codes → rate limit → bw state → server API); retry only on idempotent network errors with exponential backoff + jitter |
 | Metadata masking (opt-in) | `metadata_masking=true` masks `username`/`uris` in list/search responses; `name` never masked. Default OFF preserves search usability |
 | Binary path pinning (VWP-01) | `bw` is executed ONLY from the REQUIRED absolute `bw_cli_path` (config.yaml). No PATH lookup, no env override. Validated before use: regular file, no symlink in chain, executable, not group/world-writable, owned by root/current user; otherwise the plugin fails closed and does not load |
+| Bootstrap secrets via secrets.yaml (v0.5.0) | `client_secret` / `master_password` are read directly from `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` (mode 0600 enforced, fail-closed `ConfigError`). They never enter `.env`, an OS environment variable, or the Hermes secret_scope — closing the `printenv` and `cat .env` attack surfaces. WARNING logged when the terminal backend is `local` (privilege separation via `docker`/`ssh` recommended for production) |
 | Middleware fail-closed | If placeholder-injection middleware cannot be registered, the plugin refuses to load. No silent fallback without secret protection |
 | File-injected placeholder injection (VWP-04) | Secrets are written to a chmod 600 temp file (mkstemp, atomic) in a dedicated chmod 700 directory under `$XDG_RUNTIME_DIR` (`vw-secrets/`, typically tmpfs). The rewritten command only ever references `$(< path)` — the raw secret never enters the command string, argv, shell history, or logs. Temp files are deleted in a `finally` block even if the command fails |
 
@@ -319,16 +349,18 @@ vaultwarden_store(name="x", username="u", password_env="GH_TOKEN")
 plugins/vaultwarden/
 ├── __init__.py      # Plugin registration (register(ctx))
 ├── plugin.yaml      # Plugin manifest (name, version, tools)
-├── config.py        # Settings load, env resolution, config fallback
+├── config.py        # Settings load, config fallback (no env secret resolution since v0.5.0)
 ├── auth.py          # AuthManager: state machine, session, recovery
 ├── bw_cli.py        # BwCli: subprocess wrapper, base64 encoding, attachments
 ├── tools.py         # 12 tool handlers
 ├── schemas.py       # OpenAI-style JSON schemas
 ├── placeholders.py  # Single-use placeholder registry
+├── secrets.py       # Bootstrap secrets from secrets.yaml (v0.5.0) + terminal-backend check
 ├── security.py      # RedactingFilter, escaping
 ├── hooks.py         # Placeholder resolution middleware, cleanup hooks
 ├── errors.py        # Error taxonomy
 ├── secret_source.py # Optional SecretSource adapter
+├── secret.yaml.template  # Template users copy to $HERMES_HOME/plugins/vaultwarden/secrets.yaml
 └── tests/           # pytest suite
 ```
 
@@ -341,14 +373,19 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **350 tests** (functional files only — test filenames and
+Current suite: **370 tests** (functional files only — test filenames and
 markers must never embed a plugin version; enforced by
 `test_no_version_coupling.py`). Includes positive-control suites for
-concurrency (VWP-18), subprocess env isolation (VWP-19), and crash recovery
-(VWP-20).
+concurrency (VWP-18), subprocess env isolation (VWP-19), crash recovery
+(VWP-20), and bootstrap-secret loading from `secrets.yaml` (v0.5.0).
 
 Audit remediation status (handoff): **17/20 findings complete** — VWP-01
-(binary path pinning) was closed in v0.4.7.
+remains OPEN for binary hash/authenticity verification (path pinning landed
+in v0.4.7, but cryptographic verification of the `bw` binary is still out of
+scope / pending). The bootstrap-secret attack surface (`printenv` /
+`cat .env`) is now CLOSED as of v0.5.0: secrets are loaded directly from a
+plugin-private `secrets.yaml` (chmod 600) and never enter the OS environment
+or Hermes secret_scope.
 
 ## License
 

@@ -5,6 +5,46 @@ Author: **thieneret**
 
 ---
 
+## [0.5.0] - 2026-10-27
+
+### ⚠️ BREAKING CHANGE — bootstrap secrets now load from `secrets.yaml`, not `.env` / OS environment
+
+- **New mechanism:** the bootstrap secrets (`client_secret`, `master_password`)
+  are loaded from a plugin-private YAML file,
+  `$HERMES_HOME/plugins/vaultwarden/secrets.yaml`, read DIRECTLY by the new
+  `secrets.py` module (`load_secrets()`). The file MUST be chmod 600; any
+  other permission mode is rejected with a `ConfigError` that suggests
+  `chmod 600`. A template ships at
+  `plugins/vaultwarden/secret.yaml.template`.
+- **Removed config keys:** `client_secret_env` and `master_password_env` are
+  REMOVED from `plugin.yaml` and `_DEFAULTS`. `config.resolve_secret()`, the
+  Hermes `_hermes_get_secret` import, `PluginConfig.env_snapshot`,
+  `__init__.py::_resolve_secrets()`, and `__init__.py::_cleanup_bootstrap_env()`
+  are all REMOVED. There is no backward compatibility for the `.env` channel.
+- **Security rationale (two attack surfaces closed):** previously the secrets
+  lived in the Hermes `.env` file (readable by the LLM via
+  `cat /opt/data/.env` — same OS user) and entered the OS environment before
+  the plugin deleted them (dumpable via `printenv`). Now the secrets NEVER
+  enter an environment variable or the Hermes secret_scope at any point.
+- **Residual risk / terminal backend warning:** when the terminal backend is
+  `local`, the LLM still runs as the same OS user and could `cat`
+  `secrets.yaml`. New `secrets.check_terminal_backend()` logs a WARNING in
+  that case ("terminal backend is 'local' ... For production, use 'docker'
+  or 'ssh' backend.") and an INFO for sandboxed backends (`docker` / `ssh` /
+  `modal` / etc.). Privilege separation via a non-local backend is the
+  recommended production posture.
+- **Migration:** copy `plugins/vaultwarden/secret.yaml.template` to
+  `$HERMES_HOME/plugins/vaultwarden/secrets.yaml`, fill in `client_secret`
+  and `master_password`, then `chmod 600 secrets.yaml`. Remove the old
+  `VW_CLIENT_SECRET` / `VW_MASTER_PASSWORD` entries from `.env`.
+- **NOT affected:** VWP-01 path pinning, VWP-11 version check, the error
+  taxonomy codes, the 12-tool registration, the tool schemas and handler
+  behavior, and every security mechanism (RedactingFilter, askpass delivery,
+  temp-file cleanup, 0600/0700 permissions, env isolation — the `bw`
+  subprocess base_env remains minimal). Only the bootstrap secret loading
+  mechanism changed.
+- Version bumped to 0.5.0 in `pyproject.toml` and `plugin.yaml`.
+
 ## [0.4.9] - 2026-10-25
 
 ### ⚠️ BREAKING CHANGE — `*_env` secret-input channel removed
