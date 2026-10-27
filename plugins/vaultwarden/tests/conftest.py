@@ -363,6 +363,27 @@ def no_config_fallback(monkeypatch):
 
     monkeypatch.setattr(builtins, "open", _guarded_open)
 
+    # v0.5.0 note: config.py's FALLBACK 2 may parse config.yaml through
+    # secrets._load_yaml_mapping(), which calls ``Path.read_text()`` directly
+    # (stdlib-only path, used when PyYAML is absent — e.g. the CI venv has
+    # zero runtime deps).  That bypasses the builtins.open guard above, so
+    # block read_text/read_bytes for config.yaml too.
+    _real_read_text = Path.read_text
+    _real_read_bytes = Path.read_bytes
+
+    def _guarded_read_text(self, *args, **kwargs):
+        if str(self).endswith("config.yaml"):
+            raise FileNotFoundError(f"blocked in test: {self}")
+        return _real_read_text(self, *args, **kwargs)
+
+    def _guarded_read_bytes(self, *args, **kwargs):
+        if str(self).endswith("config.yaml"):
+            raise FileNotFoundError(f"blocked in test: {self}")
+        return _real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _guarded_read_text)
+    monkeypatch.setattr(Path, "read_bytes", _guarded_read_bytes)
+
     iso_home = Path(tempfile.mkdtemp(prefix="vw-no-config-fallback-"))
     monkeypatch.setenv("HERMES_HOME", str(iso_home))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: iso_home))
