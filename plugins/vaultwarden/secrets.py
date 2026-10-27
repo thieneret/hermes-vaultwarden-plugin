@@ -71,15 +71,75 @@ def _parse_simple_yaml(text: str) -> dict[str, str]:
     return data
 
 
+def _scalar_or_empty(raw_value: str) -> tuple[bool, str]:
+    """Normalise one inline YAML scalar.
+
+    Returns ``(is_valueless, processed_value)``.  A value is "valueless"
+    (i.e. the line opens a nested mapping) only when everything after the
+    ':' is blank or a pure ``#`` comment.  Quoted scalars are unquoted
+    AFTER comment stripping so that ``key: ""`` yields ``""`` (empty
+    string), NOT a nested mapping — this was the v0.5.0 CI regression:
+    misclassifying ``client_secret: ""`` as a parent key silently turned
+    the secret into ``{}`` and broke empty-value validation.
+    """
+    v = raw_value.strip()
+    if v == "" or v.startswith("#"):
+        return True, ""
+    if v[0] in ("'", '"'):
+        quote = v[0]
+        end = v.find(quote, 1)
+        if end != -1:
+            rest = v[end + 1:].strip()
+            if rest == "" or rest.startswith("#"):
+                # quoted scalar: '#' inside the quotes is part of the
+                # value (e.g. master_password: "p#ssw0rd")
+                return False, v[1:end]
+        # unterminated / junk after closing quote — fall through to the
+        # generic comment-stripping path below
+    # unquoted scalar: strip trailing " # comment" (only recognised when
+    # preceded by whitespace)
+    hash_pos = v.find(" #")
+    if hash_pos != -1:
+        v = v[:hash_pos].rstrip()
+    return False, v
+
+
+def _parse_simple_yaml(text: str) -> dict[str, str]:
+    """Minimal flat ``key: value`` YAML parser (stdlib-only fallback core).
+
+    Handles exactly the shape of ``secret.yaml.template``: single-level
+    mappings, ``#`` comments, quoted or bare scalar values.  Values are
+    returned as strings; a valueless key maps to ``""`` (the caller then
+    reports the key as missing/empty).
+    """
+    data: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if not key or key.startswith(("-", "*")):
+            continue  # not a plain mapping line
+        _, value = _scalar_or_empty(value)
+        data[key] = value
+    return data
+
+
 def _load_yaml_mapping(path: Path) -> dict[str, Any]:
     """Parse a small YAML mapping; prefer PyYAML, fall back to stdlib.
 
-    The fallback parser is FLAT (``key: value`` only).  For nested shapes
-    such as ``terminal:\\n  backend: local`` in ``~/.hermes/config.yaml`` it
-    returns nothing usable, so we additionally promote any indented child of
-    a top-level mapping key into ``{"<parent>": {"<child>": ...}}``.  This
-    keeps one-to-two-level nested mappings working whether or not PyYAML is
-    installed (CI venvs do not have it — the project has zero runtime deps).
+    The stdlib fallback understands two structural forms, which cover every
+    file this plugin reads:
+
+    * flat mappings (``secrets.yaml``) — parsed by :func:`_parse_simple_yaml`;
+    * block mappings nested by INDENTATION (``~/.hermes/config.yaml``, e.g.
+      ``terminal:\\n  backend: local``) — rebuilt with a stack keyed on the
+      column of each key, so arbitrarily deep nesting works without PyYAML
+      (CI venvs have zero runtime deps and therefore no PyYAML).
+
+    Scalars are always strings; flow collections / lists / multi-document
+    YAML are out of scope and simply ignored or treated as plain scalars.
     """
     text = path.read_text(encoding="utf-8-sig")
     try:
@@ -91,41 +151,35 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
         if isinstance(data, dict):
             return data
         return {}
-    # Fallback pass (no PyYAML): rebuild one-level nested mappings from
-    # indentation so that e.g. config.yaml's `terminal:\n  backend: docker`
-    # survives as {"terminal": {"backend": "docker"}}.
-    data: dict[str, Any] = {}
-    current_parent: str | None = None
+
+    # ---- stdlib fallback: indentation-based block-mapping reconstruction --
+    root: dict[str, Any] = {}
+    # Stack of (indent_column, dict_at_that_level); indent -1 => col 0.
+    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
     for raw_line in text.splitlines():
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("#") or ":" not in stripped:
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
-        key, _, value = stripped.partition(":")
+        if ":" not in raw_line:
+            continue
+        content = raw_line.rstrip()
+        indent = len(content) - len(content.lstrip(" \t"))
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        container = stack[-1][1]
+        body = content.strip()
+        key, _, value = body.partition(":")
         key = key.strip()
-        if not key or key.startswith(("-", "*")):
+        if not key or key.startswith(("-", "*", "|", ">")):
             continue
         value = value.strip()
-        # Strip trailing " # comment" first, THEN strip matching surrounding
-        # quotes — so quoted values containing '#' survive and an empty
-        # quoted string ("") correctly yields "".
-        hash_pos = value.find(" #")
-        if hash_pos != -1:
-            value = value[:hash_pos].rstrip()
-        if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
-            value = value[1:-1]
-        indented = raw_line[:1] in (" ", "\t")
-        if not indented and value == "":
-            # parent mapping key with no inline value -> start a nested dict
-            current_parent = key
-            data.setdefault(key, {})
-        elif indented and current_parent is not None:
-            child = data.get(current_parent)
-            if isinstance(child, dict):
-                child[key] = value
+        is_valueless, scalar = _scalar_or_empty(value)
+        if is_valueless:
+            child: dict[str, Any] = {}
+            container[key] = child
+            stack.append((indent, child))
         else:
-            current_parent = None
-            data[key] = value
-    return data
+            container[key] = scalar
+    return root
 
 
 def load_secrets(hermes_home: str) -> tuple[str, str]:
