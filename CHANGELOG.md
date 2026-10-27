@@ -5,6 +5,24 @@ Author: **thieneret**
 
 ---
 
+## [0.5.1] - 2026-10-27
+
+### Refactor
+- **VWP-17**: Centralize compatibility code into `compat.py` module
+  - Hermes API version fallbacks (register_tool, register_hook)
+  - Config loading fallbacks (PluginContext.get_config -> read_user_config_raw -> direct YAML)
+  - YAML import fallback (PyYAML -> stdlib parser)
+  - bw version parsing and minimum version enforcement
+  - Exception code extraction with fallback
+- Add missing `PluginError` class to `errors.py` (used by auth.py)
+- Improve maintainability and security auditability by consolidating
+  version-specific and API-version-specific code into a single module
+
+NOT a breaking change: VWP-01 path pinning, VWP-11 version check, the error
+taxonomy codes, the 12-tool registration, and all security mechanisms
+(RedactingFilter, askpass delivery, temp-file cleanup, 0600/0700 permissions,
+env isolation) are unchanged. Tool schemas and handler behavior are unchanged.
+
 ## [0.5.0] - 2026-10-27
 
 ### ⚠️ BREAKING CHANGE — bootstrap secrets now load from `secrets.yaml`, not `.env` / OS environment

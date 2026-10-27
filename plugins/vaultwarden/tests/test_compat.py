@@ -11,14 +11,12 @@ now delegate to these functions instead of carrying inline fallback code.
 """
 from __future__ import annotations
 
-import builtins
 import logging
 import sys
 
 import pytest
 
 from vaultwarden import compat, errors
-
 
 # ── helpers ──────────────────────────────────────────────────────────
 
