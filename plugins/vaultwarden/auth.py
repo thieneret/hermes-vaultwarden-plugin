@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import errors
+from . import compat, errors
 from .bw_cli import BwCli
 from .config import PluginConfig
 from .security import get_logger, get_redacting_filter
@@ -117,8 +117,10 @@ class AuthManager:
             try:
                 self.ensure_authenticated()
             except Exception as exc:  # noqa: BLE001 - degrade gracefully
+                # VWP-17: error-code extraction centralized in compat.py
+                code = compat.get_error_code(exc)
                 log.warning("Lazy authentication failed (%s); vault unavailable.",
-                            getattr(exc, "code", type(exc).__name__))
+                            code)
                 return False
             return self._state is AuthState.UNLOCKED
 
