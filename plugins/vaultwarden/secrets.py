@@ -68,7 +68,15 @@ def _parse_simple_yaml(text: str) -> dict[str, str]:
 
 
 def _load_yaml_mapping(path: Path) -> dict[str, Any]:
-    """Parse a small flat YAML mapping; prefer PyYAML, fall back to stdlib."""
+    """Parse a small YAML mapping; prefer PyYAML, fall back to stdlib.
+
+    The fallback parser is FLAT (``key: value`` only).  For nested shapes
+    such as ``terminal:\\n  backend: local`` in ``~/.hermes/config.yaml`` it
+    returns nothing usable, so we additionally promote any indented child of
+    a top-level mapping key into ``{"<parent>": {"<child>": ...}}``.  This
+    keeps one-to-two-level nested mappings working whether or not PyYAML is
+    installed (CI venvs do not have it — the project has zero runtime deps).
+    """
     text = path.read_text(encoding="utf-8-sig")
     try:
         import yaml
@@ -79,7 +87,40 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
         if isinstance(data, dict):
             return data
         return {}
-    return _parse_simple_yaml(text)
+    # Fallback pass (no PyYAML): rebuild one-level nested mappings from
+    # indentation so that e.g. config.yaml's `terminal:\n  backend: docker`
+    # survives as {"terminal": {"backend": "docker"}}.
+    data: dict[str, Any] = {}
+    current_parent: str | None = None
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        key = key.strip()
+        if not key or key.startswith(("-", "*")):
+            continue
+        value = value.strip()
+        if value.startswith(("'", '"')) and len(value) >= 2 \
+                and value[-1] == value[0]:
+            value = value[1:-1]
+        else:
+            hash_pos = value.find(" #")
+            if hash_pos != -1:
+                value = value[:hash_pos].rstrip()
+        indented = raw_line[:1] in (" ", "\t")
+        if not indented and not value:
+            # parent mapping key with no inline value -> start a nested dict
+            current_parent = key
+            data.setdefault(key, {})
+        elif indented and current_parent is not None:
+            child = data.get(current_parent)
+            if isinstance(child, dict):
+                child[key] = value
+        else:
+            current_parent = None
+            data[key] = value
+    return data
 
 
 def load_secrets(hermes_home: str) -> tuple[str, str]:

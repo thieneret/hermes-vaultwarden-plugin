@@ -7,6 +7,7 @@ Covers:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -171,3 +172,44 @@ def test_secret_yaml_template_exists_with_expected_keys():
     text = tpl.read_text(encoding="utf-8")
     assert "client_secret:" in text
     assert "master_password:" in text
+
+
+# ── stdlib fallback parser (no PyYAML — CI venvs have zero runtime deps) ────
+
+def test_backend_from_config_yaml_without_pyyaml(monkeypatch, tmp_path):
+    """CI has no PyYAML installed; the stdlib fallback must still read the
+    nested ``terminal: {backend: ...}`` mapping from config.yaml."""
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("simulated: PyYAML not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("# comment\nterminal:\n  backend: docker\n", encoding="utf-8")
+    assert secrets_mod._backend_from_hermes_config() == "docker"
+
+
+def test_load_secrets_without_pyyaml(monkeypatch, tmp_path):
+    """The flat secrets.yaml shape must load via the stdlib fallback too."""
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("simulated: PyYAML not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    plugin_dir = tmp_path / "plugins" / "vaultwarden"
+    plugin_dir.mkdir(parents=True)
+    f = plugin_dir / "secrets.yaml"
+    f.write_text('# c\nclient_secret: "cs-val"\nmaster_password: mp-val\n',
+                 encoding="utf-8")
+    os.chmod(f, 0o600)
+    assert secrets_mod.load_secrets(str(tmp_path)) == ("cs-val", "mp-val")
