@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.5.5**
+**Current version: v0.5.6**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without
 > traditional manual code review of every line. Use at your own
@@ -138,7 +138,7 @@ otherwise it fails closed with a `ConfigError`.
 The secrets never enter the OS environment or the Hermes secret_scope, which
 closes the `printenv` and `cat .env` attack surfaces.
 
-> **Residual risk (SEC-03, fail-closed since v0.5.5):** if the terminal
+> **Residual risk (fail-closed policy):** if the terminal
 > backend is `local` (or unset), the LLM runs as the same OS user that owns
 > `secrets.yaml` and could simply `cat` it — file permissions do not isolate
 > processes of the same user. The plugin therefore **refuses to load** in that
@@ -205,7 +205,7 @@ Behavior and guarantees:
 | `bw_cli_path` | **REQUIRED** FULL absolute path to the `bw` binary (e.g. `/usr/local/bin/bw`). There is NO PATH lookup and NO environment-variable override — config.yaml is the single source of truth. The path is validated before use: absolute, regular file, no symlink anywhere in the chain, executable, not group/world-writable, owned by root or the current user. If missing or invalid the plugin fails closed (does not load; the agent continues without it). |
 | `metadata_masking` | When `true`, `vaultwarden_list` and `vaultwarden_search` mask `username` and `uris` with `***`. `name` is never masked. Default: `false` |
 | `allow_startup_secret_injection` | Register the optional SecretSource adapter for startup-time secret injection. Default: `false` (disabled). See the Startup secret injection section. |
-| `allow_insecure_local_backend` | **SEC-03 (v0.5.5):** explicit opt-in to run with a `local` (or unset) Hermes terminal backend, where the LLM executes as the SAME OS user that owns `secrets.yaml` and can read `client_secret` / `master_password` via `cat`. Default: `false` — the plugin REFUSES to load on a local/unset backend (fail-closed, CRITICAL log). Set to `true` only on trusted single-user machines; loading then logs a WARNING that the operator accepts the risk. Sandboxed backends (`docker` / `ssh` / `modal`) load regardless of this flag and remain the recommended posture. Read ONLY via the native Hermes config (`plugins.entries.vaultwarden.settings`) — no `.env` / environment-variable channel. |
+| `allow_insecure_local_backend` | Explicit opt-in to run with a `local` (or unset) Hermes terminal backend, where the LLM executes as the SAME OS user that owns `secrets.yaml` and can read `client_secret` / `master_password` via `cat`. Default: `false` — the plugin REFUSES to load on a local/unset backend (fail-closed, CRITICAL log). Set to `true` only on trusted single-user machines; loading then logs a WARNING that the operator accepts the risk. Sandboxed backends (`docker` / `ssh` / `modal`) load regardless of this flag and remain the recommended posture. Read ONLY via the native Hermes config (`plugins.entries.vaultwarden.settings`) — no `.env` / environment-variable channel. |
 | `bw_max_retries` | Max retry attempts for idempotent `bw` calls on network errors. Default: `3` |
 | `bw_backoff_base` | Base delay (seconds) for exponential backoff. Default: `1.0` |
 | `bw_max_delay` | Maximum delay cap (seconds). Default: `10.0` |
@@ -412,8 +412,8 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | Structured error classification | Errors classified by source stability (Node.js codes → rate limit → bw state → server API); retry only on idempotent network errors with exponential backoff + jitter |
 | Metadata masking (opt-in) | `metadata_masking=true` masks `username`/`uris` in list/search responses; `name` never masked. Default OFF preserves search usability |
 | Binary path pinning | `bw` is executed ONLY from the REQUIRED absolute `bw_cli_path` (config.yaml). No PATH lookup, no env override. Validated before use: regular file, no symlink in chain, executable, not group/world-writable, owned by root/current user; otherwise the plugin fails closed and does not load |
-| Bootstrap secrets via secrets.yaml | `client_secret` / `master_password` are read directly from `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` (mode 0600 enforced, fail-closed `ConfigError`). They never enter `.env`, an OS environment variable, or the Hermes secret_scope — closing the `printenv` and `cat .env` attack surfaces. SEC-03 (v0.5.5): the plugin now REFUSES to load when the terminal backend is `local`/unset (the LLM could `cat` the file as the same OS user) unless `allow_insecure_local_backend: true` is set explicitly (privilege separation via `docker`/`ssh`/`modal` remains the recommended production posture) |
-| Local-backend fail-closed policy (SEC-03) | Since v0.5.5, `register()` determines the Hermes terminal backend before any tool/middleware registration. A `local` or unset backend means the LLM-driven terminal shares this OS user and can read `secrets.yaml` directly, so the plugin refuses to load (CRITICAL log, returns `False`) unless the operator opts in via the native config flag `allow_insecure_local_backend` (boolean, default `false`; ambiguity always resolves to `false`). Opting in logs a WARNING that the same-user secret-exposure risk has been explicitly accepted. `docker` / `ssh` / `modal` backends load normally regardless of the flag |
+| Bootstrap secrets via secrets.yaml | `client_secret` / `master_password` are read directly from `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` (mode 0600 enforced, fail-closed `ConfigError`). They never enter `.env`, an OS environment variable, or the Hermes secret_scope — closing the `printenv` and `cat .env` attack surfaces. The plugin REFUSES to load when the terminal backend is `local`/unset (the LLM could `cat` the file as the same OS user) unless `allow_insecure_local_backend: true` is set explicitly (privilege separation via `docker`/`ssh`/`modal` remains the recommended production posture) |
+| Local-backend fail-closed policy | `register()` determines the Hermes terminal backend before any tool/middleware registration. A `local` or unset backend means the LLM-driven terminal shares this OS user and can read `secrets.yaml` directly, so the plugin refuses to load (CRITICAL log, returns `False`) unless the operator opts in via the native config flag `allow_insecure_local_backend` (boolean, default `false`; ambiguity always resolves to `false`). Opting in logs a WARNING that the same-user secret-exposure risk has been explicitly accepted. `docker` / `ssh` / `modal` backends load normally regardless of the flag |
 | Middleware fail-closed | If placeholder-injection middleware cannot be registered, the plugin refuses to load. No silent fallback without secret protection |
 | File-injected placeholder injection | Secrets are written to a chmod 600 temp file (mkstemp, atomic) in a dedicated chmod 700 directory under `$XDG_RUNTIME_DIR` (`vw-secrets/`, typically tmpfs). The rewritten command only ever references `$(< path)` — the raw secret never enters the command string, argv, shell history, or logs. Temp files are deleted in a `finally` block even if the command fails |
 

@@ -258,7 +258,19 @@ VAULTWARDEN_UPDATE = {
                               "description": _PASSWORD_FILE_DESC},
             "uri": {"type": "string"},
             "notes": {"type": "string"},
-            "custom_fields": VAULTWARDEN_STORE["parameters"]["properties"]["custom_fields"],
+            "custom_fields": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "value": {"type": "string"},
+                        "field_type": {"type": "integer", "enum": [0, 1],
+                                       "description": "0=text, 1=hidden."},
+                    },
+                    "required": ["name", "value"],
+                },
+            },
             **_GENERATE_PROPERTIES,
         },
         "required": ["item_id"],

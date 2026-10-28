@@ -19,6 +19,7 @@ import re
 import shlex
 import threading
 import urllib.parse
+from typing import Any
 
 # Keys allowed to exist in an isolated bw subprocess environment.
 BW_ENV_ALLOWLIST = frozenset({
@@ -179,20 +180,21 @@ class StructuredJsonFormatter(logging.Formatter):
     """
 
     def format(self, record: logging.LogRecord) -> str:
-        entry = {
+        entry: dict[str, Any] = {
             "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
         }
         # Include structured extra fields if present
-        if hasattr(record, "vw_extra") and isinstance(record.vw_extra, dict):
-            entry["data"] = self._redact_dict(record.vw_extra)
+        vw_extra = getattr(record, "vw_extra", None)
+        if isinstance(vw_extra, dict):
+            entry["data"] = self._redact_dict(vw_extra)
         return _json.dumps(entry, ensure_ascii=False)
 
-    def _redact_dict(self, d: dict) -> dict:
+    def _redact_dict(self, d: dict[str, Any]) -> dict[str, Any]:
         """Recursively redact values whose keys match secret patterns."""
-        result = {}
+        result: dict[str, Any] = {}
         for k, v in d.items():
             if any(p in k.lower() for p in _SECRET_KEY_PATTERNS):
                 result[k] = "[REDACTED]"

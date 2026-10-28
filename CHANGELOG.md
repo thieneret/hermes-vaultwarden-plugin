@@ -5,6 +5,26 @@ Author: **thieneret**
 
 ---
 
+## [0.5.6] - 2026-10-29
+
+v0.5.6 — README cleanup + mypy debt resolution
+- README.md: Remove inline version numbers (v0.X.X) and audit tracking
+  numbers (VWP-XX, SEC-XX) from explanations, configuration descriptions,
+  and security mechanism tables. Version badge at top preserved
+  (operator-maintained). CHANGELOG.md unchanged (legitimately lists versions).
+  Rationale: inline version references create maintenance coupling with
+  release cycles.
+- mypy fixes: Resolve 3 pre-existing type errors:
+  - schemas.py:261 — inline custom_fields schema definition to satisfy type
+    inference (or add cast() annotation)
+  - security.py:190 — use getattr() for dynamic LogRecord.vw_extra attribute
+    with isinstance narrowing
+  - security.py:200 — add explicit recursive dict type annotation
+- No behavior changes; all fixes are type-level only.
+- Bump version to 0.5.6.
+
+---
+
 ## [0.5.5] - 2026-10-29
 
 v0.5.5 (SEC-03) — fail-closed policy for local terminal backend
