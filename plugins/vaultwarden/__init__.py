@@ -29,6 +29,7 @@ from .hooks import (
     _cleanup_stale_sockets,
     make_placeholder_resolver,
     make_post_cleanup_hook,
+    make_result_redactor,
     make_session_end_hook,
 )
 from .placeholders import PlaceholderRegistry
@@ -188,7 +189,42 @@ def register(ctx: Any) -> bool:
             "Check Hermes plugin API compatibility."
         )
     log.info("File-injection middleware registered")
+
+    # SEC-01 (v0.5.4, HIGH) FAIL-CLOSED: the authoritative confidentiality
+    # boundary for injected secrets is the `transform_tool_result` hook —
+    # Hermes documents it as the ONLY mechanism that may return a replacement
+    # tool result BEFORE it reaches the model. If the host Hermes build does
+    # not expose this hook, the plugin MUST refuse to load; silently falling
+    # back to the old post_tool_call-observer redaction would reintroduce
+    # SEC-01 (plaintext secrets possibly surviving into LLM context).
+    if not compat.supports_transform_tool_result(ctx):
+        log.error(
+            "SEC-01 fail-closed: host Hermes does not expose the mandatory "
+            "'%s' plugin hook. Refusing to load the Vaultwarden plugin "
+            "without an authoritative result-redaction boundary — redacting "
+            "in the observer-only 'post_tool_call' hook cannot guarantee "
+            "that injected secrets are scrubbed before reaching the model. "
+            "Upgrade Hermes or disable this plugin.",
+            compat.TRANSFORM_TOOL_RESULT_HOOK)
+        return False
+    redactor_ok = compat.register_hook_if_available(
+        ctx, compat.TRANSFORM_TOOL_RESULT_HOOK,
+        make_result_redactor(auth, registry, config))
+    if not redactor_ok:
+        # Capability check passed but registration still failed — same
+        # fail-closed rule applies: no transformer, no load.
+        log.error(
+            "SEC-01 fail-closed: register_hook('%s') failed. Refusing to "
+            "load without the authoritative result redactor.",
+            compat.TRANSFORM_TOOL_RESULT_HOOK)
+        return False
+    log.info("Result redactor registered on '%s' (SEC-01)",
+             compat.TRANSFORM_TOOL_RESULT_HOOK)
+
     # VWP-17: register_hook availability handled centrally in compat.py
+    # SEC-01 (v0.5.4): post_tool_call is now OBSERVER-ONLY (placeholder
+    # cleanup + metrics + secret-free error surfacing). It performs NO
+    # confidentiality redaction — that lives in transform_tool_result above.
     hooks_ok = compat.register_hook_if_available(
         ctx, "post_tool_call", make_post_cleanup_hook(auth, registry, config))
     hooks_ok &= compat.register_hook_if_available(

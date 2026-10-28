@@ -73,7 +73,10 @@ def test_register_full_flow_and_tool_count(monkeypatch, tmp_path, fake_bw):
     assert all(t["check_fn"]() for t in ctx.tools)
     assert [k for k, _ in ctx.middleware] == ["tool_execution"]
     hook_kinds = [k for k, _ in ctx.hooks]
-    assert hook_kinds == ["post_tool_call", "on_session_end"]
+    # SEC-01 (v0.5.4): transform_tool_result is the authoritative redaction
+    # hook and must be registered FIRST; post_tool_call stays observer-only.
+    assert hook_kinds == ["transform_tool_result", "post_tool_call",
+                          "on_session_end"]
     assert ctx.secret_sources == []          # disabled by default
 
 
@@ -179,6 +182,9 @@ def test_placeholder_e2e_llm_style_flow(monkeypatch, tmp_path, fake_bw):
     tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     mw = dict(ctx.middleware)["tool_execution"]
     post = dict(ctx.hooks)["post_tool_call"]
+    # SEC-01 (v0.5.4): the AUTHORITATIVE redaction hook — its return value is
+    # what reaches the model. post_tool_call is observer-only now.
+    transform = dict(ctx.hooks)["transform_tool_result"]
 
     # LLM asks for a reference, never the secret:
     ref = tools["vaultwarden_get_secret_ref"](
@@ -202,11 +208,14 @@ def test_placeholder_e2e_llm_style_flow(monkeypatch, tmp_path, fake_bw):
     assert "$(<" in executed                   # ...by a file substitution
     assert "sup3r-s3cret-pg!" not in executed  # secret NEVER in the command
 
-    # execution result may echo the secret -> post hook redacts it in place:
+    # execution result may echo the secret -> SEC-01 (v0.5.4): the
+    # authoritative transform_tool_result hook scrubs it BEFORE the model
+    # sees it. post_tool_call is observer-only and must NOT mutate results.
     result = {"output": "psql ran with sup3r-s3cret-pg! visible"}
-    returned = post("terminal", {"command": executed}, result, task_id="task-1")
-    observed = returned if isinstance(returned, dict) else result
+    observed = transform("terminal", result, task_id="task-1")
     assert "sup3r-s3cret-pg!" not in observed["output"]
+    assert "[REDACTED]" in observed["output"]
+    post("terminal", {"command": executed}, observed, task_id="task-1")
 
     # replay of the same placeholder is left verbatim (fail-safe $ expansion):
     again_seen: list[str] = []

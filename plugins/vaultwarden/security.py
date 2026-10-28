@@ -116,6 +116,17 @@ class RedactingFilter(logging.Filter):
         with self._lock:
             self._secrets.discard(value)
 
+    def snapshot_secrets(self) -> list[str]:
+        """Thread-safe copy of the registered secret values, LONGEST first.
+
+        SEC-01 (v0.5.4): public accessor so consumers (the authoritative
+        `transform_tool_result` redactor) can apply exact plaintext
+        replacement without touching private state. Longest-first ordering
+        matches :meth:`redact`, keeping overlapping values deterministic.
+        """
+        with self._lock:
+            return sorted(self._secrets, key=len, reverse=True)
+
     def redact(self, text: str) -> str:
         if not isinstance(text, str) or not text:
             return text

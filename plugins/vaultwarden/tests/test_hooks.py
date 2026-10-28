@@ -225,13 +225,42 @@ def test_secrets_dir_falls_back_when_xdg_missing(monkeypatch, tmp_path):
 
 
 # ------------------------------------------------------------- post hook
-def test_post_hook_redacts_secret_from_output(mw, post, registry):
+def test_post_hook_redacts_secret_from_output(mw, post, registry, auth_manager):
+    """SEC-01 (v0.5.4): redaction is AUTHORITATIVE in transform_tool_result.
+
+    The post_tool_call observer must no longer mutate the result for
+    confidentiality reasons; the transformer returned by make_result_redactor
+    is what scrubs echoes of injected secrets before the model sees them.
+    """
+    from vaultwarden.hooks import make_result_redactor
+
+    redact = make_result_redactor(auth_manager, registry)
     t = token_for(registry)
-    run_mw(mw, "terminal", {"command": f"echo \"{t}\""})
     leaked = {"output": "Zs: sup3r-s3cret-pg! done"}
-    post("terminal", {}, leaked, task_id="x")
-    assert "sup3r-s3cret-pg!" not in leaked["output"]
-    assert "[REDACTED]" in leaked["output"]
+
+    def next_call(a):
+        return leaked
+
+    mw("terminal", {"command": f"echo \"{t}\""}, dict({"command": f"echo \"{t}\""}),
+       next_call, task_id="x")
+    # Hermes pipeline: middleware returns -> transform_tool_result replaces.
+    observed = redact("terminal", leaked, task_id="x")
+    assert "sup3r-s3cret-pg!" not in observed["output"]
+    assert "[REDACTED]" in observed["output"]
+
+    # Observer-only guarantee: post_tool_call never redacts anymore.
+    t2 = token_for(registry)
+
+    def next_call2(a):
+        return {"output": "again sup3r-s3cret-pg!"}
+
+    res2 = mw("terminal", {"command": f"echo \"{t2}\""}, None, next_call2,
+              task_id="x2")
+    post("terminal", {}, res2, task_id="x2")
+    assert "sup3r-s3cret-pg!" in res2["output"]  # observer does NOT mutate
+    res2b = {"output": "again sup3r-s3cret-pg!"}
+    out2 = redact("terminal", res2b, task_id="x2")
+    assert "sup3r-s3cret-pg!" not in out2["output"]
 
 
 def test_post_hook_surfaces_placeholder_errors(mw, post, registry):

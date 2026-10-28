@@ -80,6 +80,7 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 | Bootstrap secrets from secrets.yaml | Since v0.5.0, `client_secret` and `master_password` are read directly from `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` (chmod 600 enforced, fail-closed `ConfigError` otherwise). They NEVER enter the OS environment or the Hermes secret_scope, closing the `printenv` and `cat .env` attack surfaces. A WARNING is logged when the terminal backend is `local` (the LLM could then still `cat` the file); `docker` / `ssh` / `modal` backends are recommended for production. |
 | Native config API only (VWP-05) | Since v0.5.2, plugin configuration is loaded exclusively through the native Hermes `PluginContext.get_config()` API. The former fallback layers (`read_user_config_raw()`, direct YAML file read) have been REMOVED — they bypassed Hermes's isolation and permission model. If the native API yields no configuration, the plugin logs a warning and does not load (fail-closed). |
 | Explicit capability detection (VWP-06) | Since v0.5.2, Hermes API compatibility is determined via explicit capability detection (`inspect.signature()` for `register_tool`, `hasattr()` for `register_hook`) instead of exception-based probing. If a required API is unavailable, the plugin fails closed with a `RuntimeError` — it never silently degrades to an insecure mode. |
+| Result redaction via transform_tool_result (SEC-01) | Since v0.5.4, the authoritative confidentiality boundary for injected secrets is the Hermes `transform_tool_result` transformation hook (`make_result_redactor` in `hooks.py`), whose RETURN VALUE replaces the tool result before it reaches the model. The per-execution injected-secret set is handed off from the `tool_execution` middleware via a `contextvars.ContextVar` (cleared in a `finally` block — no plaintext persists across turns); the transformer performs exact recursive `[REDACTED]` replacement over str/dict/list results and writable `.output` objects, then applies the global `RedactingFilter` pass. `post_tool_call` is observer-only (placeholder cleanup, metrics, secret-free error surfacing) and no longer mutates results. FAIL-CLOSED: hosts without `transform_tool_result` are refused at load (`register()` returns False). |
 
 ### File-injected placeholder injection (VWP-04) — crash recovery (VWP-20)
 
@@ -227,10 +228,11 @@ All CI checks (pytest, ruff) are **blocking** — a failing check prevents merge
 -   All CI checks (pytest, ruff) are **blocking** — a failing check prevents
     merge. (VWP-15)
 
-## VWP Audit Status (20/20 complete)
+## Audit Status (20/20 VWP + SEC-01 complete)
 
-| VWP | Description | Implemented |
+| ID | Description | Implemented |
 |-----|-------------|-------------|
+| SEC-01 | Result redaction via authoritative `transform_tool_result` hook (ContextVar handoff; `post_tool_call` reduced to observer-only; fail-closed load without the hook) | v0.5.4 |
 | VWP-01 | Binary path pinning (hash verification = operator responsibility) | v0.4.7 |
 | VWP-02 | SSH socket path restriction (dev-controlled env vars) | v0.4.6 |
 | VWP-03 | Middleware fail-closed registration | v0.4.3 |
