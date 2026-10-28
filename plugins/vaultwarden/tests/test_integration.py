@@ -149,6 +149,30 @@ def test_startup_secret_injection_registers_source(monkeypatch, tmp_path, fake_b
     assert isinstance(secrets, dict)
 
 
+def test_startup_secret_injection_with_mappings(monkeypatch, tmp_path, fake_bw):
+    """startup_injections mappings -> get_secrets() returns the configured values.
+
+    v0.5.3: mapping validation + INFO logging + redactor registration are
+    covered by tests/test_secret_source.py; this test proves the end-to-end
+    wiring from config.section["startup_injections"] through register().
+    """
+    ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw, {
+        "allow_startup_secret_injection": True,
+        "startup_injections": [
+            {"item_id": "aaaa1111-0000-0000-0000-000000000001",
+             "field": "password", "env": "DB_PASS"},
+            {"field": "password"},                       # missing item_id -> skipped
+            "not-a-dict",                                # wrong type -> skipped
+        ],
+    })
+    assert ok and len(ctx.secret_sources) == 1
+    src = ctx.secret_sources[0]
+    # v0.5.3 validation: only the one valid mapping survives __init__
+    assert len(src._mappings) == 1
+    secrets = src.get_secrets()
+    assert secrets == {"DB_PASS": "sup3r-s3cret-pg!"}
+
+
 # ------------------------------------------------- placeholder e2e via hooks
 def test_placeholder_e2e_llm_style_flow(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)

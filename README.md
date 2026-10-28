@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.5.2**
+**Current version: v0.5.3**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without
 > traditional manual code review of every line. Use at your own
@@ -143,6 +143,46 @@ closes the `printenv` and `cat .env` attack surfaces.
 > in that case — for production, use a sandboxed backend (`docker` / `ssh` /
 > `modal`) for privilege separation.
 
+### Startup secret injection (optional, disabled by default)
+
+The plugin can optionally expose a fixed, pre-configured set of vault items
+as environment-style secrets to Hermes at **startup** via the `SecretSource`
+adapter. This is intended for consumers that read secrets from environment
+variables at process start (e.g. legacy apps), and is **not** a replacement
+for the runtime placeholder injection used by tools.
+
+The feature is controlled by two settings under
+`plugins.entries.vaultwarden.settings`:
+
+```yaml
+allow_startup_secret_injection: true
+startup_injections:
+  - item_id: "abc-123-def"   # vault item UUID
+    field: "password"        # password | username | totp | notes | uri
+    env: "DB_PASSWORD"       # env-style key exposed at startup (optional)
+  - item_id: "xyz-456-ghi"
+    field: "username"
+    env: "DB_USER"
+```
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `allow_startup_secret_injection` | `false` | Master switch for the SecretSource adapter. When `false`, no startup secrets are exposed. |
+| `startup_injections` | `[]` | List of `{item_id, field, env}` mappings. Only explicitly listed item/field pairs are reachable. If `env` is omitted, a key of the form `VW_<item_id prefix>` is used. |
+
+Behavior and guarantees:
+
+- **Read-only:** the adapter only reads vault items; it never writes.
+- **Explicit allowlist:** only configured `item_id`/`field` pairs are exposed — there is no way to enumerate or fetch arbitrary items through this adapter.
+- **Fail-safe:** any retrieval error results in that secret being skipped and a warning logged; agent startup is never crashed.
+- **Redacted:** injected secret values are registered with the redacting filter so they do not leak into logs.
+- **Does not replace placeholder injection:** tool calls still use the single-use `$__VW_SECRET_x__` placeholder flow at runtime.
+
+> **Security note:** secrets injected at startup enter the process
+> environment of the host application. Prefer the runtime placeholder model
+> (`vaultwarden_get_secret_ref`) whenever possible, and enable this adapter
+> only when a consumer strictly requires startup-time environment variables.
+
 ### Key settings
 
 | Setting | Effect |
@@ -158,6 +198,7 @@ closes the `printenv` and `cat .env` attack surfaces.
 | `max_placeholders` | Maximum active placeholders. Default: `50` |
 | `bw_cli_path` | **REQUIRED** FULL absolute path to the `bw` binary (e.g. `/usr/local/bin/bw`). There is NO PATH lookup and NO environment-variable override — config.yaml is the single source of truth. The path is validated before use: absolute, regular file, no symlink anywhere in the chain, executable, not group/world-writable, owned by root or the current user. If missing or invalid the plugin fails closed (does not load; the agent continues without it). |
 | `metadata_masking` | When `true`, `vaultwarden_list` and `vaultwarden_search` mask `username` and `uris` with `***`. `name` is never masked. Default: `false` |
+| `allow_startup_secret_injection` | Register the optional SecretSource adapter for startup-time secret injection. Default: `false` (disabled). See the Startup secret injection section. |
 | `bw_max_retries` | Max retry attempts for idempotent `bw` calls on network errors. Default: `3` |
 | `bw_backoff_base` | Base delay (seconds) for exponential backoff. Default: `1.0` |
 | `bw_max_delay` | Maximum delay cap (seconds). Default: `10.0` |
@@ -387,7 +428,7 @@ plugins/vaultwarden/
 ├── hooks.py              # Placeholder resolution middleware, cleanup hooks
 ├── errors.py             # Error taxonomy
 ├── compat.py             # Centralized compatibility layer (Hermes API, bw version)
-├── secret_source.py      # Optional SecretSource adapter
+├── secret_source.py      # Optional SecretSource adapter (startup injection, disabled by default)
 ├── secret.yaml.template  # Template users copy to $HERMES_HOME/plugins/vaultwarden/secrets.yaml
 └── tests/                # pytest suite
 ```
