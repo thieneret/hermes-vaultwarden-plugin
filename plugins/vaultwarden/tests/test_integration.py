@@ -167,8 +167,10 @@ def test_startup_secret_injection_with_mappings(monkeypatch, tmp_path, fake_bw):
     })
     assert ok and len(ctx.secret_sources) == 1
     src = ctx.secret_sources[0]
+    # v0.5.3 validation: only the one valid mapping survives __init__
+    assert len(src._mappings) == 1
     secrets = src.get_secrets()
-    assert secrets == {"DB_PASS": "db-pass"}
+    assert secrets == {"DB_PASS": "sup3r-s3cret-pg!"}
 
 
 # ------------------------------------------------- placeholder e2e via hooks

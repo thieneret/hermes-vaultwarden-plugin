@@ -5,6 +5,27 @@ Author: **thieneret**
 
 ---
 
+## [0.5.3] - 2026-10-28
+
+### Improvements
+- **secret_source.py**: Add input validation for mappings (missing `item_id`,
+  invalid structure) with warning logs
+- **secret_source.py**: Add INFO logging for successful secret injections
+  (count and env var names)
+- **secret_source.py**: Register injected secrets with RedactingFilter
+  (security improvement — ensures injected secrets are redacted from logs)
+- **secret_source.py**: Lazy import `_field_value` to avoid potential
+  circular dependency
+- Add comprehensive unit tests for `secret_source.py` (11 test cases)
+
+NOT a breaking change: the feature remains opt-in
+(`allow_startup_secret_injection: false` by default), the public API
+(`name()` / `get_secrets()`) is unchanged, and all security mechanisms
+(VWP-01 path pinning, VWP-11 version check, error taxonomy, read-only
+fail-safe model, redactor integration, 12-tool registration) are untouched.
+
+---
+
 ## [0.5.2] - 2026-10-27
 
 ### Refactor

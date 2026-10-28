@@ -42,6 +42,11 @@ _DEFAULTS: dict[str, Any] = {
     "appdata_dir_env": "VW_APPDATA_DIR",
     "allow_write": False,
     "allow_startup_secret_injection": False,
+    # v0.5.3: startup-injection mappings consumed by the optional
+    # SecretSource adapter (see __init__.py / secret_source.py). Listed in
+    # _DEFAULTS so extract_plugin_section() picks them up via the native
+    # get_config() API; mapping validation happens in VaultwardenSecretSource.
+    "startup_injections": [],
     # v0.3.7 (VWP-14): allow_direct_secret_retrieval REMOVED entirely.
     # There is no code path that returns a raw secret to the LLM; the
     # placeholder model is the only supported path for secret access.
