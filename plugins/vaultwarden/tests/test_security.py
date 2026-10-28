@@ -668,8 +668,8 @@ def test_register_fail_closed_without_transform_hook(monkeypatch, tmp_path,
                                                      fake_bw, caplog):
     """SEC-01 fail-closed: hosts without transform_tool_result are refused."""
     import vaultwarden
-    from vaultwarden.tests.test_integration import _write_secrets_yaml
     from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
+    from vaultwarden.tests.test_integration import _write_secrets_yaml
 
     _write_secrets_yaml(tmp_path)
     monkeypatch.delenv("BW_CLI_PATH", raising=False)

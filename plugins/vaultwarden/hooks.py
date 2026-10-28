@@ -64,7 +64,7 @@ from typing import Any, Callable
 from . import errors
 from .auth import AuthManager
 from .placeholders import PlaceholderRegistry
-from .security import get_logger, get_redacting_filter, RedactingFilter
+from .security import get_logger, get_redacting_filter
 from .tools import _field_value
 
 log = get_logger("hooks")
