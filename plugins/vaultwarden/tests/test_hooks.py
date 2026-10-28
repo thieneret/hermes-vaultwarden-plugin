@@ -289,3 +289,90 @@ def test_session_end_clears_everything(auth_manager, registry, post):
     end()
     assert registry.snapshot() == {}
     assert auth_manager.session_key is None
+
+
+# ------------------------------------------------------- SEC-02 (v0.5.7)
+def test_multi_occurrence_single_temp_file(mw, registry, monkeypatch):
+    """SEC-02: the SAME placeholder referenced 3x in one command resolves
+    atomically — consume_and_resolve runs exactly once per unique token and
+    every occurrence maps onto the ONE injected temp file."""
+    t = token_for(registry)
+    suffix = t[1:][len("__VW_SECRET_"):-len("__")]
+
+    calls: list[str] = []
+    real_car = registry.consume_and_resolve
+
+    def spy_car(token):
+        calls.append(token)
+        return real_car(token)
+
+    monkeypatch.setattr(registry, "consume_and_resolve", spy_car)
+
+    seen: list[dict] = []
+
+    def next_call(a):
+        seen.append(a)
+        return {"output": "ran"}
+
+    command = f'curl -H "Auth: {t}" -H "Cookie: {t}" -d "pw={t}"'
+
+    created_files: list[str] = []
+    from vaultwarden import hooks as _hooks_mod
+    real_writer = _hooks_mod._write_secret_file
+
+    def spy_writer(token, value, secrets_dir, temp_files):
+        path = real_writer(token, value, secrets_dir, temp_files)
+        # snapshot the directory contents at creation time (the finally
+        # block unlinks the file after next_call returns, so we cannot
+        # list it afterwards).
+        created_files.append(path)
+        return path
+
+    monkeypatch.setattr("vaultwarden.hooks._write_secret_file", spy_writer)
+
+    mw("terminal", {"command": command}, dict(command=command), next_call,
+       task_id="sec02-multi")
+
+    # 1. Atomic consumption: exactly ONE resolve call for the unique token.
+    assert calls == [f"__VW_SECRET_{suffix}__"]
+    # 2. Exactly ONE temp file created for that token in _secrets_dir().
+    assert len(created_files) == 1
+    assert os.path.dirname(created_files[0]) == _secrets_dir()
+    assert os.path.basename(created_files[0]).startswith(
+        f"vw_{suffix}_")
+    # 3. ALL THREE occurrences rewritten to the same $(< path) reference.
+    out_cmd = seen[0]["command"]
+    assert out_cmd.count("$(< ") == 3
+    paths = set(_injected_paths(out_cmd))
+    assert len(paths) == 1
+    assert paths == {created_files[0]}
+    assert t not in out_cmd                       # no unresolved leftovers
+    assert "sup3r-s3cret-pg!" not in out_cmd      # secret never inlined
+
+
+def test_reuse_rejection_logs_warning(mw, registry, caplog):
+    """SEC-02: replaying a consumed token in a LATER tool call fails safe —
+    nothing is injected, a warning is logged, and consume_and_resolve returns
+    None on the second pass (never raises)."""
+    t = token_for(registry)
+    _PENDING_ERRORS.clear()
+
+    first, seen1 = run_mw(mw, "terminal", {"command": f"run --secret \"{t}\""},
+                          task_id="sec02-reuse")
+    assert first == {"output": "ran"}
+    assert "$(< " in seen1["command"]             # first pass injects
+
+    with caplog.at_level("WARNING"):
+        second, seen2 = run_mw(mw, "terminal", {"command": f"run --secret \"{t}\""},
+                               task_id="sec02-reuse")
+    assert second == {"output": "ran"}
+    assert "$(< " not in seen2["command"]         # reuse NOT injected
+    assert t in seen2["command"]                  # stays verbatim (fail-safe)
+    # atomic primitive: already-used token -> None, no exception
+    assert registry.consume_and_resolve(t[1:]) is None
+    # warning surfaced for operators/LLM via logs AND pending error store
+    assert any("already used" in r.getMessage() or "cannot be resolved" in r.getMessage()
+               for r in caplog.records if r.levelname == "WARNING")
+    errs = _PENDING_ERRORS.get("sec02-reuse", [])
+    assert any(e.get("error_code") == "PLACEHOLDER_ERROR" for e in errs)
+    _PENDING_ERRORS.clear()

@@ -16,6 +16,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -379,6 +380,35 @@ def _require_write(config: PluginConfig) -> None:
             "Write operations are disabled for the Vaultwarden plugin.")
 
 
+# ---------------------------------------------------------------- version
+#: SEC-02 companion (v0.5.7): single sanctioned sources of truth for the
+#: plugin version are plugin.yaml + pyproject.toml (handoff rule 6 — see
+#: tests/test_no_version_coupling.py). There is deliberately NO __version__
+#: constant; vaultwarden_status reads the version from plugin.yaml instead.
+_PLUGIN_VERSION_RE = re.compile(r"^version:\s*([^\s]+)", re.M)
+_PLUGIN_VERSION: str | None = None
+
+
+def get_plugin_version() -> str:
+    """Return the plugin version, read (once, cached) from plugin.yaml.
+
+    The lookup is a plain pathlib read relative to the package directory —
+    no third-party YAML dependency. On any failure (file missing, unreadable)
+    ``"unknown"`` is returned and cached, so the status tool never raises
+    over version introspection.
+    """
+    global _PLUGIN_VERSION
+    if _PLUGIN_VERSION is None:
+        try:
+            yaml_path = Path(__file__).resolve().parent / "plugin.yaml"
+            text = yaml_path.read_text(encoding="utf-8")
+            m = _PLUGIN_VERSION_RE.search(text)
+            _PLUGIN_VERSION = m.group(1) if m else "unknown"
+        except OSError:
+            _PLUGIN_VERSION = "unknown"
+    return _PLUGIN_VERSION
+
+
 def _collect_secret_strings(obj: Any) -> list[str]:
     """Recursively extract all non-empty string values from a nested structure.
 
@@ -447,7 +477,12 @@ def get_tools(auth: AuthManager, config: PluginConfig,
 
     # ------------------------------------------------------------ status
     def h_status(args: dict, **kw: Any) -> str:
+        # v0.5.7 (SEC-02 companion): expose the running plugin version so
+        # operators and the LLM can verify the exact build for debugging and
+        # audit compliance. Read dynamically from plugin.yaml (single source
+        # of truth — see get_plugin_version).
         return _guard(lambda: {"status": auth.status_snapshot(),
+                               "plugin_version": get_plugin_version(),
                                "placeholders_active": len(registry.active_tokens())})
 
     _tools.append((schemas.VAULTWARDEN_STATUS, h_status))

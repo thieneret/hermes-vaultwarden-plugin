@@ -35,11 +35,18 @@ Security properties:
   echoed output is scrubbed, AND the per-execution plaintext set is handed to
   the authoritative `transform_tool_result` redactor via a ContextVar
   (SEC-01, v0.5.4);
+- SEC-02 (v0.5.7): resolution is strictly ATOMIC per unique token per command
+  execution — the middleware extracts all unique tokens, consumes each exactly
+  once via `PlaceholderRegistry.consume_and_resolve()` (marked used BEFORE the
+  entry is returned), creates ONE temp file per unique token and globally
+  replaces ALL occurrences of that token with the same `$(< path)` reference.
+  A command referencing the same placeholder several times can no longer hit a
+  sequential partial-resolution or unintended-reuse path;
 - unresolved references (expired / unknown / already-used) are left EXACTLY as
   they were: the leading `$` makes them valid shell variable references that
   expand to an empty string — fail-safe, the secret cannot leak and the
-  command simply fails with an empty value (the error is recorded for
-  post_tool_call to surface to the agent).
+  command simply fails with an empty value (a warning is logged and the error
+  is recorded for post_tool_call to surface to the agent).
 
 Double-quote requirement (documented in the skill and README): the rewritten
 `$(< path)` substitution must be expanded by the shell. Shell expansion
@@ -174,32 +181,69 @@ def _cleanup_stale_sockets():
                 pass
 
 
-def _inject_one(token: str, auth: AuthManager, registry: PlaceholderRegistry,
-                secrets_dir: str, temp_files: list[str],
-                task_id: str = "",
-                injected_values_out: list[str] | None = None) -> str | None:
-    """Resolve one placeholder suffix; return the temp-file path or None.
+def _write_secret_file(token: str, value: str, secrets_dir: str,
+                       temp_files: list[str]) -> str:
+    """Write *value* to a fresh mkstemp file (chmod 600, atomic, symlink-
+    protected) inside *secrets_dir*; register it for finally-block cleanup.
 
-    The middleware has ALREADY consumed the token (single-use marking happens
-    up-front in ``vaultwarden_inject_secrets``), so here we only read the
-    registry entry and fetch the field value. None means "leave the reference
-    verbatim" (fail-safe `$` expansion): expired / unknown / already-used
-    tokens, or items whose field went empty. The real secret is ONLY ever
-    written to the returned temp file (mkstemp: atomic, O_EXCL, chmod 600) —
-    never into the command string.
-
-    SEC-01 (v0.5.4): when *injected_values_out* is provided the plaintext is
-    collected there LOCALLY (inside the middleware frame) instead of being
-    published into the ContextVar here — the middleware publishes the exact
-    set into the ContextVar handoff channel immediately before next_call and
-    restores it in its finally block. record_task_secret still keeps the
-    task-keyed dict fallback in sync for hosts that dispatch hooks on a
-    different context/thread.
+    SEC-02 (v0.5.7): extracted from the old ``_inject_one`` helper so the
+    atomic resolve loop can call it exactly once per unique token.
     """
-    placeholder = f"__VW_SECRET_{token}__"   # registry form (no $)
-    entry = registry.peek(placeholder)
+    fd, path = tempfile.mkstemp(dir=secrets_dir, prefix=f"vw_{token}_")
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, value.encode("utf-8"))
+    finally:
+        os.close(fd)
+    temp_files.append(path)
+    return path
+
+
+def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
+                               registry: PlaceholderRegistry, secrets_dir: str,
+                               temp_files: list[str], task_id: str = "",
+                               injected_values_out: list[str] | None = None,
+                               task_errors: list[dict] | None = None,
+                               ) -> str | None:
+    """SEC-02 (v0.5.7): atomically consume one unique token and create its
+    single temp file; return the file path or ``None`` (fail-safe).
+
+    ``six_hex`` is the 12-hex-character body of a ``$__VW_SECRET_<body>__``
+    command reference. The middleware calls this EXACTLY ONCE per unique
+    token per command execution — every occurrence of the same placeholder
+    in the command string maps onto the same returned path via a global
+    ``str.replace``.
+
+    Atomic consumption: :meth:`PlaceholderRegistry.consume_and_resolve`
+    marks the entry used BEFORE returning it, so a replayed/expired/unknown
+    token yields ``None`` here without ever touching the vault. On ``None``
+    we log a warning, record a PLACEHOLDER_ERROR for post_tool_call to
+    surface, and leave the reference verbatim (the leading ``$`` makes it a
+    valid shell variable that expands to an empty string — fail-safe).
+
+    The real secret is ONLY ever written to the returned temp file — never
+    into the command string. SEC-01 (v0.5.4): when *injected_values_out* is
+    provided the plaintext is collected there LOCALLY (inside the middleware
+    frame); the middleware publishes the exact set into the ContextVar
+    handoff channel immediately before next_call and restores it in its
+    finally block. record_task_secret still keeps the task-keyed dict
+    fallback in sync for hosts that dispatch hooks on a different
+    context/thread.
+    """
+    placeholder = f"__VW_SECRET_{six_hex}__"   # registry form (no $)
+    entry = registry.consume_and_resolve(placeholder)
     if entry is None:
-        return None  # unknown/expired/already-used — error recorded upstream
+        err = errors.PlaceholderError(
+            f"Placeholder '{placeholder}' cannot be resolved "
+            "(unknown, expired, or already used - single-use policy).",
+            suggestion="Request a fresh one via vaultwarden_get_secret_ref.")
+        log.warning("Placeholder %s: %s", placeholder, err.message)
+        if task_errors is not None:
+            task_errors.append(err.to_dict())
+        else:
+            with _PENDING_LOCK:
+                _PENDING_ERRORS.setdefault(task_id or "", []).append(err.to_dict())
+        return None  # leave the reference verbatim ($ expands to empty)
     try:
         item = auth.get_item(entry.item_id)
         if entry.field_name.startswith("custom:"):
@@ -219,13 +263,7 @@ def _inject_one(token: str, auth: AuthManager, registry: PlaceholderRegistry,
             _PENDING_ERRORS.setdefault(task_id or "", []).append(exc.to_dict())
         return None
     # Write the secret to a mkstemp file (chmod 600, atomic, symlink-protected).
-    fd, path = tempfile.mkstemp(dir=secrets_dir, prefix=f"vw_{token}_")
-    try:
-        os.fchmod(fd, 0o600)
-        os.write(fd, value.encode("utf-8"))
-    finally:
-        os.close(fd)
-    temp_files.append(path)
+    path = _write_secret_file(six_hex, value, secrets_dir, temp_files)
     # Register the value so it gets scrubbed from any log line / output echo.
     get_redacting_filter().register_secret(value)
     # v0.1.4 (FAIL-6): also record the plaintext per-task so the redaction
@@ -288,22 +326,20 @@ def make_placeholder_resolver(auth: AuthManager,
             # whether injection WOULD happen, without consuming anything.
             return {"args": args}
 
-        # VWP-04 single-use semantics: every $__VW_SECRET_ reference that
-        # reaches the middleware is CONSUMED — even if it later turns out to
-        # be expired/unknown/already-used or its vault field went empty (that
-        # reference stays verbatim as a fail-safe `$` expansion). Marking the
-        # tokens used up-front makes replay detection deterministic.
+        # SEC-02 (v0.5.7) atomic resolution: every UNIQUE $__VW_SECRET_ token
+        # is consumed exactly once per command execution — consumption and
+        # entry retrieval happen atomically inside consume_and_resolve(), so
+        # there is no sequential first-occurrence-consumes / second-occurrence
+        # -fails window anymore. Each resolved token gets ONE temp file, and
+        # ALL occurrences of that token are then globally replaced with the
+        # same `$(< path)` reference. Unresolvable tokens (unknown / expired /
+        # already-used, e.g. a replay across two tool calls) stay EXACTLY as
+        # they were: the leading `$` makes them valid shell variable
+        # references that expand to an empty string (fail-safe), a warning is
+        # logged and a PLACEHOLDER_ERROR is recorded for post_tool_call to
+        # surface to the agent.
         with _PENDING_LOCK:
             task_errors = _PENDING_ERRORS.setdefault(task_id or "", [])
-        for key in targets:
-            for m in _VW_SECRET_CMD_RE.finditer(args[key]):
-                placeholder = f"__VW_SECRET_{m.group(1)}__"  # registry form
-                try:
-                    registry.consume(placeholder)
-                except errors.PlaceholderError as exc:
-                    log.warning("Placeholder %s: %s", placeholder, exc.message)
-                    task_errors.append(exc.to_dict())
-
         secrets_dir = _secrets_dir()
         temp_files: list[str] = []
         injected_values: list[str] = []
@@ -312,14 +348,24 @@ def make_placeholder_resolver(auth: AuthManager,
         try:
             for key in targets:
                 command = new_args[key]
-                new_command = command
-                for m in _VW_SECRET_CMD_RE.finditer(command):
-                    path = _inject_one(m.group(1), auth, registry, secrets_dir,
-                                       temp_files, task_id, injected_values)
+                # 1. Extract unique token bodies (first-seen order preserved).
+                unique_suffixes = list(dict.fromkeys(
+                    m.group(1) for m in _VW_SECRET_CMD_RE.finditer(command)))
+                if not unique_suffixes:
+                    continue
+                # 2. Atomic resolution loop: one consume + one temp file each.
+                replacements: dict[str, str] = {}
+                for suffix in unique_suffixes:
+                    path = _resolve_placeholder_token(
+                        suffix, auth, registry, secrets_dir, temp_files,
+                        task_id, injected_values, task_errors)
                     if path is None:
-                        continue  # expired/unknown/already-used -> leave as-is
-                    new_command = new_command.replace(m.group(0), f"$(< {path})")
-                    resolved_any = True
+                        continue  # unknown/expired/used -> leave verbatim
+                    replacements[f"$__VW_SECRET_{suffix}__"] = f"$(< {path})"
+                # 3. Global replacement: ALL occurrences map to the same file.
+                new_command = command
+                for ref, sub in replacements.items():
+                    new_command = new_command.replace(ref, sub)
                 if new_command != command:
                     new_args[key] = new_command
                     resolved_any = True
