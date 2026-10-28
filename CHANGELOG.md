@@ -5,6 +5,24 @@ Author: **thieneret**
 
 ---
 
+## [0.5.5] - 2026-10-29
+
+v0.5.5 (SEC-03) — fail-closed policy for local terminal backend
+- BREAKING (default behavior): plugin now REFUSES to load when the Hermes
+  terminal backend is `local` (or unset), because the LLM then runs as the same
+  OS user and can read secrets.yaml directly, bypassing all protections.
+- New config flag `allow_insecure_local_backend` (boolean, default false) under
+  plugins.entries.vaultwarden.settings. Set to true to explicitly accept the
+  same-user secret-exposure risk (a WARNING is logged).
+- Recommended production posture unchanged: use `docker` / `ssh` / `modal`
+  terminal backends for privilege separation.
+- secrets.check_terminal_backend() now returns the detected backend so
+  register() can enforce the policy before any tool registration.
+- Docs: README.md config table + SECURITY.md threat vector updated.
+- Bump version to 0.5.5.
+
+---
+
 ## [0.5.4] - 2026-10-28
 
 v0.5.4 (SEC-01) — migrate result redaction to authoritative transform_tool_result hook

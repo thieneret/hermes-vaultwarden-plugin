@@ -1,4 +1,4 @@
-"""Hermes Agent — Vaultwarden secrets management plugin (v0.5.2).
+"""Hermes Agent — Vaultwarden secrets management plugin (v0.5.5).
 
 Entry point: ``register(ctx)`` (see plan §4/§12).
 
@@ -117,10 +117,34 @@ def register(ctx: Any) -> bool:
     log.info("Bootstrap secrets loaded from %s (never entered OS env)",
              f"{hermes_home}/plugins/vaultwarden/secrets.yaml")
 
-    # v0.5.0: privilege-separation advisory — with a 'local' terminal backend
-    # the LLM could still cat secrets.yaml; sandboxed backends cannot.
+    # SEC-03 (v0.5.5, BREAKING default behavior): privilege-separation POLICY,
+    # not just an advisory. With a 'local' (or unset) terminal backend the
+    # LLM-driven terminal executes as the SAME OS user that owns secrets.yaml,
+    # so the agent could simply `cat` it and read client_secret /
+    # master_password in plaintext — file permissions do not isolate processes
+    # of the same user. The plugin therefore REFUSES to load unless the
+    # operator explicitly opts in via allow_insecure_local_backend: true.
+    # This check runs BEFORE any tool/middleware registration so a refused
+    # load leaves no partial state.
     backend = _secrets.check_terminal_backend()
-    log.debug("Terminal backend check completed (backend=%s)", backend or "local")
+    if not _secrets.is_sandboxed_backend(backend):
+        if not config.allow_insecure_local_backend:
+            log.critical(
+                "SEC-03 fail-closed: local terminal backend allows the LLM to "
+                "read secrets.yaml as the same OS user; set "
+                "allow_insecure_local_backend: true to accept this risk, or "
+                "use docker/ssh/modal. Refusing to load the Vaultwarden "
+                "plugin (backend=%r).", backend or "unset")
+            return False
+        log.warning(
+            "SEC-03 opt-in: operator has EXPLICITLY accepted the same-user "
+            "secret-exposure risk (allow_insecure_local_backend=true) with "
+            "terminal backend %r — the LLM can read secrets.yaml directly "
+            "via 'cat'. Recommended production posture: use docker / ssh / "
+            "modal for privilege separation.", backend or "unset/local")
+    else:
+        log.info("Terminal backend '%s' is sandboxed — SEC-03 policy "
+                 "satisfied.", backend)
 
     # 4. isolated appdata dir (chmod 700)
     try:

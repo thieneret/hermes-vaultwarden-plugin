@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 0.5.4
+version: 0.5.5
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key
@@ -51,6 +51,19 @@ config:
     type: boolean
     default: false
     description: Register the optional SecretSource adapter (disabled by default).
+  # SEC-03 (v0.5.5): fail-closed policy for the local terminal backend.
+  allow_insecure_local_backend:
+    type: boolean
+    default: false
+    description: >-
+      Explicitly accept the same-user secret-exposure risk of a 'local'
+      Hermes terminal backend. With backend 'local' (or unset) the LLM-driven
+      terminal runs as the SAME OS user that owns secrets.yaml and can read
+      client_secret / master_password via 'cat secrets.yaml', bypassing all
+      plugin protections. Default FALSE: the plugin REFUSES to load on a
+      local/unset backend (fail-closed, CRITICAL log). Set TRUE only on
+      trusted single-user machines (a WARNING is then logged). Recommended
+      posture: use the docker / ssh / modal backends for privilege separation.
   # v0.3.7 (VWP-14): allow_direct_secret_retrieval removed entirely.
   # vaultwarden_get_secret_ref always returns only a placeholder.
   auto_sync:

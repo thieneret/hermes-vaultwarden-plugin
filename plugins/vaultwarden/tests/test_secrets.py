@@ -164,6 +164,33 @@ def test_check_terminal_backend_from_config_yaml_docker(monkeypatch, tmp_path,
     assert not any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
+# ── SEC-03 (v0.5.5): backend classification helpers ─────────────────────────
+
+@pytest.mark.parametrize("backend,expected", [
+    ("docker", True),
+    ("ssh", True),
+    ("modal", True),
+    ("DOCKER", True),          # case-insensitive
+    (" ssh ", True),           # whitespace-tolerant
+    ("local", False),
+    ("", False),               # unset => NOT sandboxed (fail-closed)
+    ("kubernetes", False),     # unknown backends are NOT trusted (fail-closed)
+])
+def test_is_sandboxed_backend_classification(backend, expected):
+    assert secrets_mod.is_sandboxed_backend(backend) is expected
+
+
+def test_check_terminal_backend_modal_info(monkeypatch, caplog):
+    """SEC-03: 'modal' is a recognized sandboxed backend — INFO, no warning."""
+    monkeypatch.setenv("TERMINAL_ENV", "modal")
+    with caplog.at_level(logging.INFO,
+                         logger="hermes.plugins.vaultwarden.secrets"):
+        backend = secrets_mod.check_terminal_backend()
+    assert backend == "modal"
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    assert any(r.levelno == logging.INFO for r in caplog.records)
+
+
 # ── template file ────────────────────────────────────────────────────────────
 
 def test_secret_yaml_template_exists_with_expected_keys():
