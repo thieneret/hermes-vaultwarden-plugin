@@ -213,7 +213,9 @@ class PluginConfig:
         # BW_CLI_PATH env var cannot resurrect the override; secrets never
         # flow through this channel (bootstrap secrets live in secrets.yaml).
         if os.environ.get("BW_CLI_PATH", "").strip():
-            log.warning("BW_CLI_PATH is set but IGNORED (VWP-01): "
+            # VWP-01 (v0.4.7 BREAKING): env override removed — this warning
+            # only informs operators that the legacy variable is inert.
+            log.warning("BW_CLI_PATH is set but IGNORED: "
                         "bw_cli_path in config.yaml is the only source.")
         return str(self._raw("bw_cli_path") or "")
 

@@ -129,22 +129,26 @@ def register(ctx: Any) -> bool:
     backend = _secrets.check_terminal_backend()
     if not _secrets.is_sandboxed_backend(backend):
         if not config.allow_insecure_local_backend:
+            # SEC-03 (v0.5.5): fail-closed privilege-separation policy —
+            # see CHANGELOG.md [0.5.5] for details.
             log.critical(
-                "SEC-03 fail-closed: local terminal backend allows the LLM to "
+                "fail-closed: local terminal backend allows the LLM to "
                 "read secrets.yaml as the same OS user; set "
                 "allow_insecure_local_backend: true to accept this risk, or "
                 "use docker/ssh/modal. Refusing to load the Vaultwarden "
                 "plugin (backend=%r).", backend or "unset")
             return False
+        # SEC-03 (v0.5.5): operator explicitly accepted the same-user risk.
         log.warning(
-            "SEC-03 opt-in: operator has EXPLICITLY accepted the same-user "
+            "operator has EXPLICITLY accepted the same-user "
             "secret-exposure risk (allow_insecure_local_backend=true) with "
             "terminal backend %r — the LLM can read secrets.yaml directly "
             "via 'cat'. Recommended production posture: use docker / ssh / "
             "modal for privilege separation.", backend or "unset/local")
     else:
-        log.info("Terminal backend '%s' is sandboxed — SEC-03 policy "
-                 "satisfied.", backend)
+        # SEC-03 (v0.5.5): sandboxed backends satisfy the policy.
+        log.info("Terminal backend '%s' is sandboxed — privilege-separation "
+                 "policy satisfied.", backend)
 
     # 4. isolated appdata dir (chmod 700)
     try:
@@ -222,8 +226,10 @@ def register(ctx: Any) -> bool:
     # back to the old post_tool_call-observer redaction would reintroduce
     # SEC-01 (plaintext secrets possibly surviving into LLM context).
     if not compat.supports_transform_tool_result(ctx):
+        # SEC-01 (v0.5.4): fail-closed — no authoritative redaction hook,
+        # no load. See CHANGELOG.md [0.5.4] for details.
         log.error(
-            "SEC-01 fail-closed: host Hermes does not expose the mandatory "
+            "fail-closed: host Hermes does not expose the mandatory "
             "'%s' plugin hook. Refusing to load the Vaultwarden plugin "
             "without an authoritative result-redaction boundary — redacting "
             "in the observer-only 'post_tool_call' hook cannot guarantee "
@@ -237,12 +243,14 @@ def register(ctx: Any) -> bool:
     if not redactor_ok:
         # Capability check passed but registration still failed — same
         # fail-closed rule applies: no transformer, no load.
+        # SEC-01 (v0.5.4): fail-closed on registration failure.
         log.error(
-            "SEC-01 fail-closed: register_hook('%s') failed. Refusing to "
+            "fail-closed: register_hook('%s') failed. Refusing to "
             "load without the authoritative result redactor.",
             compat.TRANSFORM_TOOL_RESULT_HOOK)
         return False
-    log.info("Result redactor registered on '%s' (SEC-01)",
+    # SEC-01 (v0.5.4): authoritative confidentiality boundary now active.
+    log.info("Result redactor registered on '%s'",
              compat.TRANSFORM_TOOL_RESULT_HOOK)
 
     # VWP-17: register_hook availability handled centrally in compat.py

@@ -11,7 +11,10 @@ the LLM, so it no longer performs any redaction; it only does placeholder
 cleanup, metrics logging and secret-free error surfacing. The per-execution
 injected-secret set is handed off from the middleware to the transformer via
 a ContextVar (`_CURRENT_INJECTED_SECRETS`), cleared in a finally block so no
-secret values persist across turns.
+secret values persist across turns. See CHANGELOG.md [0.5.4] for details.
+NOTE: SEC-01 / VWP-XX audit references are intentionally kept in comments and
+docstrings (developer context) only — they must NOT appear in runtime log
+messages; logs carry diagnostic information exclusively.
 
 VWP-04 (v0.4.4, BREAKING): secrets are no longer written into the command
 string. The middleware intercepts the terminal call via Hermes's
