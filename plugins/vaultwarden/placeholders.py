@@ -89,17 +89,58 @@ class PlaceholderRegistry:
             return entry
 
     def peek(self, token: str) -> PlaceholderEntry | None:
-        """Non-consuming lookup (unknown/expired -> None)."""
+        """Non-consuming lookup (unknown/expired/already-used -> None).
+
+        SEC-02 (v0.5.7): the middleware no longer needs a non-consuming
+        lookup on the injection path — :meth:`consume_and_resolve` is the
+        single atomic primitive. ``peek`` stays as a safe introspection
+        helper; it reports already-used tokens as ``None`` so callers can
+        never mistake a consumed placeholder for a live one.
+        """
         with self._lock:
             entry = self._entries.get(token)
-            if entry is None or self._expired_locked(entry):
+            if entry is None or entry.used or self._expired_locked(entry):
                 return None
+            return entry
+
+    def consume_and_resolve(self, token: str) -> PlaceholderEntry | None:
+        """SEC-02 (v0.5.7): atomically mark *token* consumed AND return its
+        entry in one locked operation.
+
+        The entry is marked used BEFORE it is handed back to the caller, so
+        the very same token can never be resolved twice — even when a single
+        command string references it multiple times (the middleware resolves
+        each unique token exactly once and maps every occurrence onto the
+        same injected temp file).
+
+        Returns ``None`` (never raises) when the token is unknown, expired,
+        or already consumed; expired/used entries are dropped from the
+        registry, mirroring :meth:`consume`. Raising-vs-returning policy is
+        left to the caller (the middleware logs a warning and fails safe).
+        """
+        with self._lock:
+            entry = self._entries.get(token)
+            if entry is None:
+                return None
+            if self._expired_locked(entry):
+                del self._entries[token]
+                return None
+            if entry.used:
+                del self._entries[token]
+                return None
+            entry.used = True
             return entry
 
     def consume(self, token: str) -> PlaceholderEntry:
         """Atomically mark a token used and return it (single-use enforcement).
 
         Raises PLACEHOLDER_ERROR for unknown/expired/already-used tokens.
+
+        .. deprecated:: 0.5.7
+            SEC-02 refactored the middleware onto
+            :meth:`consume_and_resolve`, which never raises. This raising
+            variant is retained only for existing test/consumer call sites;
+            new code should use ``consume_and_resolve``.
         """
         with self._lock:
             entry = self._entries.get(token)

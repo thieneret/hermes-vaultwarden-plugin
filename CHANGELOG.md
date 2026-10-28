@@ -5,6 +5,21 @@ Author: **thieneret**
 
 ---
 
+## [0.5.7] - 2026-10-29
+
+v0.5.7 (SEC-02) — atomic placeholder resolution & status version exposure
+- Security (SEC-02): Refactored placeholder resolution to be strictly atomic
+  per unique token per command. Commands containing the same placeholder
+  multiple times now correctly map all occurrences to a single injected temp
+  file, preventing partial resolution or unintended reuse paths.
+- Feature: `vaultwarden_status` now returns the current `plugin_version`
+  in its response payload for operator and LLM visibility.
+- Added `consume_and_resolve()` to PlaceholderRegistry for atomic
+  consumption-before-return semantics.
+- Bump version to 0.5.7.
+
+---
+
 ## [0.5.6] - 2026-10-29
 
 v0.5.6 — README cleanup + mypy debt resolution

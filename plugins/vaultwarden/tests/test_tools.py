@@ -55,6 +55,24 @@ def test_status_tool(auth_manager, plugin_config, registry, tools_by_name):
         assert secret not in blob
 
 
+def test_status_version_exposed(auth_manager, plugin_config, registry,
+                                tools_by_name):
+    """v0.5.7 (SEC-02 companion): vaultwarden_status reports the running
+    plugin version, dynamically read from plugin.yaml (single source of
+    truth — no hardcoded version string here)."""
+    import re as _re
+    from pathlib import Path
+
+    res = tools_by_name["vaultwarden_status"]({})
+    assert "error" not in res
+    assert "plugin_version" in res
+    yaml_text = (Path(__file__).resolve().parent.parent / "plugin.yaml"
+                 ).read_text(encoding="utf-8")
+    m = _re.search(r"^version:\s*([^\s]+)", yaml_text, _re.M)
+    assert m is not None
+    assert res["plugin_version"] == m.group(1)
+
+
 def test_sync_tool(tools_by_name):
     res = tools_by_name["vaultwarden_sync"]({"force": True})
     assert res.get("synced") is True

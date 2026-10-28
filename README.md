@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.5.6**
+**Current version: v0.5.7**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without
 > traditional manual code review of every line. Use at your own
@@ -8,7 +8,7 @@
 >>
 > ⚠️ This is my first "vibe-coded" program, intended primarily for my own use. Use it entirely at your own risk!
 >
-> ⚠️ AI audit results: [Qwen](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20Qwen3.8-max.md) [ChatGPT](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20ChatGPT.md)
+> ⚠️ AI audit results: [v0.3.2-Qwen](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20Qwen3.8-max.md) [v0.3.2-ChatGPT](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20ChatGPT.md) [v0.5.2-Qwen](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/eda5876f048916f9506a9f30b2e12ade2b0a017d/audit/v0.5.2%20audit%20by%20Qwen3.8-max.md) [v0.5.2-ChatGPT](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/eda5876f048916f9506a9f30b2e12ade2b0a017d/audit/v0.5.2%20audit%20by%20ChatGPT.md)
 >
 > ⚠️ **Security:** See [SECURITY.md](SECURITY.md) for the full threat model
 > and security guarantees.
@@ -216,7 +216,7 @@ Behavior and guarantees:
 
 | Tool | Purpose | Requires `allow_write` |
 | --- | --- | :-: |
-| `vaultwarden_status` | Plugin health: auth state, session, server config | ❌ |
+| `vaultwarden_status` | Plugin health: auth state, session, server config, plugin version | ❌ |
 | `vaultwarden_sync` | Sync vault (`force=true` bypasses auto-sync interval) | ❌ |
 | `vaultwarden_list` | List items — metadata only | ❌ |
 | `vaultwarden_search` | Search items by name/username/uri — metadata only | ❌ |
@@ -255,6 +255,7 @@ quotes — so the shell expands the `$(< path)` substitution.
 - The real secret is injected only at the moment of command execution
 - The raw secret never appears in the command string, argv, shell history, or logs
 - Every secret is registered with a redacting filter so it cannot leak into logs
+- If a command references the same placeholder multiple times, the middleware resolves it **exactly once** and creates a single temp file; all occurrences are rewritten to the same `$(< path)` reference.
 
 ## SSH Key Management
 
@@ -416,6 +417,7 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | Local-backend fail-closed policy | `register()` determines the Hermes terminal backend before any tool/middleware registration. A `local` or unset backend means the LLM-driven terminal shares this OS user and can read `secrets.yaml` directly, so the plugin refuses to load (CRITICAL log, returns `False`) unless the operator opts in via the native config flag `allow_insecure_local_backend` (boolean, default `false`; ambiguity always resolves to `false`). Opting in logs a WARNING that the same-user secret-exposure risk has been explicitly accepted. `docker` / `ssh` / `modal` backends load normally regardless of the flag |
 | Middleware fail-closed | If placeholder-injection middleware cannot be registered, the plugin refuses to load. No silent fallback without secret protection |
 | File-injected placeholder injection | Secrets are written to a chmod 600 temp file (mkstemp, atomic) in a dedicated chmod 700 directory under `$XDG_RUNTIME_DIR` (`vw-secrets/`, typically tmpfs). The rewritten command only ever references `$(< path)` — the raw secret never enters the command string, argv, shell history, or logs. Temp files are deleted in a `finally` block even if the command fails |
+| Atomic placeholder resolution | If a command contains the same placeholder multiple times, it is resolved exactly once via `consume_and_resolve()`, creating a single temp file per unique token. Prevents sequential consumption hazards and guarantees single-use semantics even on repeated references |
 
 See SECURITY.md for the full threat model and all security controls.
 
