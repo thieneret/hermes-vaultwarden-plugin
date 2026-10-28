@@ -1,5 +1,17 @@
 """Terminal hook handlers (plan §7): VWP-04 file-injection `tool_execution`
-middleware + `post_tool_call` cleanup/redaction.
+middleware + `transform_tool_result` redaction (SEC-01, v0.5.4) +
+`post_tool_call` cleanup/metrics (observer-only).
+
+SEC-01 (v0.5.4, HIGH): the confidentiality boundary for injected secrets is
+the AUTHORITATIVE Hermes transformation hook `transform_tool_result`
+(`make_result_redactor`) — its RETURN VALUE replaces the tool result before
+it reaches the model. The `post_tool_call` observer may mutate its own
+reference but that mutation is not guaranteed to be the result delivered to
+the LLM, so it no longer performs any redaction; it only does placeholder
+cleanup, metrics logging and secret-free error surfacing. The per-execution
+injected-secret set is handed off from the middleware to the transformer via
+a ContextVar (`_CURRENT_INJECTED_SECRETS`), cleared in a finally block so no
+secret values persist across turns.
 
 VWP-04 (v0.4.4, BREAKING): secrets are no longer written into the command
 string. The middleware intercepts the terminal call via Hermes's
@@ -17,7 +29,9 @@ Security properties:
   any log line / tool response; it exists only inside the temp file for the
   duration of the command execution;
 - every injected secret is registered with the RedactingFilter first, so even
-  echoed output is scrubbed;
+  echoed output is scrubbed, AND the per-execution plaintext set is handed to
+  the authoritative `transform_tool_result` redactor via a ContextVar
+  (SEC-01, v0.5.4);
 - unresolved references (expired / unknown / already-used) are left EXACTLY as
   they were: the leading `$` makes them valid shell variable references that
   expand to an empty string — fail-safe, the secret cannot leak and the
@@ -37,6 +51,7 @@ Middleware chain safety rules (CRITICAL):
 """
 from __future__ import annotations
 
+import contextvars
 import os
 import re
 import subprocess
@@ -307,17 +322,32 @@ _PENDING_ERRORS: dict[str, list[dict]] = {}
 _PENDING_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# Per-task injected-secret store (v0.1.4, FAIL-6).
+# Per-task injected-secret store (v0.1.4, FAIL-6) + SEC-01 ContextVar handoff
+# (v0.5.4).
 #
 # When the middleware resolves a placeholder it knows the plaintext secret
 # value that is about to enter the shell. We keep that value ONLY for the
-# duration of the tool call (keyed by task_id) so the post_tool_call hook can
+# duration of the tool call (keyed by task_id) so the redaction layer can
 # scrub it out of whatever the command echoed back — without ever registering
 # vault item values in the global RedactingFilter (which would redact them
 # from unrelated text forever and could collide with benign strings).
 # The store is short-lived, memory-only and never logged.
+#
+# SEC-01 (v0.5.4): the authoritative confidentiality boundary is the
+# `transform_tool_result` hook (see make_result_redactor), NOT the
+# post_tool_call observer. Hermes does not guarantee that the transformer
+# runs on the same OS thread as the middleware, so the per-execution
+# plaintext set is handed off via a contextvars.ContextVar (the secure
+# handoff channel — secrets are never passed as function arguments through
+# Hermes internals). The ContextVar covers the asyncio/current-context case;
+# the task-keyed dict below stays as belt-and-braces fallback for hosts that
+# dispatch hooks on a different context or thread. Both stores are cleared
+# in the middleware's finally block so no secret values persist across turns.
 _INJECTED_SECRETS: dict[str, list[str]] = {}
 _INJECTED_LOCK = threading.Lock()
+
+_CURRENT_INJECTED_SECRETS: contextvars.ContextVar[frozenset[str] | None] = \
+    contextvars.ContextVar("vaultwarden_injected_secrets", default=None)
 
 
 def record_task_secret(task_id: str, value: str) -> None:
@@ -325,6 +355,11 @@ def record_task_secret(task_id: str, value: str) -> None:
         return
     with _INJECTED_LOCK:
         _INJECTED_SECRETS.setdefault(task_id or "", []).append(value)
+    # SEC-01 handoff: also publish into the ContextVar so the
+    # transform_tool_result redactor sees the exact set injected for the
+    # current execution, even when no task id is threaded through Hermes.
+    cur = _CURRENT_INJECTED_SECRETS.get() or frozenset()
+    _CURRENT_INJECTED_SECRETS.set(cur | {value})
 
 
 def take_task_secrets(task_id: str) -> list[str]:
@@ -333,22 +368,38 @@ def take_task_secrets(task_id: str) -> list[str]:
         return _INJECTED_SECRETS.pop(task_id or "", [])
 
 
+def peek_task_secrets(task_id: str) -> list[str]:
+    """Return (without forgetting) the pending secret values for *task_id*.
+
+    Used by the SEC-01 `transform_tool_result` redactor: unlike the old
+    post_tool_call path it must NOT pop, because both the transformer and
+    the cleanup observer may run for the same task_id and the transformer
+    may be invoked more than once. The middleware's finally block (and the
+    session-end hook) remain the single owners that forget these values.
+    """
+    with _INJECTED_LOCK:
+        return list(_INJECTED_SECRETS.get(task_id or "", []))
+
+
 def clear_task_secrets() -> None:
     """Drop every pending secret (used on session end / registry clear)."""
     with _INJECTED_LOCK:
         _INJECTED_SECRETS.clear()
+    # SEC-01: never let plaintext linger in the current context either.
+    _CURRENT_INJECTED_SECRETS.set(None)
 
 
 def _redact_in_result(result: Any) -> Any:
-    """Scrub registered secret values out of a tool result object.
+    """Scrub globally registered secret values out of a tool result object.
 
     v0.1.4 (FAIL-6): the shared RedactingFilter only knows bootstrap secrets,
     session keys and explicitly tracked write payloads — vault-stored item
     fields are deliberately NOT registered globally (they could collide with
-    unrelated text). For post_tool_call leak protection we therefore also
-    redact every secret this plugin just INJECTED into a terminal command:
-    ``hooks`` records the resolved values per task in _INJECTED_SECRETS and
-    they are scrubbed from the matching task's output here, then forgotten.
+    unrelated text). SEC-01 (v0.5.4): this global pass now runs inside the
+    authoritative `transform_tool_result` redactor (see
+    ``make_result_redactor``); the per-task injected values are scrubbed by
+    ``_redact_task_secrets`` from the same place. The post_tool_call observer
+    no longer performs any confidentiality mutation.
     """
     redactor = get_redacting_filter()
     if isinstance(result, str):
@@ -366,9 +417,19 @@ def _redact_in_result(result: Any) -> Any:
     return result
 
 
-def _redact_task_secrets(task_id: str, result: Any) -> None:
-    """Remove freshly injected placeholder secrets from *result* (in place)."""
-    values = take_task_secrets(task_id)
+def _redact_task_secrets(task_id: str, result: Any,
+                         values: list[str] | None = None) -> None:
+    """Remove freshly injected placeholder secrets from *result* (in place).
+
+    SEC-01 (v0.5.4): refactored from "pop the per-task store" to a helper
+    that redacts an EXPLICIT set of plaintext values (exact replacement with
+    ``[REDACTED]``), called from the authoritative `transform_tool_result`
+    redactor. When *values* is None it falls back to peeking the task-keyed
+    store (never popping — the middleware's finally block owns forgetting).
+    Pure in-memory string replacement: no I/O, no subprocesses, no network.
+    """
+    if values is None:
+        values = peek_task_secrets(task_id)
     if not values:
         return
 
@@ -412,40 +473,109 @@ def _redact_task_secrets(task_id: str, result: Any) -> None:
             pass
 
 
+def make_result_redactor(auth: AuthManager,
+                         registry: PlaceholderRegistry,
+                         config: Any = None) -> Callable[..., Any]:
+    """Build the `transform_tool_result` transformer for ctx.register_hook.
+
+    SEC-01 (v0.5.4, HIGH): this is the AUTHORITATIVE confidentiality
+    boundary. Hermes documents `transform_tool_result` as the hook whose
+    return value REPLACES the tool result before it reaches the model —
+    unlike `post_tool_call`, which is an observer-only hook and provides no
+    such guarantee. The redaction previously done in the observer lives here
+    now.
+
+    The returned callable:
+    1. follows the standard Hermes transformer signature
+       ``(tool_name, result, task_id/turn_id, **kwargs)``;
+    2. reads the per-execution injected-secret set from the ContextVar
+       established by the tool_execution middleware (`_CURRENT_INJECTED_SECRETS`
+       via record_task_secret), with the task-keyed store as fallback when
+       Hermes dispatches the hook on a different context/thread;
+    3. performs exact, recursive plaintext replacement of every injected
+       secret value with the literal ``[REDACTED]`` on str / dict / list
+       results and objects exposing a writable ``.output`` attribute;
+    4. applies the global RedactingFilter pass (bootstrap secrets, session
+       keys, tracked write payloads) to the same result;
+    5. RETURNS the sanitized result — that return value is what the model
+       observes. If the handoff stores are empty for this execution the
+       result still passes through the global filter and is otherwise
+       returned unchanged.
+
+    Purely in-memory string replacement: no network calls, no subprocesses,
+    no disk I/O.
+    """
+
+    def vaultwarden_transform_tool_result(tool_name: str = "", result: Any = None,
+                                          task_id: str = "", turn_id: str = "",
+                                          **kwargs: Any) -> Any:
+        # Hermes may key the execution by task_id or turn_id depending on
+        # version/backend — accept both, prefer task_id.
+        exec_id = task_id or kwargs.get("task_id") or turn_id \
+            or kwargs.get("turn_id") or ""
+        # 1) per-execution injected secrets (SEC-01 handoff). ContextVar is
+        #    the primary channel; the task-keyed dict covers cross-context /
+        #    cross-thread dispatch. Never pop here — the middleware's finally
+        #    block owns forgetting the values.
+        cv_values = _CURRENT_INJECTED_SECRETS.get()
+        values = list(cv_values) if cv_values else peek_task_secrets(exec_id)
+        # 2) exact plaintext replacement with [REDACTED] (in place for
+        #    containers / .output objects, new object for plain strings).
+        if values:
+            _redact_task_secrets(exec_id, result, values=values)
+        # 3) global RedactingFilter pass (bootstrap secrets, session keys,
+        #    tracked write payloads) — replaces the global redaction
+        #    previously done in post_tool_call.
+        scrubbed = _redact_in_result(result)
+        if isinstance(result, MutableMapping) and isinstance(scrubbed, dict) \
+                and scrubbed is not result:
+            result.clear()
+            result.update(scrubbed)
+            return result
+        # 4) THE authoritative part: whatever we return becomes the result
+        #    delivered to the conversation/model context.
+        return scrubbed
+
+    return vaultwarden_transform_tool_result
+
+
 def make_post_cleanup_hook(auth: AuthManager,
                            registry: PlaceholderRegistry,
                            config: Any = None) -> Callable[..., None]:
-    """Build the `post_tool_call` observer for ctx.register_hook."""
+    """Build the `post_tool_call` observer for ctx.register_hook.
+
+    SEC-01 (v0.5.4): redaction moved to transform_tool_result. This
+    hook is now observer-only for cleanup/metrics and must not mutate the
+    result for confidentiality reasons.
+    """
 
     terminal_tools = set(getattr(config, "terminal_tool_names", None) or _DEFAULT_TERMINAL_TOOLS)
 
     def vaultwarden_post_cleanup(tool_name: str = "", args: dict | None = None,
                                  result: Any = None, task_id: str = "",
                                  **kwargs: Any) -> None:
+        # SEC-01 (v0.5.4): redaction moved to transform_tool_result. This
+        # hook is now observer-only for cleanup/metrics and must not mutate
+        # the result for confidentiality reasons. Observer duties kept here:
+        #   - placeholder bookkeeping (cleanup_used),
+        #   - secret-free diagnostic error surfacing,
+        #   - debug/metrics logging.
         if tool_name not in terminal_tools:
             return
         n = registry.cleanup_used()
         if n:
             log.debug("post_tool_call cleaned %d used placeholder(s).", n)
-        # Leak protection: redact any resolved secret echoed by the command.
-        # v0.1.5 (FAIL-6): _redact_in_result returns a NEW dict for dict results
-        # (the old code discarded it, so {"output": ...} was never scrubbed);
-        # merge the scrubbed copy back in place so callers observe redaction.
-        scrubbed = _redact_in_result(result)
-        if isinstance(result, dict) and isinstance(scrubbed, dict) \
-                and scrubbed is not result:
-            result.clear()
-            result.update(scrubbed)
-        # Task-scoped redaction for secrets this plugin just injected
-        # (single-use per task_id; forgotten immediately after).
-        _redact_task_secrets(task_id, result)
         # Surface fail-closed resolution errors to the agent (secret-free).
         # v0.2.2 (BUGFIX): pop only THIS task's errors — other in-flight
         # tasks keep their pending errors until their own post_tool_call.
+        # NOTE: this is diagnostic telemetry, NOT a confidentiality boundary;
+        # the error dicts never contain secret values by construction.
         with _PENDING_LOCK:
             task_errors = _PENDING_ERRORS.pop(task_id or "", [])
         if task_errors and isinstance(result, dict):
             result.setdefault("vaultwarden_placeholder_errors", []).extend(task_errors)
+        log.debug("post_tool_call observer finished for %s (errors=%d).",
+                  tool_name, len(task_errors))
 
     return vaultwarden_post_cleanup
 
