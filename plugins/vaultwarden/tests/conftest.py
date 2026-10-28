@@ -429,6 +429,14 @@ class RecordingCtx:
     def register_middleware(self, kind, fn):
         self.middleware.append((kind, fn))
 
+    # SEC-01 (v0.5.4): modern Hermes builds expose the authoritative
+    # transform_tool_result hook; compat.supports_transform_tool_result()
+    # detects it via this declared capability set. Stand-in contexts that
+    # want to simulate OLDER Hermes hosts can clear/replace this attribute
+    # in tests exercising the fail-closed path.
+    supported_hooks = frozenset({"post_tool_call", "on_session_end",
+                                 "transform_tool_result"})
+
     def register_hook(self, kind, fn):
         self.hooks.append((kind, fn))
 

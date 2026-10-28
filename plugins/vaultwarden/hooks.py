@@ -332,6 +332,12 @@ def make_placeholder_resolver(auth: AuthManager,
             # values persist across turns.
             cv_token = _publish_injected_secrets(injected_values)
             try:
+                # SEC-01 (v0.5.4): the authoritative confidentiality boundary
+                # is the Hermes `transform_tool_result` hook
+                # (make_result_redactor), which consumes the ContextVar /
+                # task-store handoff established here. The middleware itself
+                # only injects and hands off — it never mutates the result
+                # for confidentiality reasons.
                 return next_call(new_args)
             finally:
                 _restore_injected_secrets(cv_token)
@@ -476,20 +482,29 @@ def _redact_in_result(result: Any) -> Any:
 
 
 def _redact_task_secrets(task_id: str, result: Any,
-                         values: list[str] | None = None) -> None:
-    """Remove freshly injected placeholder secrets from *result* (in place).
+                         values: list[str] | None = None) -> Any:
+    """Remove freshly injected placeholder secrets from *result*.
 
     SEC-01 (v0.5.4): refactored from "pop the per-task store" to a helper
     that redacts an EXPLICIT set of plaintext values (exact replacement with
     ``[REDACTED]``), called from the authoritative `transform_tool_result`
     redactor. When *values* is None it falls back to peeking the task-keyed
     store (never popping — the middleware's finally block owns forgetting).
-    Pure in-memory string replacement: no I/O, no subprocesses, no network.
+    Containers (dict / list / MutableMapping / writable ``.output`` objects)
+    are scrubbed in place; a plain ``str`` result cannot be mutated, so the
+    sanitized copy is RETURNED (the transformer returns it — that return
+    value is what reaches the model). Pure in-memory string replacement:
+    no I/O, no subprocesses, no network.
     """
     if values is None:
         values = peek_task_secrets(task_id)
     if not values:
-        return
+        return result
+    if isinstance(result, str):
+        text = result
+        for v in values:
+            text = text.replace(v, "[REDACTED]")
+        return text
 
     def _scrub(obj: Any) -> Any:
         if isinstance(obj, str):
@@ -529,6 +544,7 @@ def _redact_task_secrets(task_id: str, result: Any,
             result.output = out
         except Exception:  # pragma: no cover - immutable result objects
             pass
+    return result
 
 
 def make_result_redactor(auth: AuthManager,
@@ -604,9 +620,10 @@ def make_result_redactor(auth: AuthManager,
         values = list(cv_values) if cv_values else peek_task_secrets(exec_id)
         # 2) exact plaintext replacement of every injected value with the
         #    literal [REDACTED] (shared building block; in-place for
-        #    containers / writable .output objects).
+        #    containers / writable .output objects, returned copy for plain
+        #    str results).
         if values:
-            _redact_task_secrets(exec_id, result, values=values)
+            result = _redact_task_secrets(exec_id, result, values=values)
         # 3) global RedactingFilter pass (bootstrap secrets, session keys,
         #    tracked write payloads) — replaces the global redaction
         #    previously done in post_tool_call. String results produce a NEW
