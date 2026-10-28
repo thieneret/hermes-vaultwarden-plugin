@@ -169,20 +169,6 @@ class UnsupportedBwVersionError(VaultwardenError):
         )
 
 
-# ---------------------------------------------------- v0.5.8 error taxonomy
-class SecurityError(PluginError):
-    """Fail-closed security validation failure (e.g. the secrets directory
-    is a symlink, owned by another user, or not exactly mode 0700).
-
-    Raised from hooks._secrets_dir() / _validate_secrets_dir(): the plugin
-    REFUSES to load or inject rather than falling back to an insecure path.
-    Messages must never contain secret material.
-    """
-
-    code = "SECURITY_ERROR"
-    recoverable = False
-
-
 def error_response(exc: Exception) -> dict:
     """Convert any exception into the standard, secret-free error dict."""
     if isinstance(exc, VaultwardenError):
