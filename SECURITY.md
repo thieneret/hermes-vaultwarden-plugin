@@ -254,11 +254,12 @@ All CI checks (pytest, ruff) are **blocking** — a failing check prevents merge
 -   All CI checks (pytest, ruff) are **blocking** — a failing check prevents
     merge. (VWP-15)
 
-## Audit Status (20/20 VWP + SEC-01 complete)
+## Audit Status (20/20 VWP + SEC-01 + SEC-03 complete)
 
 | ID | Description | Implemented |
 |-----|-------------|-------------|
 | SEC-01 | Result redaction via authoritative `transform_tool_result` hook (ContextVar handoff; `post_tool_call` reduced to observer-only; fail-closed load without the hook) | v0.5.4 |
+| SEC-03 | Fail-closed policy for local terminal backend (`allow_insecure_local_backend` opt-in; plugin refuses to load on `local`/unset backend by default) | v0.5.5 |
 | VWP-01 | Binary path pinning (hash verification = operator responsibility) | v0.4.7 |
 | VWP-02 | SSH socket path restriction (dev-controlled env vars) | v0.4.6 |
 | VWP-03 | Middleware fail-closed registration | v0.4.3 |
