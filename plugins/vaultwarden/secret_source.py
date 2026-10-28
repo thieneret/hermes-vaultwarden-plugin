@@ -68,7 +68,7 @@ class VaultwardenSecretSource(SecretSourceABC):
                 value = _field_value(item, str(m.get("field", "password")),
                                      m.get("custom_field_name"))
                 if value:
-                    key = str(m.get("env") or f"VW_{m['item_id'][:8]}")
+                    key = str(m.get("env") or f"VW_{m['item_id']}")
                     out[key] = value
                     # Register with redactor for log safety
                     from .security import get_redacting_filter
