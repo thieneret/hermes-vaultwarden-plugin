@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.5.7**
+**Current version: v0.5.8**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without
 > traditional manual code review of every line. Use at your own
@@ -418,6 +418,7 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | Middleware fail-closed | If placeholder-injection middleware cannot be registered, the plugin refuses to load. No silent fallback without secret protection |
 | File-injected placeholder injection | Secrets are written to a chmod 600 temp file (mkstemp, atomic) in a dedicated chmod 700 directory under `$XDG_RUNTIME_DIR` (`vw-secrets/`, typically tmpfs). The rewritten command only ever references `$(< path)` — the raw secret never enters the command string, argv, shell history, or logs. Temp files are deleted in a `finally` block even if the command fails |
 | Atomic placeholder resolution | If a command contains the same placeholder multiple times, it is resolved exactly once via `consume_and_resolve()`, creating a single temp file per unique token. Prevents sequential consumption hazards and guarantees single-use semantics even on repeated references |
+| Strict directory validation & cleanup observability | `_secrets_dir()` enforces non-symlink, correct ownership, and exact `0700` permissions (fail-closed). Temp file deletions are wrapped in `try/except` to log sanitized warnings on failure, preventing silent secret leaks on disk. Stale cleanup respects `placeholder_ttl_seconds`. |
 
 See SECURITY.md for the full threat model and all security controls.
 

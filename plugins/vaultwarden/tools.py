@@ -35,6 +35,39 @@ Handler = Callable[..., str]
 
 
 # --------------------------------------------------------------- helpers
+def _remove_quietly(path: str, label: str) -> None:
+    """Delete *path*, never raising; log a sanitized WARNING on failure.
+
+    v0.5.8 cleanup observability: leftover secret material must be visible
+    to operators instead of failing silently. The path itself is safe to
+    log (generated temp name); file CONTENTS are NEVER read or logged.
+    ENOENT means the file is already gone — nothing leaked, so it stays
+    quiet.
+    """
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("Failed to remove %s %s: %s", label, path, exc)
+
+
+def _rmtree_quietly(dir_path: str) -> None:
+    """Remove keypair temp dir *dir_path*; warn (sanitized) on failure.
+
+    v0.5.8: replaces the silent ``shutil.rmtree(..., ignore_errors=True)``
+    pattern — a failed removal leaves the generated PRIVATE KEY on disk,
+    which operators must see in the logs (path + error only).
+    """
+    try:
+        shutil.rmtree(dir_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("Failed to remove temp key directory %s: %s",
+                    dir_path, exc)
+
+
 def _ssh_base_env(extra: dict | None = None) -> dict:
     """Minimal, isolated environment for SSH subprocess calls.
 
@@ -318,10 +351,8 @@ def _generate_ssh_keypair(
                 fingerprint = parts[1]
         return tmpdir, key_path, public_key, fingerprint
     finally:
-        try:
-            os.unlink(askpass_path)
-        except OSError:
-            pass
+        # v0.5.8 cleanup observability: sanitized WARNING on failure.
+        _remove_quietly(askpass_path, "askpass helper")
 
 
 def _item_type_name(item: dict) -> str:
@@ -991,8 +1022,9 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                     "passphrase_generated": True,
                 }
             finally:
+                # v0.5.8 cleanup observability: sanitized WARNING on failure.
                 if tmpdir is not None:
-                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    _rmtree_quietly(tmpdir)
                 redactor.forget_secret(passphrase)
 
         # Upload mode: resolve the passphrase from exactly one channel.
@@ -1151,8 +1183,9 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                     "passphrase_rotated": True,
                 }
             finally:
+                # v0.5.8 cleanup observability: sanitized WARNING on failure.
                 if tmpdir is not None:
-                    shutil.rmtree(tmpdir, ignore_errors=True)
+                    _rmtree_quietly(tmpdir)
                 redactor.forget_secret(passphrase)
 
         # Non-generate update path (upload semantics).
@@ -1323,17 +1356,13 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
             }
         finally:
             # Clean up temp key file
+            # v0.5.8 cleanup observability: sanitized WARNING on failure —
+            # leftover private-key material on disk must never be silent.
             if key_path and os.path.exists(key_path):
-                try:
-                    os.unlink(key_path)
-                except OSError:
-                    pass
+                _remove_quietly(key_path, "temp SSH key file")
             # Clean up askpass script
             if askpass_path and os.path.exists(askpass_path):
-                try:
-                    os.unlink(askpass_path)
-                except OSError:
-                    pass
+                _remove_quietly(askpass_path, "askpass helper")
     return _guard(run)
 
 

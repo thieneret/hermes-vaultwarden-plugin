@@ -73,7 +73,10 @@ def register(ctx: Any) -> bool:
 
     # VWP-20 (v0.4.5): cleanup stale temp files from previous crashed runs
     # (SIGKILL/SIGTERM where the middleware's finally block did not run).
-    _cleanup_stale_secrets()
+    # v0.5.8: the TTL now respects the configured placeholder_ttl_seconds
+    # instead of a hardcoded lifetime — any file older than the registry
+    # TTL is stale by definition.
+    _cleanup_stale_secrets(ttl_seconds=config.placeholder_ttl_seconds)
 
     # VWP-02 (v0.4.6): remove stale ssh-agent sockets (file exists but no
     # agent running) at the developer-controlled socket locations.
