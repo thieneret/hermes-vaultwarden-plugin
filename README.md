@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.5.6**
+**Current version: v0.5.7**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without
 > traditional manual code review of every line. Use at your own
@@ -8,7 +8,7 @@
 >>
 > ⚠️ This is my first "vibe-coded" program, intended primarily for my own use. Use it entirely at your own risk!
 >
-> ⚠️ AI audit results: [Qwen](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20Qwen3.8-max.md) [ChatGPT](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20ChatGPT.md)
+> ⚠️ AI audit results: [v0.3.2-Qwen](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20Qwen3.8-max.md) [v0.3.2-ChatGPT](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20ChatGPT.md) [v0.5.2-Qwen](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/eda5876f048916f9506a9f30b2e12ade2b0a017d/audit/v0.5.2%20audit%20by%20Qwen3.8-max.md) [v0.5.2-ChatGPT](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/eda5876f048916f9506a9f30b2e12ade2b0a017d/audit/v0.5.2%20audit%20by%20ChatGPT.md)
 >
 > ⚠️ **Security:** See [SECURITY.md](SECURITY.md) for the full threat model
 > and security guarantees.
