@@ -55,6 +55,42 @@ def register_hook_if_available(ctx: Any, hook_name: str, hook_fn: Any) -> bool:
         log.error("register_hook(%r) failed: %s", hook_name, exc)
         return False
 
+
+#: The single hook name whose presence is MANDATORY since SEC-01 (v0.5.4).
+TRANSFORM_TOOL_RESULT_HOOK = "transform_tool_result"
+
+
+def supports_transform_tool_result(ctx: Any) -> bool:
+    """SEC-01 (v0.5.4): capability detection for the authoritative result
+    redaction hook.
+
+    Hermes documents ``transform_tool_result`` as the ONLY hook that may
+    return a replacement tool result string/object BEFORE it is passed to
+    the model — i.e. the only guaranteed confidentiality boundary for
+    injected secrets. Older Hermes builds do not expose it; on such hosts
+    the plugin must refuse to load (fail-closed) instead of silently
+    falling back to the observer-only ``post_tool_call`` redaction model
+    that audit finding SEC-01 (HIGH) identified.
+
+    Detection follows the VWP-06 rule: explicit ``hasattr()`` capability
+    check, NOT exception-based probing. A host exposes the hook either as a
+    bound attribute/method on the context, or by declaring the hook name in
+    a ``supported_hooks`` collection (some Hermes builds ship a static list
+    of valid hook names instead of attributes).
+    """
+    if not callable(getattr(ctx, "register_hook", None)):
+        return False
+    if hasattr(ctx, TRANSFORM_TOOL_RESULT_HOOK):
+        return True
+    # Test doubles / stand-in contexts may opt in explicitly instead of
+    # exposing the hook as an attribute or a supported_hooks collection.
+    if getattr(ctx, "supports_transform_tool_result", False):
+        return True
+    declared = getattr(ctx, "supported_hooks", None)
+    if isinstance(declared, (list, tuple, set, frozenset)):
+        return TRANSFORM_TOOL_RESULT_HOOK in set(declared)
+    return False
+
 # ── Config loading compatibility ─────────────────────────────────────
 
 

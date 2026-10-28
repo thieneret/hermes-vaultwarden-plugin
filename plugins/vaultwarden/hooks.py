@@ -64,7 +64,7 @@ from typing import Any, Callable
 from . import errors
 from .auth import AuthManager
 from .placeholders import PlaceholderRegistry
-from .security import get_logger, get_redacting_filter
+from .security import get_logger, get_redacting_filter, RedactingFilter
 from .tools import _field_value
 
 log = get_logger("hooks")
@@ -173,7 +173,8 @@ def _cleanup_stale_sockets():
 
 def _inject_one(token: str, auth: AuthManager, registry: PlaceholderRegistry,
                 secrets_dir: str, temp_files: list[str],
-                task_id: str = "") -> str | None:
+                task_id: str = "",
+                injected_values_out: list[str] | None = None) -> str | None:
     """Resolve one placeholder suffix; return the temp-file path or None.
 
     The middleware has ALREADY consumed the token (single-use marking happens
@@ -183,6 +184,14 @@ def _inject_one(token: str, auth: AuthManager, registry: PlaceholderRegistry,
     tokens, or items whose field went empty. The real secret is ONLY ever
     written to the returned temp file (mkstemp: atomic, O_EXCL, chmod 600) —
     never into the command string.
+
+    SEC-01 (v0.5.4): when *injected_values_out* is provided the plaintext is
+    collected there LOCALLY (inside the middleware frame) instead of being
+    published into the ContextVar here — the middleware publishes the exact
+    set into the ContextVar handoff channel immediately before next_call and
+    restores it in its finally block. record_task_secret still keeps the
+    task-keyed dict fallback in sync for hosts that dispatch hooks on a
+    different context/thread.
     """
     placeholder = f"__VW_SECRET_{token}__"   # registry form (no $)
     entry = registry.peek(placeholder)
@@ -216,10 +225,21 @@ def _inject_one(token: str, auth: AuthManager, registry: PlaceholderRegistry,
     temp_files.append(path)
     # Register the value so it gets scrubbed from any log line / output echo.
     get_redacting_filter().register_secret(value)
-    # v0.1.4 (FAIL-6): also record the plaintext per-task so post_tool_call can
-    # redact it from this specific tool call's output even when the global
-    # filter state was reset by another component in between.
-    record_task_secret(task_id, value)
+    # v0.1.4 (FAIL-6): also record the plaintext per-task so the redaction
+    # layer can scrub it from this specific tool call's output even when the
+    # global filter state was reset by another component in between.
+    # SEC-01 (v0.5.4): the consumer is now the authoritative
+    # transform_tool_result redactor (make_result_redactor). When called from
+    # the middleware, *injected_values_out* collects the plaintext locally;
+    # the middleware publishes/restores the ContextVar handoff around
+    # next_call itself. Without that channel (legacy callers) fall back to
+    # record_task_secret, which keeps both stores in sync.
+    if injected_values_out is not None:
+        injected_values_out.append(value)
+        with _INJECTED_LOCK:
+            _INJECTED_SECRETS.setdefault(task_id or "", []).append(value)
+    else:
+        record_task_secret(task_id, value)
     return path
 
 
@@ -283,6 +303,7 @@ def make_placeholder_resolver(auth: AuthManager,
 
         secrets_dir = _secrets_dir()
         temp_files: list[str] = []
+        injected_values: list[str] = []
         new_args = dict(args)
         resolved_any = False
         try:
@@ -291,7 +312,7 @@ def make_placeholder_resolver(auth: AuthManager,
                 new_command = command
                 for m in _VW_SECRET_CMD_RE.finditer(command):
                     path = _inject_one(m.group(1), auth, registry, secrets_dir,
-                                       temp_files, task_id)
+                                       temp_files, task_id, injected_values)
                     if path is None:
                         continue  # expired/unknown/already-used -> leave as-is
                     new_command = new_command.replace(m.group(0), f"$(< {path})")
@@ -303,7 +324,17 @@ def make_placeholder_resolver(auth: AuthManager,
                 return next_call(args)
             log.debug("Injected %d secret temp file(s) for %s.",
                       len(temp_files), tool_name)
-            return next_call(new_args)
+            # SEC-01 (v0.5.4) handoff: publish the exact plaintext set that is
+            # about to enter the shell into the ContextVar IMMEDIATELY BEFORE
+            # the tool runs, so the authoritative transform_tool_result
+            # redactor can scrub echoes of it from the result. The finally
+            # block below restores the previous context value — no secret
+            # values persist across turns.
+            cv_token = _publish_injected_secrets(injected_values)
+            try:
+                return next_call(new_args)
+            finally:
+                _restore_injected_secrets(cv_token)
         finally:
             # Cleanup temp files — MUST run even if the command fails/times out
             for path in temp_files:
@@ -311,6 +342,11 @@ def make_placeholder_resolver(auth: AuthManager,
                     os.unlink(path)
                 except OSError:
                     pass
+            # SEC-01 (v0.5.4): forget this execution's per-task plaintext set
+            # too (the ContextVar was already restored above). The middleware
+            # is the single OWNER that forgets injected values — neither the
+            # transformer nor the observer pops them.
+            take_task_secrets(task_id)
 
     return vaultwarden_inject_secrets
 
@@ -360,6 +396,28 @@ def record_task_secret(task_id: str, value: str) -> None:
     # current execution, even when no task id is threaded through Hermes.
     cur = _CURRENT_INJECTED_SECRETS.get() or frozenset()
     _CURRENT_INJECTED_SECRETS.set(cur | {value})
+
+
+def _publish_injected_secrets(values: list[str]) -> contextvars.Token:
+    """SEC-01 (v0.5.4): publish the per-execution injected-secret set into
+    the ContextVar handoff channel IMMEDIATELY BEFORE the tool runs.
+
+    Returns the ContextVar token so the caller can restore the PREVIOUS
+    context value in its ``finally`` block via
+    :func:`_restore_injected_secrets`. Restoring by token (instead of
+    blanket-clearing) keeps the store correctly nested when middlewares or
+    tools run concurrently inside one event loop, while guaranteeing that
+    plaintext values NEVER outlive the tool execution they belong to.
+    """
+    return _CURRENT_INJECTED_SECRETS.set(frozenset(v for v in values if v))
+
+
+def _restore_injected_secrets(token: "contextvars.Token[frozenset[str] | None]") -> None:
+    """Restore the previous injected-secrets context (middleware finally)."""
+    try:
+        _CURRENT_INJECTED_SECRETS.reset(token)
+    except ValueError:  # pragma: no cover - token from a different context
+        _CURRENT_INJECTED_SECRETS.set(None)
 
 
 def take_task_secrets(task_id: str) -> list[str]:
@@ -506,6 +564,31 @@ def make_result_redactor(auth: AuthManager,
     no disk I/O.
     """
 
+    def _scrub_str(text: str, values: list[str]) -> str:
+        # Exact plaintext replacement first (per-execution injected set)...
+        for v in values:
+            text = text.replace(v, "[REDACTED]")
+        # ...then the GLOBAL RedactingFilter pass (bootstrap secrets,
+        # session keys, tracked write payloads). Both entry points share
+        # this single helper — no duplicate redaction logic (SEC-01).
+        return get_redacting_filter().redact(text)
+
+    def _transform(obj: Any, values: list[str]) -> Any:
+        """Recursively rebuild str/dict/list containers with scrubbed leaves."""
+        if isinstance(obj, str):
+            return _scrub_str(obj, values)
+        if isinstance(obj, dict):
+            out: dict[Any, Any] = {}
+            for k, v in obj.items():
+                # Non-string scalars cannot contain plaintext secrets —
+                # leave them untouched (matches the historical behaviour).
+                out[k] = (_transform(v, values)
+                          if not isinstance(v, (int, float, bool)) else v)
+            return out
+        if isinstance(obj, list):
+            return [_transform(v, values) for v in obj]
+        return obj
+
     def vaultwarden_transform_tool_result(tool_name: str = "", result: Any = None,
                                           task_id: str = "", turn_id: str = "",
                                           **kwargs: Any) -> Any:
@@ -519,21 +602,35 @@ def make_result_redactor(auth: AuthManager,
         #    block owns forgetting the values.
         cv_values = _CURRENT_INJECTED_SECRETS.get()
         values = list(cv_values) if cv_values else peek_task_secrets(exec_id)
-        # 2) exact plaintext replacement with [REDACTED] (in place for
-        #    containers / .output objects, new object for plain strings).
+        # 2) exact plaintext replacement of every injected value with the
+        #    literal [REDACTED] (shared building block; in-place for
+        #    containers / writable .output objects).
         if values:
             _redact_task_secrets(exec_id, result, values=values)
         # 3) global RedactingFilter pass (bootstrap secrets, session keys,
         #    tracked write payloads) — replaces the global redaction
-        #    previously done in post_tool_call.
+        #    previously done in post_tool_call. String results produce a NEW
+        #    scrubbed string; dict/list results are rebuilt/merged in place;
+        #    other shapes pass through unchanged unless they carry a
+        #    writable .output.
         scrubbed = _redact_in_result(result)
+        # 4) THE authoritative part: whatever we RETURN becomes the result
+        #    delivered to the conversation/model context.
+        if isinstance(scrubbed, str) and isinstance(result, (dict, list)):
+            # The global filter found secret material inside a container's
+            # string leaves — rewrite every leaf through the same shared
+            # string-scrubbing path so the returned container is clean too.
+            fixed = _transform(result, [])
+            if isinstance(result, MutableMapping) and isinstance(fixed, dict):
+                result.clear()
+                result.update(fixed)
+                return result
+            return fixed
         if isinstance(result, MutableMapping) and isinstance(scrubbed, dict) \
                 and scrubbed is not result:
             result.clear()
             result.update(scrubbed)
             return result
-        # 4) THE authoritative part: whatever we return becomes the result
-        #    delivered to the conversation/model context.
         return scrubbed
 
     return vaultwarden_transform_tool_result
