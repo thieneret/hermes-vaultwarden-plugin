@@ -98,78 +98,12 @@ _DEFAULT_TERMINAL_TOOLS = {
 _DEFAULT_COMMAND_KEYS = ("command", "cmd", "input", "script", "code")
 
 
-#: Default stale-file lifetime (seconds) used when no configured
-#: ``placeholder_ttl_seconds`` value is supplied to the startup cleanup.
-#: Mirrors the config default (config.placeholder_ttl_seconds == 300) so
-#: callers that predate TTL wiring keep working unchanged.
-_DEFAULT_STALE_TTL_SECONDS = 300
-
-
-def _validate_secrets_dir(d: str) -> None:
-    """Strictly validate the secrets directory *d* (fail-closed).
-
-    Defense-in-depth checks enforced on EVERY use of the directory, after
-    creation/resolution:
-
-    1. symlink: the directory itself must NOT be a symlink (a redirected
-       secrets dir would let a local attacker move secret material);
-    2. ownership: ``st_uid`` must be the current effective user or root;
-    3. permissions: the mode (masked with ``0o777``) must be EXACTLY
-       ``0o700``. A drifted mode is repaired once via ``chmod 0o700``; if
-       the repair fails or the resulting mode is still not ``0o700``, the
-       check fails closed.
-
-    Raises:
-        errors.SecurityError: on ANY validation failure. There is NO
-        fallback path — an insecure secrets directory must abort plugin
-        load / middleware registration instead of silently writing secret
-        material into an attacker-controlled location.
-    """
-    if os.path.islink(d):
-        raise errors.SecurityError(
-            "Secrets directory cannot be a symlink",
-            suggestion=f"Remove the symlink at {d!r} and recreate it as a "
-                       "real directory owned by the agent user (mode 0700).")
-    try:
-        st = os.stat(d)
-    except OSError as exc:
-        raise errors.SecurityError(
-            f"Cannot stat secrets directory: {type(exc).__name__}",
-            suggestion=f"Ensure {d!r} exists and is accessible.") from exc
-    if st.st_uid not in (0, os.geteuid()):
-        raise errors.SecurityError(
-            f"Secrets directory has unexpected owner uid {st.st_uid}; it "
-            "must be owned by root or the current effective user.",
-            suggestion=f"Run: chown root {d!r} (or remove the directory and "
-                       "let the plugin recreate it).")
-    if st.st_mode & 0o777 != 0o700:
-        # Attempt a one-shot repair, then re-validate — fail closed if the
-        # mode still drifts (chmod refused, filesystem quirks, races).
-        try:
-            os.chmod(d, 0o700)
-        except OSError as exc:
-            raise errors.SecurityError(
-                f"Cannot enforce 0700 on secrets directory: "
-                f"{type(exc).__name__}",
-                suggestion=f"Run: chmod 700 {d!r}") from exc
-        if os.stat(d).st_mode & 0o777 != 0o700:
-            raise errors.SecurityError(
-                "Secrets directory mode is not exactly 0700 after chmod.")
-
-
 def _secrets_dir() -> str:
     """Return the dedicated secrets directory, creating it if needed.
 
     Prefers $XDG_RUNTIME_DIR/vw-secrets (typically tmpfs/RAM-backed).
     Falls back to /tmp/vw-secrets-<uid> if XDG_RUNTIME_DIR is unavailable.
     The directory is chmod 700 so no other user can list its contents.
-
-    v0.5.8: STRICT VALIDATION (fail-closed defense-in-depth). Before the
-    resolved/created directory is returned it is validated by
-    :func:`_validate_secrets_dir`: non-symlink, owned by the current
-    effective user (or root), and mode EXACTLY 0700. Any violation raises
-    ``errors.SecurityError`` — the plugin refuses to load / inject rather
-    than falling back to an insecure path.
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR", "")
     if xdg and os.path.isdir(xdg) and os.access(xdg, os.W_OK):
@@ -178,56 +112,35 @@ def _secrets_dir() -> str:
         d = os.path.join(tempfile.gettempdir(), f"vw-secrets-{os.getuid()}")
     os.makedirs(d, mode=0o700, exist_ok=True)
     os.chmod(d, 0o700)
-    _validate_secrets_dir(d)
     return d
 
 
-def _cleanup_stale_secrets(ttl_seconds: int | None = None):
-    """Remove temp files older than *ttl_seconds*.
+def _cleanup_stale_secrets():
+    """Remove temp files older than the placeholder TTL (300s).
 
     Handles files left behind by a previous SIGKILL/SIGTERM where the
-    middleware's finally block did not run. The TTL MUST match the
-    configured placeholder registry TTL (``placeholder_ttl_seconds``) —
-    any file older than that is stale and should be removed. When the
-    caller supplies no value, the config-default lifetime (300s) applies.
-
-    Deletion rule: a regular file whose age
-    ``time.time() - os.stat(path).st_mtime`` exceeds *ttl_seconds* is
-    deleted. v0.5.8: deletions are OBSERVABLE — a failed unlink emits a
-    sanitized WARNING (path + error only, never file contents), so
-    operators learn about secret material left on disk instead of the
-    failure being swallowed.
+    middleware's finally block did not run. The TTL matches the placeholder
+    registry TTL — any file older than that is stale and should be removed.
 
     Called at plugin startup (in register()) to ensure stale files are
     cleaned up even if the previous process crashed.
     """
-    if ttl_seconds is None or ttl_seconds <= 0:
-        ttl_seconds = _DEFAULT_STALE_TTL_SECONDS
     try:
         secrets_dir = _secrets_dir()
-    except (OSError, errors.VaultwardenError):
-        # Cannot create/access/validate the dir — the strict validation
-        # inside _secrets_dir() already surfaces loudly wherever it is
-        # enforced; startup stale cleanup stays best-effort and skips.
-        return
+    except OSError:
+        return  # cannot create/access the dir, skip cleanup
 
     if not os.path.isdir(secrets_dir):
         return
 
-    now = time.time()
+    cutoff = time.time() - 300  # placeholder TTL (5 minutes)
     for entry in os.scandir(secrets_dir):
         try:
-            if entry.is_file() and (now - entry.stat().st_mtime) > ttl_seconds:
-                try:
-                    os.unlink(entry.path)
-                    log.info("cleaned stale secret file: %s", entry.name)
-                except OSError as exc:
-                    # Sanitized: path is safe (vw_<token>_XXXXXX filename);
-                    # NEVER read or log the file contents.
-                    log.warning("Failed to remove stale secret file %s: %s",
-                                entry.path, exc)
+            if entry.is_file() and entry.stat().st_mtime < cutoff:
+                os.unlink(entry.path)
+                log.info("cleaned stale secret file: %s", entry.name)
         except OSError:
-            pass  # best-effort cleanup (stat/race failures are transient)
+            pass  # best-effort cleanup
 
 
 def _cleanup_stale_sockets():
@@ -485,17 +398,12 @@ def make_placeholder_resolver(auth: AuthManager,
             finally:
                 _restore_injected_secrets(cv_token)
         finally:
-            # Cleanup temp files — MUST run even if the command fails/times
-            # out. v0.5.8 OBSERVABLE CLEANUP: a failed deletion is logged as
-            # a sanitized WARNING (path + error only). The path itself is
-            # safe to log (vw_<token>_XXXXXX filename); the file CONTENTS
-            # (the resolved secret) are NEVER read or logged. Swallowing the
-            # failure silently would hide leftover secret material on disk.
+            # Cleanup temp files — MUST run even if the command fails/times out
             for path in temp_files:
                 try:
                     os.unlink(path)
-                except OSError as exc:
-                    log.warning("Failed to remove temp file %s: %s", path, exc)
+                except OSError:
+                    pass
             # SEC-01 (v0.5.4): forget this execution's per-task plaintext set
             # too (the ContextVar was already restored above). The middleware
             # is the single OWNER that forgets injected values — neither the
