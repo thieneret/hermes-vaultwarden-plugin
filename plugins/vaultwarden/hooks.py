@@ -338,7 +338,14 @@ def make_placeholder_resolver(auth: AuthManager,
                 # task-store handoff established here. The middleware itself
                 # only injects and hands off — it never mutates the result
                 # for confidentiality reasons.
-                return next_call(new_args)
+                #
+                # IMPORTANT: bind the result to a name and return THAT exact
+                # object (never call next_call twice). Hermes dispatches
+                # transform_tool_result on the object returned from tool
+                # execution; a second invocation would hand the redactor a
+                # different instance than the one the shell actually ran.
+                result = next_call(new_args)
+                return result
             finally:
                 _restore_injected_secrets(cv_token)
         finally:

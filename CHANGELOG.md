@@ -5,6 +5,28 @@ Author: **thieneret**
 
 ---
 
+## [0.5.4] - 2026-10-28
+
+v0.5.4 (SEC-01) — migrate result redaction to authoritative transform_tool_result hook
+- BREAKING (host compatibility): plugin now requires a Hermes build that
+  exposes the `transform_tool_result` plugin hook; refuses to load otherwise
+  (fail-closed).
+- Security: confidentiality boundary for injected secrets moved from the
+  `post_tool_call` observer to the `transform_tool_result` transformer, which
+  Hermes documents as the authoritative result-rewriting hook.
+- New `make_result_redactor` factory in hooks.py performs exact plaintext
+  replacement with `[REDACTED]` on the result before it reaches the model,
+  covering both per-task injected secrets and the global RedactingFilter set.
+- `post_tool_call` reduced to observer-only duties (placeholder cleanup,
+  metrics, secret-free error surfacing); no longer mutates results for
+  confidentiality reasons.
+- ContextVar-based handoff carries the per-execution secret set from the
+  tool_execution middleware into the transformer; cleared in a finally block
+  so no secret values persist across turns.
+- Bump version to 0.5.4.
+
+---
+
 ## [0.5.3] - 2026-10-28
 
 ### Improvements

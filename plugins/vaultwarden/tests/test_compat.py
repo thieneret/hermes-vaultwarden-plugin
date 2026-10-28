@@ -317,7 +317,8 @@ def test_register_tool_compat_used_by_register(fake_bw, appdata,
     assert vaultwarden.register(ctx) is True
     assert len(ctx.tools) == 12
     assert all(t["check_fn"] is not None for t in ctx.tools)
-    assert [h[0] for h in ctx.hooks] == ["post_tool_call", "on_session_end"]
+    assert [h[0] for h in ctx.hooks] == ["transform_tool_result", "post_tool_call",
+                       "on_session_end"]
 
 
 def test_config_native_only_through_compat(monkeypatch, tmp_path):

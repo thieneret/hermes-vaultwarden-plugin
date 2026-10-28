@@ -600,3 +600,88 @@ def test_register_loads_secrets_without_touching_env(monkeypatch, tmp_path, fake
     assert res["status"]["auth_state"] == "unlocked"
     bwdata = home / "plugins" / "vaultwarden" / ".bw-data"
     assert bwdata.exists() and stat.S_IMODE(os.stat(bwdata).st_mode) == 0o700
+
+
+# --------------------------------------------- SEC-01 (v0.5.4) redaction hook
+def test_transform_tool_result_redacts_echoed_secret(monkeypatch, tmp_path,
+                                                     fake_bw):
+    """SEC-01 integration: simulate the Hermes hook pipeline.
+
+    tool_execution middleware injects a temp-file secret -> the command
+    echoes it -> transform_tool_result must return a result whose text is
+    scrubbed ([REDACTED]) BEFORE it reaches the model. post_tool_call is
+    observer-only and never mutates results for confidentiality reasons.
+    """
+    from vaultwarden.tests.test_integration import _dict_tools, _register_ok
+
+    ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
+    assert ok is True
+    hooks = dict(ctx.hooks)
+    assert "transform_tool_result" in hooks      # authoritative hook landed
+    mw = dict(ctx.middleware)["tool_execution"]
+    transform = hooks["transform_tool_result"]
+    post = hooks["post_tool_call"]
+    tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
+
+    ref = tools["vaultwarden_get_secret_ref"](
+        {"item_id": "aaaa1111-0000-0000-0000-000000000001", "field": "password"})
+    token = ref["placeholder"]
+
+    echoed = {"output": "printf ran: sup3r-s3cret-pg!\n"}
+
+    def next_call(a):
+        # pretend the shell expanded $(< tmpfile) and echoed the plaintext
+        return echoed
+
+    result = mw("terminal", {"command": f"printf '%s\\n' \"$(<{token})\""},
+                None, next_call, task_id="sec01-task")
+    assert result is echoed                       # middleware never mutates
+
+    # observer-only: post_tool_call must NOT scrub anything...
+    post("terminal", {}, result, task_id="sec01-task")
+    assert "sup3r-s3cret-pg!" in result["output"]
+
+    # ...the transformer does, and its RETURN VALUE is authoritative.
+    final = transform("terminal", result, task_id="sec01-task")
+    assert "sup3r-s3cret-pg!" not in final["output"]
+    assert "[REDACTED]" in final["output"]
+
+
+def test_transform_tool_result_empty_handoff_still_global_filter(
+        auth_manager, registry):
+    """No per-execution secrets -> result passes through RedactingFilter only."""
+    from vaultwarden.hooks import make_result_redactor
+    from vaultwarden.security import get_redacting_filter
+
+    get_redacting_filter().register_secret("bootstrap-global-secret")
+    redact = make_result_redactor(auth_manager, registry)
+    out = redact("terminal", {"data": "leak bootstrap-global-secret here"},
+                 task_id="unknown-task")
+    assert "bootstrap-global-secret" not in str(out)
+    assert "[REDACTED]" in str(out)
+    # unrelated result untouched (no secrets anywhere)
+    plain = redact("terminal", {"data": "nothing to see"}, task_id="t2")
+    assert plain == {"data": "nothing to see"}
+
+
+def test_register_fail_closed_without_transform_hook(monkeypatch, tmp_path,
+                                                     fake_bw, caplog):
+    """SEC-01 fail-closed: hosts without transform_tool_result are refused."""
+    import vaultwarden
+    from vaultwarden.tests.test_integration import _write_secrets_yaml
+    from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
+
+    _write_secrets_yaml(tmp_path)
+    monkeypatch.delenv("BW_CLI_PATH", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
+                           "bw_cli_path": fake_bw})
+    # simulate an OLDER Hermes build: no declared capability, no attribute
+    ctx.supported_hooks = frozenset({"post_tool_call", "on_session_end"})
+    with caplog.at_level(logging.ERROR):
+        ok = vaultwarden.register(ctx)
+    assert ok is False
+    assert "transform_tool_result" in caplog.text
+    # nothing was registered on the refused load path beyond tools/middleware
+    assert all(kind != "transform_tool_result" for kind, _ in ctx.hooks)
