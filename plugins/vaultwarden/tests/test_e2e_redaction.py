@@ -117,24 +117,26 @@ def test_e2e_leaky_cat_redaction(auth_manager: AuthManager, registry: Placeholde
     hook must scrub it down to ``[REDACTED]`` before the result reaches the
     model, and the temp file must be gone afterwards.
     """
-    # Keep the global RedactingFilter out of the picture: this test must
-    # prove the SEC-01 per-execution handoff (ContextVar / task store) does
-    # the redaction, NOT the globally registered secret set. The middleware
-    # registers the plaintext globally during injection; we forget it again
-    # as soon as the pipeline run is over (monkeypatch finalizes this too).
-    from vaultwarden.security import get_redacting_filter
+    # Isolate the global RedactingFilter for the duration of this test: the
+    # middleware registers the injected plaintext globally (hooks.py), so a
+    # fresh filter instance keeps the E2E secret from leaking into unrelated
+    # suites while still participating in the transform pass exactly like a
+    # production host would. monkeypatch restores the singleton afterwards.
+    from vaultwarden.security import RedactingFilter, get_redacting_filter
 
-    filter_obj = get_redacting_filter()
-    monkeypatch.setattr(
-        filter_obj, "register_secret", lambda value: None, raising=False)
-    assert LEAKY_CAT_SECRET not in filter_obj.snapshot_secrets()
+    assert LEAKY_CAT_SECRET not in get_redacting_filter().snapshot_secrets()
 
     def _forget_leaky_secret() -> None:
-        # Drop any leftover global registration of the E2E plaintext so it
-        # can never influence other tests (the register_secret no-op above
-        # already prevents NEW registrations during this test).
-        filter_obj.forget_secret(LEAKY_CAT_SECRET)
+        # Belt-and-braces: drop any leftover global registration of the E2E
+        # plaintext so it can never influence other tests.
+        get_redacting_filter().forget_secret(LEAKY_CAT_SECRET)
     request.addfinalizer(_forget_leaky_secret)
+
+    isolated_filter = RedactingFilter()
+    monkeypatch.setattr("vaultwarden.security._shared_filter", isolated_filter,
+                        raising=True)
+    monkeypatch.setattr("vaultwarden.hooks.get_redacting_filter",
+                        lambda: isolated_filter, raising=True)
 
     # Isolate the secrets dir on tmp_path (hooks._secrets_dir honours
     # XDG_RUNTIME_DIR; mode 700 satisfies the strict v0.5.8 validation).

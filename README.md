@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.5.8**
+**Current version: v0.5.9**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without
 > traditional manual code review of every line. Use at your own
@@ -452,6 +452,14 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 ```
 pytest plugins/vaultwarden/tests/ -q
 ```
+
+Current suite: **440 tests** — including positive-control suites for:
+
+- Placeholder lifecycle (single-use, expiry, replay rejection)
+- Fail-closed behaviour (missing hooks, broken config, refused loads)
+- Auth and secret-source isolation (bootstrap secrets never enter the env)
+- E2E pipeline redaction (the "Leaky Cat" scenario verifying
+  `transform_tool_result` prevents secret exfiltration to the LLM context)
 
 ## License
 

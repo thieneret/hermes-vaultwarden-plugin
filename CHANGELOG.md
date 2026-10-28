@@ -5,6 +5,19 @@ Author: **thieneret**
 
 ---
 
+## [0.5.9] - 2026-10-29
+
+v0.5.9 — SEC-01 E2E integration test ("Leaky Cat" scenario)
+- Testing: Added End-to-End integration test simulating the full Hermes
+  tool execution pipeline (`tool_execution` -> `transform_tool_result` ->
+  `post_tool_call`). Verifies that a command explicitly reading and printing
+  the injected temp file results in `[REDACTED]` in the final model context,
+  and that the temp file is securely cleaned up.
+- Testing: Added fail-closed negative test verifying the plugin refuses to
+  load if the `transform_tool_result` hook cannot be registered.
+- Docs: README.md updated with new test suite count and E2E coverage note.
+- Bump version to 0.5.9.
+
 ## [0.5.8] - 2026-10-29
 
 v0.5.8 — directory validation & cleanup observability
