@@ -536,6 +536,9 @@ def test_register_raises_when_middleware_registration_returns_false(monkeypatch,
     """A False return (instead of an exception) must also abort loading."""
     _write_secrets_yaml(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # SEC-03 (v0.5.5): pin a sandboxed backend so the local-backend policy
+    # cannot short-circuit register() before the middleware path is reached.
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                            "bw_cli_path": fake_bw})
     ctx.register_middleware = lambda kind, fn: False

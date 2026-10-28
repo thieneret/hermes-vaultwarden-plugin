@@ -42,6 +42,12 @@ _DEFAULTS: dict[str, Any] = {
     "appdata_dir_env": "VW_APPDATA_DIR",
     "allow_write": False,
     "allow_startup_secret_injection": False,
+    # SEC-03 (v0.5.5): fail-closed policy for the 'local' terminal backend.
+    # With backend 'local' (or unset) the LLM-driven terminal executes as the
+    # SAME OS user that owns secrets.yaml and could simply `cat` it, so the
+    # plugin REFUSES to load unless the operator explicitly opts in by setting
+    # this flag to true. Any ambiguity resolves to false — never fail open.
+    "allow_insecure_local_backend": False,
     # v0.5.3: startup-injection mappings consumed by the optional
     # SecretSource adapter (see __init__.py / secret_source.py). Listed in
     # _DEFAULTS so extract_plugin_section() picks them up via the native
@@ -158,6 +164,17 @@ class PluginConfig:
     @property
     def allow_startup_secret_injection(self) -> bool:
         return _as_bool(self._raw("allow_startup_secret_injection"))
+
+    # SEC-03 (v0.5.5): explicit opt-in for running with a 'local' terminal
+    # backend, where the LLM executes as the SAME OS user that owns
+    # secrets.yaml and could read it directly (`cat secrets.yaml`). Default
+    # FALSE = fail-closed: register() refuses to load on a local/unset
+    # backend unless the operator accepts the risk in writing. The value is
+    # read ONLY through the native PluginContext.get_config() section
+    # (VWP-05) — there is NO .env / OS-environment channel for this flag.
+    @property
+    def allow_insecure_local_backend(self) -> bool:
+        return _as_bool(self._raw("allow_insecure_local_backend"))
 
     # VWP-13 (v0.4.3): when True, vaultwarden_list / vaultwarden_search mask
     # `username` and `uris` with "***". Default OFF preserves usability.

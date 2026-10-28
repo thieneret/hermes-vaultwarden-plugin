@@ -37,9 +37,12 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     plugin-private `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` file
     (chmod 600 enforced at load time) and NEVER enter the OS environment or
     the Hermes secret_scope. Residual risk: with a `local` terminal backend
-    the LLM could still `cat` `secrets.yaml` (same OS user); the plugin logs
-    a WARNING when it detects a local/unset backend and recommends `docker`
-    / `ssh` / `modal` for privilege separation in production.)
+    the LLM could still `cat` `secrets.yaml` (same OS user); since v0.5.5
+    (SEC-03) this residual risk is closed FAIL-CLOSED by default — the plugin
+    refuses to load on a local/unset backend unless the operator explicitly
+    opts in via `allow_insecure_local_backend: true`. `docker` / `ssh` /
+    `modal` backends provide privilege separation and are recommended for
+    production (see threat vector 15.)
 12. **Environment-variable secret channel impracticality** (in multiplex
     gateway mode Hermes loads `.env` only at startup, so a secret added to
     `.env` required a full Hermes restart before the plugin could resolve it;
@@ -57,6 +60,28 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     unexpected exception occurred; closed since v0.5.2 by VWP-06 — explicit
     capability detection via `inspect.signature()` and `hasattr()` with
     fail-closed semantics.)
+15. **Same-user secret exposure via a `local` terminal backend (SEC-03)**
+    (when the Hermes terminal backend is `local` — or unset, which defaults to
+    local — the LLM-driven terminal executes commands as the SAME OS user that
+    owns `$HERMES_HOME/plugins/vaultwarden/secrets.yaml`. Because POSIX file
+    permissions only isolate across USERS, not across processes of the same
+    user, the agent can trivially bypass every protection the plugin
+    implements by running `cat ~/.hermes/plugins/vaultwarden/secrets.yaml` and
+    reading `client_secret` / `master_password` in plaintext. Until v0.5.4 the
+    plugin merely logged a WARNING recommending a sandboxed backend — an
+    advisory, not a control: the confidentiality boundary silently degraded to
+    "trust the model not to `cat` the file". Closed since v0.5.5 by a
+    FAIL-CLOSED default policy: `register()` determines the terminal backend
+    before any tool/middleware registration and REFUSES to load (CRITICAL log,
+    returns False) on a `local`/unset backend unless the operator explicitly
+    accepts the risk in writing via the native config flag
+    `allow_insecure_local_backend: true` (boolean, default false; any
+    ambiguity resolves to false — never fail open). With the flag set to true
+    the plugin loads but logs a WARNING that the operator has assumed the
+    same-user secret-exposure risk. The `docker` / `ssh` / `modal` backends
+    run the agent's terminal in a different privilege domain, keep
+    secrets.yaml unreadable to the LLM, and load normally regardless of the
+    flag — they remain the recommended production posture.)
 
 ## Primary Security Controls
 
@@ -77,7 +102,8 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 | bw version enforcement | At startup, `BwCli._check_version()` runs `bw --version` with an isolated environment and validates against a hardcoded minimum (2026.9.1). Fail-closed with NO override: an unsupported or unparseable version raises `UnsupportedBwVersionError`, logs the error, and prevents the plugin from loading. The minimum version is not configurable — compatibility is the plugin author's responsibility, not the user's. (VWP-11) |
 | Middleware fail-closed | If the Hermes placeholder-injection middleware (the v0.4.4 `tool_execution` file-injection middleware) fails to register, `register()` propagates the exception and the plugin does NOT load. This prevents operating without secret injection, which would expose raw secrets in terminal commands. Consistent with the fail-closed bw version check and fail-closed auth. (VWP-03) |
 | Metadata masking (opt-in) | When `metadata_masking=true`, `username` and `uris` are replaced with `***` in `list`/`search` responses. `name`, `id`, `type` are never masked. Default OFF preserves search/list usability while offering a privacy mode for environments where metadata is sensitive. (VWP-13) |
-| Bootstrap secrets from secrets.yaml | Since v0.5.0, `client_secret` and `master_password` are read directly from `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` (chmod 600 enforced, fail-closed `ConfigError` otherwise). They NEVER enter the OS environment or the Hermes secret_scope, closing the `printenv` and `cat .env` attack surfaces. A WARNING is logged when the terminal backend is `local` (the LLM could then still `cat` the file); `docker` / `ssh` / `modal` backends are recommended for production. |
+| Bootstrap secrets from secrets.yaml | Since v0.5.0, `client_secret` and `master_password` are read directly from `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` (chmod 600 enforced, fail-closed `ConfigError` otherwise). They NEVER enter the OS environment or the Hermes secret_scope, closing the `printenv` and `cat .env` attack surfaces. SEC-03 (v0.5.5): on a `local`/unset terminal backend — where the LLM shares this OS user and could still `cat` the file — the plugin now REFUSES to load unless `allow_insecure_local_backend: true` is set explicitly; `docker` / `ssh` / `modal` backends are recommended for production. |
+| Local-backend fail-closed policy (SEC-03) | Since v0.5.5, `register()` classifies the Hermes terminal backend (`secrets.check_terminal_backend()` returns it; resolution: `TERMINAL_ENV` override, then `terminal.backend` in `$HERMES_HOME/config.yaml`) BEFORE any tool/middleware registration. Sandboxed backends (`docker` / `ssh` / `modal`) → INFO, load proceeds. `local` or unset/unknown backend → treated as NOT privilege-separated: with `allow_insecure_local_backend` false (the default; missing key or ambiguous value also resolve to false) the plugin logs a CRITICAL naming the same-user `cat secrets.yaml` risk and returns False — no partial state is left behind. With the flag explicitly true the plugin logs a WARNING (operator assumes the risk) and continues. The flag is read ONLY through the native Hermes config API (`plugins.entries.vaultwarden.settings`, VWP-05) — there is NO `.env` / OS-environment / ad-hoc YAML channel for it, and the check performs no network calls and spawns no subprocesses. |
 | Native config API only (VWP-05) | Since v0.5.2, plugin configuration is loaded exclusively through the native Hermes `PluginContext.get_config()` API. The former fallback layers (`read_user_config_raw()`, direct YAML file read) have been REMOVED — they bypassed Hermes's isolation and permission model. If the native API yields no configuration, the plugin logs a warning and does not load (fail-closed). |
 | Explicit capability detection (VWP-06) | Since v0.5.2, Hermes API compatibility is determined via explicit capability detection (`inspect.signature()` for `register_tool`, `hasattr()` for `register_hook`) instead of exception-based probing. If a required API is unavailable, the plugin fails closed with a `RuntimeError` — it never silently degrades to an insecure mode. |
 | Result redaction via transform_tool_result (SEC-01) | Since v0.5.4, the authoritative confidentiality boundary for injected secrets is the Hermes `transform_tool_result` transformation hook (`make_result_redactor` in `hooks.py`), whose RETURN VALUE replaces the tool result before it reaches the model. The per-execution injected-secret set is handed off from the `tool_execution` middleware via a `contextvars.ContextVar` (cleared in a `finally` block — no plaintext persists across turns); the transformer performs exact recursive `[REDACTED]` replacement over str/dict/list results and writable `.output` objects, then applies the global `RedactingFilter` pass. `post_tool_call` is observer-only (placeholder cleanup, metrics, secret-free error surfacing) and no longer mutates results. FAIL-CLOSED: hosts without `transform_tool_result` are refused at load (`register()` returns False). |
@@ -228,11 +254,12 @@ All CI checks (pytest, ruff) are **blocking** — a failing check prevents merge
 -   All CI checks (pytest, ruff) are **blocking** — a failing check prevents
     merge. (VWP-15)
 
-## Audit Status (20/20 VWP + SEC-01 complete)
+## Audit Status (20/20 VWP + SEC-01 + SEC-03 complete)
 
 | ID | Description | Implemented |
 |-----|-------------|-------------|
 | SEC-01 | Result redaction via authoritative `transform_tool_result` hook (ContextVar handoff; `post_tool_call` reduced to observer-only; fail-closed load without the hook) | v0.5.4 |
+| SEC-03 | Fail-closed policy for local terminal backend (`allow_insecure_local_backend` opt-in; plugin refuses to load on `local`/unset backend by default) | v0.5.5 |
 | VWP-01 | Binary path pinning (hash verification = operator responsibility) | v0.4.7 |
 | VWP-02 | SSH socket path restriction (dev-controlled env vars) | v0.4.6 |
 | VWP-03 | Middleware fail-closed registration | v0.4.3 |

@@ -19,10 +19,12 @@ environment variable or the Hermes secret_scope at any point, which closes
 both attack surfaces above.
 
 Residual risk: when the terminal backend is ``local``, the LLM executes
-commands as the same OS user and can still ``cat`` this file. The
-``check_terminal_backend()`` helper below logs a WARNING in that case and
-advises migrating to a sandboxed backend (``docker`` / ``ssh`` / ``modal``)
-for production use (privilege separation).
+commands as the same OS user and can still ``cat`` this file. Since v0.5.5
+(SEC-03) this is a fail-closed POLICY, not an advisory: ``register()``
+REFUSES to load on a local/unset backend unless the operator explicitly
+opts in via the ``allow_insecure_local_backend`` config flag (default
+false). Sandboxed backends (``docker`` / ``ssh`` / ``modal``) provide
+privilege separation and are the recommended production posture.
 """
 from __future__ import annotations
 
@@ -226,8 +228,26 @@ def _backend_from_hermes_config() -> str:
     return ""
 
 
+#: Backends that execute the LLM-driven terminal in a DIFFERENT privilege
+#: domain than the plugin's OS user (SEC-03, v0.5.5). Anything else — most
+#: notably ``local`` or an unset backend — means the agent runs as the same
+#: OS user that owns secrets.yaml and could read it directly (`cat`).
+SANDBOXED_BACKENDS = ("docker", "ssh", "modal")
+
+
+def is_sandboxed_backend(backend: str) -> bool:
+    """Return True when ``backend`` provides privilege separation (SEC-03).
+
+    ``docker`` / ``ssh`` / ``modal`` run the LLM's terminal OUTSIDE this OS
+    user, so secrets.yaml is not readable by the agent. ``local`` and empty
+    (unset) values are NOT sandboxed. The check performs NO network calls and
+    spawns NO subprocesses — pure string classification.
+    """
+    return str(backend or "").strip().lower() in SANDBOXED_BACKENDS
+
+
 def check_terminal_backend() -> str:
-    """Warn when the terminal backend lets the LLM read secrets.yaml.
+    """Classify the terminal backend and log the confidentiality posture.
 
     Resolution order:
       1. ``TERMINAL_ENV`` environment variable (explicit override).
@@ -236,21 +256,36 @@ def check_terminal_backend() -> str:
 
     A backend of ``local`` (or unset/empty) means the agent's terminal tools
     execute as the SAME OS user that owns secrets.yaml — the LLM could then
-    simply ``cat`` the file. Sandboxed backends (docker / ssh / modal / ...)
+    simply ``cat`` the file. Sandboxed backends (docker / ssh / modal)
     provide privilege separation and are logged at INFO level.
 
-    Returns the effective backend name (for tests / introspection).
+    SEC-03 (v0.5.5): this helper only CLASSIFIES and LOGS; the fail-closed
+    POLICY lives in ``register()`` (__init__.py), which consumes the RETURNED
+    backend together with the ``allow_insecure_local_backend`` config flag
+    and refuses to load on a local/unset backend unless the operator opts in.
+
+    Returns the effective backend name ('' when unset) so the caller can
+    enforce the policy (for tests / introspection as well).
     """
     backend = os.environ.get("TERMINAL_ENV", "").strip().lower()
     if not backend:
         backend = _backend_from_hermes_config()
 
-    if backend in ("", "local"):
+    if is_sandboxed_backend(backend):
+        log.info("Terminal backend is '%s' — sandboxed from the plugin's "
+                 "OS user; secrets.yaml is not readable by the LLM.", backend)
+    elif backend == "local":
         log.warning(
             "WARNING: terminal backend is 'local'. The LLM can read "
             "secrets.yaml via 'cat'. For production, use 'docker' or 'ssh' "
             "backend.")
     else:
-        log.info("Terminal backend is '%s' — sandboxed from the plugin's "
-                 "OS user; secrets.yaml is not readable by the LLM.", backend)
+        # unset / unknown backend: treat as NOT privilege-separated
+        # (fail-closed classification — register() decides the policy).
+        log.warning(
+            "WARNING: terminal backend is unset/unknown (%r); treating it as "
+            "'local' — the LLM may share this OS user and could read "
+            "secrets.yaml via 'cat'. Configure a sandboxed backend "
+            "('docker', 'ssh', or 'modal') for privilege separation.",
+            backend or "")
     return backend
