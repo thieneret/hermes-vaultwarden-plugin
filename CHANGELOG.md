@@ -16,7 +16,7 @@ Author: **thieneret**
   (security improvement — ensures injected secrets are redacted from logs)
 - **secret_source.py**: Lazy import `_field_value` to avoid potential
   circular dependency
-- Add comprehensive unit tests for `secret_source.py` (11 test cases)
+- Add comprehensive unit tests for `secret_source.py` (12 test cases)
 
 NOT a breaking change: the feature remains opt-in
 (`allow_startup_secret_injection: false` by default), the public API
