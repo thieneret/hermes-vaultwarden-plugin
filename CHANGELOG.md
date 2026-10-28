@@ -5,6 +5,19 @@ Author: **thieneret**
 
 ---
 
+## [0.5.8] - 2026-10-29
+
+v0.5.8 — directory validation & cleanup observability
+- Security: `_secrets_dir()` now strictly validates the temp directory on
+  creation/use. Enforces non-symlink, correct ownership (current user or root),
+  and exact 0700 permissions. Fails closed if validation fails.
+- Reliability: All temp file deletions in `finally` blocks are now wrapped in
+  try/except. Failures emit a sanitized WARNING log (path + error code) instead
+  of failing silently, ensuring operators are alerted to leftover secret material.
+- Fix: Startup stale-file cleanup now uses the configured `placeholder_ttl_seconds`
+  instead of a hardcoded lifetime.
+- Bump version to 0.5.8.
+
 ## [0.5.7] - 2026-10-29
 
 v0.5.7 (SEC-02) — atomic placeholder resolution & status version exposure
