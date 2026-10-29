@@ -5,6 +5,26 @@ Author: **thieneret**
 
 ---
 
+## [0.6.1] - 2026-10-29
+
+v0.6.1 (VWP-18) — hotfix: detect transform_tool_result via host VALID_HOOKS registry
+- FIX: production Hermes builds that advertise hook support only through the
+  module-level `hermes_cli.plugins.VALID_HOOKS` registry (and do NOT mirror
+  it as a PluginContext attribute or `supported_hooks` collection) were
+  misclassified as legacy hosts; the plugin refused to load with the SEC-01
+  fail-closed error "host Hermes does not expose the mandatory
+  'transform_tool_result' plugin hook".
+- `compat.supports_transform_tool_result()` now consults
+  `hermes_cli.plugins.VALID_HOOKS` as a last-resort detection layer. The
+  lookup is a guarded, pure membership test: if the module is absent (older
+  hosts, unit-test environments without Hermes installed) the check
+  conservatively returns False — genuinely old hosts still fail closed and
+  SEC-01 protection is unchanged.
+- Tests: +4 regression tests in test_compat.py (registry detected; registry
+  without the hook fails closed; no hermes_cli fails closed; end-to-end
+  register() succeeds on a bare production-shaped context).
+- Bump version to 0.6.1.
+
 ## [0.6.0] - 2026-10-29
 
 v0.6.0 (AUD-01) — enforce HTTPS for server_url configuration

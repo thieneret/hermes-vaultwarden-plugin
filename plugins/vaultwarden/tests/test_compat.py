@@ -13,6 +13,7 @@ now delegate to these functions instead of carrying inline fallback code.
 from __future__ import annotations
 
 import logging
+import sys
 
 import pytest
 
@@ -349,3 +350,115 @@ def test_plugin_error_class_exists():
     assert errors.PluginError.code == "PLUGIN_ERROR"
     exc = errors.PluginError("boom")
     assert exc.to_dict()["error_code"] == "PLUGIN_ERROR"
+
+
+# ── VWP-18 (v0.6.0 hotfix): hermes_cli.plugins.VALID_HOOKS detection ──
+
+
+class _BareCtx:
+    """Minimal stand-in for the production Hermes PluginContext.
+
+    Current host builds expose ONLY register_hook() and do NOT mirror hook
+    support as a context attribute or a supported_hooks collection — the
+    capability lives exclusively in the module-level VALID_HOOKS registry.
+    """
+
+    def __init__(self):
+        self.hooks: list[tuple[str, object]] = []
+
+    def register_hook(self, kind, fn):
+        self.hooks.append((kind, fn))
+
+
+def _install_fake_hermes_cli(monkeypatch, valid_hooks):
+    import types
+
+    plugins_mod = types.ModuleType("hermes_cli.plugins")
+    plugins_mod.VALID_HOOKS = valid_hooks
+    cli_mod = types.ModuleType("hermes_cli")
+    cli_mod.plugins = plugins_mod
+    monkeypatch.setitem(sys.modules, "hermes_cli", cli_mod)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", plugins_mod)
+
+
+PRODUCTION_VALID_HOOKS = [
+    "agent_loop_stopped", "api_request_error", "gateway_platform_event",
+    "post_tool_call", "pre_tool_call", "on_session_end",
+    "transform_api_error_classification", "transform_llm_output",
+    "transform_terminal_output", "transform_tool_result",
+]
+
+
+def test_vwp18_valid_hooks_registry_detected(monkeypatch):
+    """VWP-18: hosts that advertise transform_tool_result ONLY via the
+    hermes_cli.plugins.VALID_HOOKS registry must be detected as capable —
+    this is exactly the production Hermes build that v0.6.0 initially
+    misclassified and refused to load."""
+    from vaultwarden.compat import supports_transform_tool_result
+
+    _install_fake_hermes_cli(monkeypatch, PRODUCTION_VALID_HOOKS)
+    assert supports_transform_tool_result(_BareCtx()) is True
+
+
+def test_vwp18_valid_hooks_without_transform_fails_closed(monkeypatch):
+    """VWP-18: an older registry lacking transform_tool_result still fails
+    closed — the new detection layer must not weaken SEC-01."""
+    from vaultwarden.compat import supports_transform_tool_result
+
+    _install_fake_hermes_cli(
+        monkeypatch, ["post_tool_call", "pre_tool_call", "on_session_end"])
+    assert supports_transform_tool_result(_BareCtx()) is False
+
+
+def test_vwp18_no_hermes_cli_fails_closed(monkeypatch):
+    """VWP-18: no hermes_cli importable at all (unit-test envs, non-Hermes
+    hosts) → conservative False; fail-closed default preserved."""
+    from vaultwarden.compat import supports_transform_tool_result
+
+    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
+    monkeypatch.delitem(sys.modules, "hermes_cli.plugins", raising=False)
+    # Even if some unrelated object shadows the name, the guarded import
+    # must not raise out of the capability check.
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)
+    assert supports_transform_tool_result(_BareCtx()) is False
+
+
+def test_vwp18_register_loads_on_bare_valid_hooks_host(monkeypatch, tmp_path,
+                                                        fake_bw):
+    """VWP-18 end-to-end: register() succeeds on a bare context whose only
+    hook-capability signal is the VALID_HOOKS registry (production shape)."""
+    import vaultwarden
+    from vaultwarden.tests.conftest import BASE_SECTION
+    from vaultwarden.tests.test_integration import _write_secrets_yaml
+
+    _write_secrets_yaml(tmp_path)
+    _install_fake_hermes_cli(monkeypatch, PRODUCTION_VALID_HOOKS)
+    monkeypatch.delenv("BW_CLI_PATH", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+    class BareRecordingCtx(_BareCtx):
+        def __init__(self, settings):
+            super().__init__()
+            self._settings = settings
+            self.tools: list[dict] = []
+            self.middleware: list[tuple[str, object]] = []
+
+        def get_config(self, key, default=None):
+            return self._settings.get(key, default)
+
+        def register_middleware(self, kind, fn):
+            self.middleware.append((kind, fn))
+
+        def register_tool(self, *, name, toolset, schema, handler,
+                          check_fn=None):
+            self.tools.append({"name": name})
+
+    ctx = BareRecordingCtx({**BASE_SECTION, "enabled": True,
+                            "bw_cli_path": fake_bw})
+    # The bare host context mirrors production: NO supported_hooks attr and
+    # NO transform_tool_result attribute on the context itself.
+    assert not hasattr(ctx, "supported_hooks")
+    assert not hasattr(ctx, "transform_tool_result")
+    assert vaultwarden.register(ctx) is True
+    assert [kind for kind, _ in ctx.hooks][0] == "transform_tool_result"

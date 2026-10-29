@@ -77,6 +77,14 @@ def supports_transform_tool_result(ctx: Any) -> bool:
     bound attribute/method on the context, or by declaring the hook name in
     a ``supported_hooks`` collection (some Hermes builds ship a static list
     of valid hook names instead of attributes).
+
+    v0.6.0 hotfix (VWP-18): current production Hermes builds advertise hook
+    support via the module-level ``hermes_cli.plugins.VALID_HOOKS`` registry
+    (e.g. ``python -c "from hermes_cli.plugins import VALID_HOOKS; print(...)"``)
+    rather than through PluginContext attributes. That registry is consulted
+    as a last-resort detection layer so up-to-date hosts are no longer
+    misclassified as legacy and refused at load time. The fail-closed
+    behaviour for genuinely old hosts (no hook anywhere) is unchanged.
     """
     if not callable(getattr(ctx, "register_hook", None)):
         return False
@@ -89,6 +97,28 @@ def supports_transform_tool_result(ctx: Any) -> bool:
     declared = getattr(ctx, "supported_hooks", None)
     if isinstance(declared, (list, tuple, set, frozenset)):
         return TRANSFORM_TOOL_RESULT_HOOK in set(declared)
+    return _valid_hooks_registry_supports(TRANSFORM_TOOL_RESULT_HOOK)
+
+
+def _valid_hooks_registry_supports(hook_name: str) -> bool:
+    """VWP-18 (v0.6.0 hotfix): consult the host's VALID_HOOKS registry.
+
+    Modern Hermes hosts enumerate every hook name they dispatch in
+    ``hermes_cli.plugins.VALID_HOOKS`` (a set/list/frozenset of strings),
+    but do NOT mirror that capability on the PluginContext object. Reading
+    this registry is a pure membership test — it never invokes host code
+    and raises nothing: if the module is absent (older hosts, unit-test
+    environments without Hermes installed) we conservatively return False
+    and the caller keeps failing closed.
+    """
+    try:
+        from hermes_cli.plugins import VALID_HOOKS  # type: ignore[attr-defined]
+    except Exception:
+        # No hermes_cli on sys.path, or the build predates VALID_HOOKS:
+        # treat as unsupported (fail-closed default preserved).
+        return False
+    if isinstance(VALID_HOOKS, (list, tuple, set, frozenset)):
+        return hook_name in set(VALID_HOOKS)
     return False
 
 # ── Config loading compatibility ─────────────────────────────────────
