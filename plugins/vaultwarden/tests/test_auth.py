@@ -136,11 +136,16 @@ def test_base_env_blocks_bw_on_insecure_appdata(fake_bw, tmp_path):
     """AUD-04 (v0.6.2): the single bw-subprocess choke point re-validates
     the appdata dir BEFORE exporting BITWARDENCLI_APPDATA_DIR — an insecure
     dir raises FilesystemSecurityError and no env (hence no bw run) results."""
+    from unittest.mock import patch
+
     from vaultwarden.bw_cli import BwCli
     from vaultwarden.secure_fs import FilesystemSecurityError
     d = tmp_path / ".bw-data"
     d.mkdir(mode=0o755)  # group/world accessible — insecure
-    cli = BwCli(fake_bw, d)
+    # Bypass the fail-fast version check (it runs bw through base_env() in
+    # __init__) so we can exercise the AUD-04 gate inside base_env() itself.
+    with patch.object(BwCli, "_check_version", return_value="2025.1.0"):
+        cli = BwCli(fake_bw, d)
     with pytest.raises(FilesystemSecurityError):
         cli.base_env({"BW_SESSION": "x"})
     # no silent repair: dir keeps its insecure mode
