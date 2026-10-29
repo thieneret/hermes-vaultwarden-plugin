@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.6.2**
+**Current version: v0.6.3**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -326,6 +326,7 @@ mkdir -m 700 /path/to/real-dir
 | Local-backend fail-closed policy | Plugin refuses to load on `local` backend unless `allow_insecure_local_backend: true` is set. |
 | HTTPS enforcement | `server_url` MUST use `https://` scheme; HTTP is rejected fail-closed unless `allow_insecure_http: true` is explicitly set. |
 | Filesystem hardening | Secrets dir, `.bw-data`, and `secrets.yaml` validated via `secure_fs.py` before use. Symlinks, wrong owners, and loose permissions abort execution. |
+| Lifecycle hook fail-closed registration | Critical lifecycle hooks are validated before tools are exposed; plugin refuses to load if required hook registration fails. |
 
 See SECURITY.md for the full threat model and all security controls.
 

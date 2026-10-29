@@ -218,41 +218,25 @@ def register(ctx: Any) -> bool:
     registry = PlaceholderRegistry(ttl_seconds=config.placeholder_ttl_seconds,
                                    max_entries=config.max_placeholders)
 
-    # 8. register tools on the 'vaultwarden' toolset
-    registered = 0
-    for schema, handler in get_tools(auth, config, registry):
-        # VWP-17: signature compatibility handled centrally in compat.py
-        compat.register_tool_compat(
-            ctx, name=schema["name"], toolset="vaultwarden", schema=schema,
-            handler=handler, check_fn=_make_check_fn(auth))
-        registered += 1
-    log.info("Registered %d vaultwarden_* tools.", registered)
+    # ── AUD-06 (v0.6.3) + SEC-01 + VWP-03: MANDATORY registration gate ──
+    # ALL mandatory hooks/middleware are validated and registered BEFORE any
+    # Vaultwarden tool is exposed. Recommended order:
+    #   transform_tool_result -> tool_execution middleware ->
+    #   post_tool_call -> on_session_end -> tools.
+    # If any mandatory registration fails the plugin refuses to load with NO
+    # partial state: no tools, no middleware, no hooks.
 
-    # middleware + hooks (chain-safe resolver is NOT pre_tool_call)
-    # VWP-03 (v0.4.3): FAIL-CLOSED. If the placeholder-injection middleware
-    # cannot be registered, the plugin MUST NOT load — operating without it
-    # would leave placeholder tokens unresolved in terminal commands and
-    # expose raw secrets. Any exception from register_middleware propagates
-    # out of register(); do NOT wrap this call in a swallowing try/except.
-    log.info("vaultwarden: registering file-injection middleware (fail-closed)")
-    result = ctx.register_middleware(
-        "tool_execution", make_placeholder_resolver(auth, registry, config))
-    if result is False:
-        # Some contexts signal failure with a False return instead of raising.
-        raise RuntimeError(
-            "vaultwarden plugin: middleware registration failed. "
-            "Refusing to load without placeholder injection (fail-closed). "
-            "Check Hermes plugin API compatibility."
-        )
-    log.info("File-injection middleware registered")
-
-    # SEC-01 (v0.5.4, HIGH) FAIL-CLOSED: the authoritative confidentiality
-    # boundary for injected secrets is the `transform_tool_result` hook —
-    # Hermes documents it as the ONLY mechanism that may return a replacement
-    # tool result BEFORE it reaches the model. If the host Hermes build does
-    # not expose this hook, the plugin MUST refuse to load; silently falling
-    # back to the old post_tool_call-observer redaction would reintroduce
-    # SEC-01 (plaintext secrets possibly surviving into LLM context).
+    # SEC-01 (v0.5.4, HIGH) FAIL-CLOSED — UNCHANGED by AUD-06: the
+    # authoritative confidentiality boundary for injected secrets is the
+    # `transform_tool_result` hook — Hermes documents it as the ONLY
+    # mechanism that may return a replacement tool result BEFORE it reaches
+    # the model. If the host Hermes build does not expose this hook, the
+    # plugin MUST refuse to load; silently falling back to the old
+    # post_tool_call-observer redaction would reintroduce SEC-01 (plaintext
+    # secrets possibly surviving into LLM context). This failure path stays
+    # SEPARATE from the generic lifecycle-hook handling below — it must
+    # never be merged into a catch-all handler that could swallow
+    # initialization errors.
     if not compat.supports_transform_tool_result(ctx):
         # SEC-01 (v0.5.4): fail-closed — no authoritative redaction hook,
         # no load. See CHANGELOG.md [0.5.4] for details.
@@ -281,16 +265,68 @@ def register(ctx: Any) -> bool:
     log.info("Result redactor registered on '%s'",
              compat.TRANSFORM_TOOL_RESULT_HOOK)
 
-    # VWP-17: register_hook availability handled centrally in compat.py
-    # SEC-01 (v0.5.4): post_tool_call is now OBSERVER-ONLY (placeholder
-    # cleanup + metrics + secret-free error surfacing). It performs NO
-    # confidentiality redaction — that lives in transform_tool_result above.
-    hooks_ok = compat.register_hook_if_available(
-        ctx, "post_tool_call", make_post_cleanup_hook(auth, registry, config))
-    hooks_ok &= compat.register_hook_if_available(
-        ctx, "on_session_end", make_session_end_hook(auth, registry))
-    if hooks_ok:
-        log.info("Cleanup hooks registered")
+    # middleware (chain-safe resolver is NOT pre_tool_call)
+    # VWP-03 (v0.4.3): FAIL-CLOSED. If the placeholder-injection middleware
+    # cannot be registered, the plugin MUST NOT load — operating without it
+    # would leave placeholder tokens unresolved in terminal commands and
+    # expose raw secrets. Any exception from register_middleware propagates
+    # out of register(); do NOT wrap this call in a swallowing try/except.
+    log.info("vaultwarden: registering file-injection middleware (fail-closed)")
+    result = ctx.register_middleware(
+        "tool_execution", make_placeholder_resolver(auth, registry, config))
+    if result is False:
+        # Some contexts signal failure with a False return instead of raising.
+        raise RuntimeError(
+            "vaultwarden plugin: middleware registration failed. "
+            "Refusing to load without placeholder injection (fail-closed). "
+            "Check Hermes plugin API compatibility."
+        )
+    log.info("File-injection middleware registered")
+
+    # AUD-06 (v0.6.3) FAIL-CLOSED: mandatory lifecycle hooks. The plugin
+    # refuses to load if the required lifecycle hooks cannot be registered:
+    #   - post_tool_call : placeholder cleanup, temp-file cleanup
+    #     observability, metrics, post-call hygiene;
+    #   - on_session_end : session-end cleanup / session lifecycle
+    #     termination (the exact session-end hook name this plugin
+    #     implements — see hooks.make_session_end_hook).
+    # These registrations run BEFORE any tool is exposed so a refused load
+    # leaves NO partial plugin state. Registration failures raise
+    # errors.PluginInitializationError; we log a sanitized message (hook
+    # name + failure reason only — NEVER secrets, YAML contents, env values,
+    # or session material), abort initialization, and return False. Do NOT
+    # wrap these calls in a swallowing try/except.
+    log.info("vaultwarden: registering mandatory lifecycle hooks (fail-closed)")
+    lifecycle_handlers = {
+        "post_tool_call": make_post_cleanup_hook(auth, registry, config),
+        "on_session_end": make_session_end_hook(auth, registry),
+    }
+    for hook_name in compat.MANDATORY_LIFECYCLE_HOOKS:
+        try:
+            compat.register_mandatory_lifecycle_hook(
+                ctx, hook_name, lifecycle_handlers[hook_name])
+        except Exception as exc:
+            code = compat.get_error_code(exc)
+            log.error(
+                "fail-closed: mandatory lifecycle hook '%s' could not be "
+                "registered (%s: %s). Aborting Vaultwarden plugin "
+                "initialization — no tools are exposed and no partially "
+                "active plugin state is left behind.",
+                hook_name, code, exc)
+            return False
+    log.info("Mandatory lifecycle hooks registered: %s",
+             ", ".join(compat.MANDATORY_LIFECYCLE_HOOKS))
+
+    # 8. register tools on the 'vaultwarden' toolset — ONLY reached after
+    # every mandatory registration above succeeded (AUD-06).
+    registered = 0
+    for schema, handler in get_tools(auth, config, registry):
+        # VWP-17: signature compatibility handled centrally in compat.py
+        compat.register_tool_compat(
+            ctx, name=schema["name"], toolset="vaultwarden", schema=schema,
+            handler=handler, check_fn=_make_check_fn(auth))
+        registered += 1
+    log.info("Registered %d vaultwarden_* tools.", registered)
 
     # optional SecretSource (disabled by default)
     if config.allow_startup_secret_injection:

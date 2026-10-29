@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.6.2
+**Applies to:** v0.6.3
 
 ## Threat Model
 
@@ -121,6 +121,7 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 | Secrets directory load-time validation | The secret-injection directory (`$XDG_RUNTIME_DIR/vw-secrets`) is validated during plugin registration before any tool or hook is registered. A symlinked, wrong-owner, or insecure-mode directory aborts plugin activation. The plugin never becomes partially active with an insecure secrets directory. |
 | Bitwarden appdata hardening | The Bitwarden appdata directory (`.bw-data`) is validated before `BITWARDENCLI_APPDATA_DIR` is exported and before every `bw` subprocess call. A symlinked, wrong-owner, or group/world-accessible `.bw-data` directory blocks Bitwarden CLI execution. |
 | `secrets.yaml` pre-parse validation | Before bootstrap secret parsing, `secrets.yaml` is validated as an absolute path, regular file, non-symlink, owned by the current effective UID, with no group/other access bits. An existing but insecure `secrets.yaml` is never parsed. |
+| Lifecycle hook fail-closed registration | Critical lifecycle hooks required for cleanup and session termination are validated and registered before tools are exposed. If a required lifecycle hook cannot be registered, plugin initialization aborts. Existing `transform_tool_result` and `tool_execution` fail-closed behavior remains unchanged. |
 
 ### File-injected Placeholder Injection (VWP-04) — Crash Recovery (VWP-20)
 
@@ -211,6 +212,7 @@ The plugin's security controls are validated by dedicated test suites:
 | Env isolation tests | Subprocess environment allowlist enforcement, parent env never inherited | VWP-19 |
 | Crash recovery tests | Startup cleanup of stale temp files after SIGKILL/SIGTERM | VWP-20 |
 | Filesystem hardening tests | Symlink rejection, ownership enforcement, permission enforcement, plugin load failure, `.bw-data` blocking, insecure `secrets.yaml` rejection | AUD-03 / AUD-04 / AUD-08 |
+| Lifecycle hook registration tests | Missing or failing required lifecycle hook registration refuses plugin load; successful registration loads the plugin | AUD-06 |
 
 All CI checks (pytest, ruff) are **blocking** — a failing check prevents merge.
 
@@ -264,6 +266,10 @@ try/except that swallows failures. Fail-closed is mandatory.
 - Never silently repair insecure permissions, ownership, or symlinks.
 - Use `os.lstat()` for filesystem validation where symlink traversal must be prevented.
 - Filesystem validation errors may include paths, but must never include secret values, file contents, or environment variables.
+- Critical lifecycle hooks must be registered fail-closed.
+- Never wrap mandatory lifecycle-hook registration in a try/except block that swallows failures.
+- Do not treat a successful `None` return value from hook registration as failure unless the host API explicitly defines it as failure.
+- Lifecycle-hook registration failures must abort plugin initialization before tools are exposed.
 
 ## Supply Chain
 
@@ -273,7 +279,7 @@ try/except that swallows failures. Fail-closed is mandatory.
 - All CI checks (pytest, ruff) are **blocking** — a failing check prevents
 merge. (VWP-15)
 
-## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-03 + AUD-04 + AUD-08 implemented)
+## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-03 + AUD-04 + AUD-06 + AUD-08 implemented)
 
 | ID | Description | Implemented |
 | --- | --- | --- |
@@ -283,6 +289,7 @@ merge. (VWP-15)
 | AUD-01 | HTTPS enforcement for `server_url` — `server_url` MUST use `https://` scheme; HTTP or missing scheme is rejected fail-closed at plugin load. Explicit developer override: `allow_insecure_http` | v0.6.0 |
 | AUD-03 | Secrets directory fail-closed validation at plugin load — `register()` runs `secure_fs.ensure_hardened_directory()` before any tool/hook registration; symlink / wrong owner / mode ≠ 0700 aborts activation (no partial state, no silent chmod repair) | v0.6.2 |
 | AUD-04 | `.bw-data` fail-closed validation before any `bw` invocation — shared hardened-directory validator gates `BITWARDENCLI_APPDATA_DIR` export and every `bw` subprocess call; insecure appdata dir blocks `bw` execution | v0.6.2 |
+| AUD-06 | Fail-closed lifecycle hook registration — required `post_tool_call` and session-end lifecycle hooks are validated and registered before tools are exposed; plugin refuses to load if a required lifecycle hook cannot be registered | v0.6.3 |
 | AUD-08 | `secrets.yaml` fail-closed filesystem validation before YAML parsing — `secure_fs.ensure_hardened_secret_file()` requires absolute path, regular non-symlink file, euid ownership, no group/other access; insecure file is NEVER parsed | v0.6.2 |
 | VWP-01 | Binary path pinning (hash verification = operator responsibility) | v0.4.7 |
 | VWP-02 | SSH socket path restriction (dev-controlled env vars) | v0.4.6 |
