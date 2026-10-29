@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.5.9**
+**Current version: v0.6.0**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without
 > traditional manual code review of every line. Use at your own
@@ -98,6 +98,9 @@ plugins:
         client_id: "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
         allow_write: false
         allow_startup_secret_injection: false
+        # allow_insecure_http: false  # DANGER: permits http:// server_url.
+                                      # Only enable for local dev/integration.
+                                      # Default: false (enforces https://).
         auto_sync: true
         sync_interval_seconds: 300
         session_timeout_seconds: 14400
@@ -194,7 +197,8 @@ Behavior and guarantees:
 | Setting | Effect |
 | --- | --- |
 | `enabled` | Master switch. Default: `false` |
-| `server_url` | Vaultwarden server URL (required) |
+| `server_url` | Vaultwarden server URL (required). **Must use `https://`** — cleartext `http://` is rejected with a `ConfigError` unless `allow_insecure_http: true` is set explicitly. Any other scheme (`ftp://`, `file://`, `ws://`, missing) is always rejected. |
+| `allow_insecure_http` | Permits cleartext `http://` for `server_url`. **Default: `false`** (enforces `https://`). Only enable for local development or isolated integration networks; credentials will be transmitted in plaintext. When enabled, `http://` is accepted for ANY hostname (no loopback restriction) and a sanitized WARNING naming the hostname is logged at startup. |
 | `client_id` | API-key client id, format `user.<uuid>` (required) |
 | `allow_write` | Enables `store`/`update`/`delete` operations. Default: `false` |
 | `auto_sync` | Sync vault before read operations. Default: `true` |
@@ -419,6 +423,7 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | File-injected placeholder injection | Secrets are written to a chmod 600 temp file (mkstemp, atomic) in a dedicated chmod 700 directory under `$XDG_RUNTIME_DIR` (`vw-secrets/`, typically tmpfs). The rewritten command only ever references `$(< path)` — the raw secret never enters the command string, argv, shell history, or logs. Temp files are deleted in a `finally` block even if the command fails |
 | Atomic placeholder resolution | If a command contains the same placeholder multiple times, it is resolved exactly once via `consume_and_resolve()`, creating a single temp file per unique token. Prevents sequential consumption hazards and guarantees single-use semantics even on repeated references |
 | Strict directory validation & cleanup observability | `_secrets_dir()` enforces non-symlink, correct ownership, and exact `0700` permissions (fail-closed). Temp file deletions are wrapped in `try/except` to log sanitized warnings on failure, preventing silent secret leaks on disk. Stale cleanup respects `placeholder_ttl_seconds`. |
+| HTTPS-only server URL (AUD-01) | `validate()` parses `server_url` with `urllib.parse.urlparse()` and enforces the `https://` scheme by default: a cleartext `http://` URL raises `ConfigError` and the plugin refuses to load (the session key and bootstrap secrets would otherwise cross the network in plaintext). The opt-in flag `allow_insecure_http` (boolean, default `false`) permits `http://` for ANY hostname as an explicit developer/integration risk acceptance — there is deliberately no loopback restriction — and then logs a sanitized WARNING naming only the scheme + hostname (never embedded credentials). Any other scheme (`ftp://`, `file://`, `ws://`, missing/empty) is always rejected. |
 
 See SECURITY.md for the full threat model and all security controls.
 

@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 0.5.9
+version: 0.6.0
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key
@@ -51,6 +51,19 @@ config:
     type: boolean
     default: false
     description: Register the optional SecretSource adapter (disabled by default).
+  # AUD-01 (v0.6.0, BREAKING): strict https:// enforcement for server_url.
+  allow_insecure_http:
+    type: boolean
+    default: false
+    description: >-
+      Permits a cleartext http:// server_url. Default FALSE (fail-closed):
+      an http:// URL raises ConfigError and the plugin refuses to load,
+      because the Bitwarden session key and bootstrap secrets would be
+      transmitted in plaintext. Set TRUE only as an explicit developer /
+      integration risk acceptance — when enabled, http:// is accepted for
+      ANY hostname (no local-only restriction) and a sanitized WARNING
+      naming scheme + hostname is logged. Other schemes (ftp://, file://,
+      ws://, missing) are always rejected regardless of this flag.
   # SEC-03 (v0.5.5): fail-closed policy for the local terminal backend.
   allow_insecure_local_backend:
     type: boolean
