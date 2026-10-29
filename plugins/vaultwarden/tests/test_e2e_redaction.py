@@ -249,6 +249,11 @@ def test_plugin_fails_closed_on_missing_transform_hook(monkeypatch: pytest.Monke
     # --- A. capability absent: older Hermes without the hook --------------
     ctx_a = RecordingCtx({**BASE_SECTION, "enabled": True, "bw_cli_path": fake_bw})
     ctx_a.supported_hooks = frozenset({"post_tool_call", "on_session_end"})
+    # VWP-18 added a VALID_HOOKS-registry detection layer; simulate a host
+    # with NO registry at all so this genuinely-old build still fails closed.
+    import sys as _sys
+    _sys.modules["hermes_cli"] = None  # type: ignore[assignment]
+    _sys.modules.pop("hermes_cli.plugins", None)
     ok_a = vaultwarden.register(ctx_a)
     assert ok_a is False
     assert all(kind != "transform_tool_result" for kind, _ in ctx_a.hooks)
