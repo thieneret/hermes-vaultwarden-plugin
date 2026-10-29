@@ -24,6 +24,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 from . import compat, errors
 
@@ -42,6 +43,13 @@ _DEFAULTS: dict[str, Any] = {
     "appdata_dir_env": "VW_APPDATA_DIR",
     "allow_write": False,
     "allow_startup_secret_injection": False,
+    # AUD-01 (v0.6.0, BREAKING): strict https:// enforcement for server_url.
+    # Cleartext http:// risks catastrophic credential disclosure (the Bitwarden
+    # session key and bootstrap secrets would traverse the network in
+    # plaintext), so the plugin REFUSES to load on an http:// URL unless the
+    # operator explicitly opts in below. Ambiguity resolves to false — never
+    # fail open.
+    "allow_insecure_http": False,
     # SEC-03 (v0.5.5): fail-closed policy for the 'local' terminal backend.
     # With backend 'local' (or unset) the LLM-driven terminal executes as the
     # SAME OS user that owns secrets.yaml and could simply `cat` it, so the
@@ -176,6 +184,17 @@ class PluginConfig:
     def allow_insecure_local_backend(self) -> bool:
         return _as_bool(self._raw("allow_insecure_local_backend"))
 
+    # AUD-01 (v0.6.0, BREAKING): explicit opt-in that permits a cleartext
+    # http:// server_url. Default FALSE = fail-closed: validate() raises
+    # ConfigError for any http:// URL and the plugin refuses to load. When set
+    # to true, http:// is accepted for ANY hostname (this is a blanket
+    # developer/integration risk acceptance — there is deliberately NO
+    # local-only restriction) and a sanitized WARNING naming only the
+    # scheme + hostname is logged so operators see the cleartext exposure.
+    @property
+    def allow_insecure_http(self) -> bool:
+        return _as_bool(self._raw("allow_insecure_http"))
+
     # VWP-13 (v0.4.3): when True, vaultwarden_list / vaultwarden_search mask
     # `username` and `uris` with "***". Default OFF preserves usability.
     @property
@@ -269,9 +288,46 @@ class PluginConfig:
             return Path(hermes_home).expanduser() / "plugins" / "vaultwarden" / ".bw-data"
         return PLUGIN_DIR / ".bw-data"
 
-    def validate(self) -> None:
-        if not self.server_url:
+    def _validate_server_url_scheme(self) -> None:
+        """AUD-01 (v0.6.0, BREAKING): strictly enforce https:// server_url.
+
+        Cleartext HTTP would transmit the Bitwarden session key and bootstrap
+        secrets in plaintext, so an ``http://`` URL is rejected with a
+        ConfigError (fail-closed — the plugin refuses to load) unless the
+        operator explicitly opts in via ``allow_insecure_http: true``. The
+        opt-in is a blanket developer/integration decision: when set, HTTP is
+        permitted for ANY hostname (deliberately NO local-only restriction).
+        Any other scheme (ftp, file, ws, missing/empty) is always rejected.
+
+        Logging is sanitized: only the scheme + hostname are ever emitted —
+        never userinfo (credentials) or the full URL.
+        """
+        server_url = self.server_url
+        if not server_url:
             raise errors.ConfigError("secrets.vaultwarden.server_url is required.")
+        parsed = urlparse(server_url)
+        scheme = parsed.scheme.lower()
+        if scheme == "https":
+            return
+        if scheme == "http":
+            if not self.allow_insecure_http:
+                raise errors.ConfigError(
+                    "server_url must use https://. Set allow_insecure_http: "
+                    "true in config.yaml to permit http:// (not recommended "
+                    "for production).")
+            # Sanitized WARNING: scheme + hostname ONLY — never the full URL,
+            # which could carry embedded credentials.
+            log.warning(
+                "allow_insecure_http is enabled; server_url uses cleartext "
+                "http://%s. Credentials will be transmitted in plaintext.",
+                parsed.hostname)
+            return
+        raise errors.ConfigError(
+            "server_url must use http:// or https:// scheme; got '%s'."
+            % (scheme or "<none>",))
+
+    def validate(self) -> None:
+        self._validate_server_url_scheme()
         if not self.client_id:
             raise errors.ConfigError("secrets.vaultwarden.client_id is required.")
         if not self.client_id.startswith("user."):
