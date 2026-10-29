@@ -2,15 +2,15 @@
 
 **Current version: v0.6.2**
 
-> ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without
-> traditional manual code review of every line. Use at your own
-> risk. Audit before production deployment.**
->>
+> ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
+> **traditional manual code review of every line. Use at your own**
+> **risk. Audit before production deployment.**
+>
 > ⚠️ This is my first "vibe-coded" program, intended primarily for my own use. Use it entirely at your own risk!
 >
-> ⚠️ AI audit results: [v0.3.2-Qwen](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20Qwen3.8-max.md) [v0.3.2-ChatGPT](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/9cf9f22d0abbb694affe22f98dd8c5dfa31688c6/audit/v0.3.2%20audit%20by%20ChatGPT.md) [v0.5.2-Qwen](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/eda5876f048916f9506a9f30b2e12ade2b0a017d/audit/v0.5.2%20audit%20by%20Qwen3.8-max.md) [v0.5.2-ChatGPT](https://github.com/thieneret/hermes-vaultwarden-plugin/blob/eda5876f048916f9506a9f30b2e12ade2b0a017d/audit/v0.5.2%20audit%20by%20ChatGPT.md)
+> ⚠️ AI audit results: v0.3.2-Qwen v0.3.2-ChatGPT v0.5.2-Qwen v0.5.2-ChatGPT
 >
-> ⚠️ **Security:** See [SECURITY.md](SECURITY.md) for the full threat model
+> ⚠️ **Security:** See SECURITY.md for the full threat model
 > and security guarantees.
 
 Secure secrets management for Hermes Agent via Vaultwarden. Provides safe
@@ -49,7 +49,7 @@ key storage and ssh-agent integration.
 
 Copy the plugin directory into your Hermes plugins folder:
 
-```
+```bash
 cp -r plugins/vaultwarden ~/.hermes/plugins/vaultwarden
 ```
 
@@ -63,7 +63,7 @@ editable package with development dependencies.
 
 **Using `pip`:**
 
-```
+```bash
 git clone <repository-url>
 cd hermes-vaultwarden-plugin
 pip install -e ".[dev]"
@@ -71,7 +71,7 @@ pip install -e ".[dev]"
 
 **Using `uv` (recommended):**
 
-```
+```bash
 git clone <repository-url>
 cd hermes-vaultwarden-plugin
 uv pip install -e ".[dev]"
@@ -95,6 +95,7 @@ plugins:
       settings:
         enabled: true
         server_url: "https://vault.example.com"
+        allow_insecure_http: false    # HTTPS enforcement override
         client_id: "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
         allow_write: false
         allow_startup_secret_injection: false
@@ -115,7 +116,7 @@ plugins:
 Bootstrap secrets are loaded from a plugin-private YAML file that the plugin
 reads directly — **never** from `.env` or OS environment variables:
 
-```
+```text
 $HERMES_HOME/plugins/vaultwarden/secrets.yaml   # chmod 600 (enforced)
 ```
 
@@ -135,7 +136,7 @@ The plugin validates the file at startup: it must exist, be exactly mode
 `0600`, and contain non-empty `client_secret` and `master_password` values;
 otherwise it fails closed with a `ConfigError`.
 
-The secrets never enter the OS environment or the Hermes secret_scope, which
+The secrets never enter the OS environment or the Hermes secret\_scope, which
 closes the `printenv` and `cat .env` attack surfaces.
 
 > **Residual risk (fail-closed policy):** if the terminal
@@ -194,7 +195,8 @@ Behavior and guarantees:
 | Setting | Effect |
 | --- | --- |
 | `enabled` | Master switch. Default: `false` |
-| `server_url` | Vaultwarden server URL (required) |
+| `server_url` | Vaultwarden server URL (required, HTTPS enforced) |
+| `allow_insecure_http` | Disables strict HTTPS enforcement for `server_url`. Default: `false`. If `true`, the plugin will connect to an `http://` server (useful for local testing or isolated networks). In production, this should remain `false`. |
 | `client_id` | API-key client id, format `user.<uuid>` (required) |
 | `allow_write` | Enables `store`/`update`/`delete` operations. Default: `false` |
 | `auto_sync` | Sync vault before read operations. Default: `true` |
@@ -212,6 +214,8 @@ Behavior and guarantees:
 
 ## Tools
 
+The plugin exposes 12 tools to the Hermes agent. The LLM constructs the exact tool calls based on the registered JSON schemas and the `vaultwarden-usage` skill.
+
 ### Core tools
 
 | Tool | Purpose | Requires `allow_write` |
@@ -221,206 +225,57 @@ Behavior and guarantees:
 | `vaultwarden_list` | List items — metadata only | ❌ |
 | `vaultwarden_search` | Search items by name/username/uri — metadata only | ❌ |
 | `vaultwarden_get_secret_ref` | Generate a single-use placeholder token | ❌ |
-| `vaultwarden_store` | Create a new vault item. Supports `generate=true` to auto-generate a password stored directly in the vault; password can be supplied via `password_file` to keep it out of the LLM context. | ✅ |
-| `vaultwarden_update` | Update an existing item. Supports `generate=true` to regenerate the password, stored directly in the vault; password can be supplied via `password_file` to keep it out of the LLM context. | ✅ |
+| `vaultwarden_store` | Create a new vault item. Supports password generation or secure file input. | ✅ |
+| `vaultwarden_update` | Update an existing item. Supports password generation or secure file input. | ✅ |
 | `vaultwarden_delete` | Delete an item (`confirm=true` required) | ✅ |
 
 ### SSH key management tools
 
 | Tool | Purpose | Requires `allow_write` |
 | --- | --- | :-: |
-| `vaultwarden_store_ssh` | Store SSH key as login item + attachment (name must be unique). Supports `generate=true` to generate a keypair internally and return the public key; passphrase via `pass_file`. | ✅ |
-| `vaultwarden_update_ssh` | Update user/passphrase/key attachment. Supports `generate=true` for key rotation (`confirm=true` required); returns the new public key; passphrase via `pass_file`. | ✅ |
+| `vaultwarden_store_ssh` | Store SSH key as login item + attachment. Supports internal keypair generation or secure file input. | ✅ |
+| `vaultwarden_update_ssh` | Update user/passphrase/key attachment. Supports internal key rotation (`confirm=true` required). | ✅ |
 | `vaultwarden_delete_ssh` | Delete SSH key item (attachment included) | ✅ |
-| `vaultwarden_use_ssh` | Load SSH key into ssh-agent (socket path resolved from developer-controlled env vars, see SSH Agent Socket) | ❌ |
+| `vaultwarden_use_ssh` | Load SSH key into ssh-agent (socket path resolved from developer-controlled env vars) | ❌ |
 
 ## Placeholder Injection (security model)
 
-Raw secrets are never exposed to the agent. Instead:
+Raw secrets are never exposed to the agent's context window or terminal history. Instead, the plugin uses a file-based injection architecture:
 
-```
-1. vaultwarden_search(query="github")              → metadata only
-2. vaultwarden_get_secret_ref(item_id, field)      → $__VW_SECRET_xxxx__
-3. terminal(command="curl -H \"Bearer $__VW_SECRET_xxxx__\" ...")
-   ↑ tool_execution middleware writes the real secret to a temp file in
-     $XDG_RUNTIME_DIR/vw-secrets/ (chmod 600, mkstemp) and rewrites the
-     command to read from it via $(< path); the shell expands it at
-     execution time and the file is deleted in a finally block
-```
+1. The LLM requests a single-use placeholder token (e.g., `$__VW_SECRET_xxxx__`) via `vaultwarden_get_secret_ref`.
+2. The LLM embeds this token inside a terminal command (e.g., `curl -H "Bearer $__VW_SECRET_xxxx__"`).
+3. The Hermes `tool_execution` middleware intercepts the command, writes the real secret to a secure temporary file (`chmod 600`), and rewrites the command to read from it using shell expansion (e.g., `$(< /tmp/vw-secrets/...)`).
+4. The shell expands the file content at execution time. The raw secret never appears in the command string, argv, shell history, or logs.
 
-The placeholder reference MUST be double-quoted (or unquoted) — never single
-quotes — so the shell expands the `$(< path)` substitution.
-
-- Placeholders are **single-use** and expire after `placeholder_ttl_seconds`
-- The real secret is injected only at the moment of command execution
-- The raw secret never appears in the command string, argv, shell history, or logs
-- Every secret is registered with a redacting filter so it cannot leak into logs
-- If a command references the same placeholder multiple times, the middleware resolves it **exactly once** and creates a single temp file; all occurrences are rewritten to the same `$(< path)` reference.
+**Key guarantees:**
+- Placeholders are **single-use** and expire after `placeholder_ttl_seconds`.
+- The placeholder reference MUST be double-quoted (or unquoted) — never single quotes — so the shell expands the `$(< path)` substitution.
+- If a command references the same placeholder multiple times, the middleware resolves it exactly once and creates a single temp file.
 
 ## SSH Key Management
 
-SSH private keys are stored as login items with a file attachment:
+SSH private keys are managed securely without exposing passphrases to the LLM:
 
-| Vault field | Meaning |
-| --- | --- |
-| `name` | Item name (must be unique) |
-| `username` | SSH user (e.g. `deploy`, `root`) |
-| `password` | SSH key passphrase |
-| attachment | SSH private key file (original filename) |
-
-### Store a key
-
-```
-vaultwarden_store_ssh(name="SSH - Production", user="deploy",
-                      pass_file="/run/secrets/ssh_pass",
-                      file="/path/to/id_ed25519")
-```
-
-### Load a key into ssh-agent
-
-```
-vaultwarden_use_ssh(name="SSH - Production")
-```
-
-The passphrase is delivered via the `SSH_ASKPASS` mechanism (see Security
-Architecture below) — never via stdin, argv, or a file; the key uses an atomic
-temp file (`mkstemp`, `0600`) deleted in a `finally` block.
-
-### SSH Agent Socket
-
-The `vaultwarden_use_ssh` tool resolves the ssh-agent socket via a
-developer-controlled mechanism (NOT configurable by the LLM):
-
-1. **`$VW_SSH_SOCKET_PATH`** env var (if set): the socket is created/reused
-   at this path. This allows sharing the socket with external tools (e.g.
-   an ssh-mcp server).
-2. **`$XDG_RUNTIME_DIR/auth.sock`** (fallback): if `$VW_SSH_SOCKET_PATH`
-   is unset, the socket is created/reused here.
-
-If an agent is already running at the resolved socket, it is reused.
-Otherwise, a new agent is started. Stale sockets (file exists but no agent
-running) are cleaned up at plugin startup.
-
-**Sharing with ssh-mcp:** Set `$VW_SSH_SOCKET_PATH` to a path accessible by
-both the plugin and the ssh-mcp server, e.g.:
-
-```bash
-export VW_SSH_SOCKET_PATH=$XDG_RUNTIME_DIR/shared-ssh.sock
-```
-
-### SSH key generation (`generate=true`)
-
-`vaultwarden_store_ssh` and `vaultwarden_update_ssh` accept `generate=true`,
-which makes the plugin generate the keypair internally — the user never types
-a passphrase or a key file path:
-
-1. A **32-character passphrase** is generated via the same `bw generate` path
-   used by `vaultwarden_store` / `vaultwarden_update` `generate=true` (one
-   consistent secret-generation mechanism across the plugin).
-2. An SSH keypair is generated with `ssh-keygen` — default `ed25519`, optional
-   `rsa` via `key_type` / `rsa_bits` (default **4096** bits). The passphrase is
-   delivered via the **`SSH_ASKPASS` mechanism** (env var only — never stdin,
-   which `ssh-keygen` does not read for passphrases, and never `-N` argv,
-   which would leak it to `ps`).
-3. Post-generation safety verify: `ssh-keygen -yf <key>` with `stdin=DEVNULL`
-   must FAIL — if it succeeds, the key is unencrypted and the operation aborts
-   rather than storing an unprotected key. The generation, `-yf` verify,
-   fingerprint, and `ssh-add` subprocesses all run with `start_new_session=True`,
-   detaching them from any controlling terminal so they can never fall back to
-   a `/dev/tty` passphrase prompt on interactive (dashboard) sessions.
-4. The private key is stored as a vault attachment and the passphrase as the
-   item `password` field. Neither is ever returned.
-5. The response contains the **public key** and **fingerprint** (non-secret —
-   paste the public key into `authorized_keys`).
-
-In generate mode, `pass` / `pass_file` / `file` are forbidden (the plugin
-supplies them). `vaultwarden_update_ssh` + `generate=true` is a **key rotation**
-(destructive: replaces the existing keypair + passphrase) and therefore
-requires `confirm=true`, mirroring `vaultwarden_delete_ssh`.
-
-```
-# Generate a new ed25519 keypair
-vaultwarden_store_ssh(name="SSH - New", user="deploy", generate=true)
--> {"created": true, "id": "...", "name": "SSH - New", "ssh_user": "deploy",
-    "key_type": "ed25519", "public_key": "ssh-ed25519 AAAA... SSH - New",
-    "fingerprint": "SHA256:...", "passphrase_generated": true}
-
-# Generate an RSA keypair (4096-bit default)
-vaultwarden_store_ssh(name="SSH - RSA", generate=true, key_type="rsa")
-
-# Rotate an existing key (destructive - confirm required)
-vaultwarden_update_ssh(name="SSH - New", generate=true, confirm=true)
--> {"updated": true, ..., "public_key": "ssh-ed25519 AAAA...",
-    "fingerprint": "SHA256:...", "passphrase_rotated": true}
-```
+- **Storage:** Keys are stored as Vaultwarden login items, with the private key attached as a secure file attachment.
+- **Generation:** The plugin can generate keypairs internally using `ssh-keygen` and `bw generate`. The passphrase is delivered securely via the `SSH_ASKPASS` environment mechanism, never via stdin or command-line arguments.
+- **Loading:** The `vaultwarden_use_ssh` tool loads the key into a local `ssh-agent`. The socket path is strictly resolved from developer-controlled environment variables (`$VW_SSH_SOCKET_PATH` or `$XDG_RUNTIME_DIR/auth.sock`), preventing the LLM from hijacking the agent socket.
 
 ## Secret input channels
 
-Write tools that accept a secret (`vaultwarden_store` / `vaultwarden_update`
-via `password*`, `vaultwarden_store_ssh` / `vaultwarden_update_ssh` via
-`pass*`) support two **mutually exclusive** input sources (plus `generate=true`):
+When creating or updating secrets (passwords or SSH passphrases), the LLM can supply the value through two mutually exclusive channels:
 
-| Source | Parameter (store/update) | Parameter (ssh) | Notes |
-| --- | --- | --- | --- |
-| Raw value | `password` | `pass` | Enters the LLM context and chat history — **not secure**. Emits a warning in BOTH the log and the tool response. |
-| Owner-only file | `password_file` | `pass_file` | Path to a file holding the secret. Must be a regular file readable **only by the owner** (chmod 600) — permission violations are rejected before the file is read. |
-
-Rules:
-
-- **Conflicting sources are an error.** Providing more than one of the pair
-  raises `ConfigError` (no silent precedence). In generate mode, supplying any
-  secret/file parameter is also a `ConfigError`.
-- **Raw input triggers a dual-channel warning:** a value-free `log.warning`
-  AND a `"warning"` field in the tool response. The response warning is an
-  **imperative instruction directing the agent to warn the user** that direct
-  secret input is insecure and to recommend the safer `*_file` channel; it
-  never contains the secret value itself. Raw input is still accepted
-  (accept-and-warn).
-- File-resolved secrets never appear in the tool call arguments, keeping them
-  out of the LLM context entirely.
-
-```
-# Passphrase from an owner-only file (chmod 600)
-vaultwarden_store_ssh(name="SSH - Prod", user="deploy",
-                      pass_file="/run/secrets/ssh_pass",
-                      file="/home/u/.ssh/id_ed25519")
-
-# Password from an owner-only file (chmod 600)
-vaultwarden_store(name="GitHub account", username="octocat",
-                  password_file="/run/secrets/gh_token")
-
-# Raw password still works, but the response carries a warning
-vaultwarden_store(name="raw-test", username="u", password="hunter2")
--> {"created": true, ..., "warning": "AGENT INSTRUCTION: A raw secret was
-    supplied directly via 'password' in vaultwarden_store. ... You MUST warn
-    the user about this now: tell them direct secret input is insecure, and
-    recommend providing it via 'password_file' (an owner-only file, chmod 600)
-    instead. Do NOT repeat the secret value in your reply."}
-```
+1. **Owner-only file (Secure):** A path to a file holding the secret (`password_file` / `pass_file`). The file must be readable only by the owner (`chmod 600`). The secret is read directly from disk and never enters the LLM context or chat history.
+2. **Raw value (Insecure):** The secret is passed directly as a string. The plugin accepts it but emits a strict security warning in both the logs and the tool response, instructing the agent to warn the user.
 
 ## Filesystem Security Requirements
 
-v0.6.2 (AUD-03 / AUD-04 / AUD-08) introduced a shared filesystem-hardening
-layer (`plugins/vaultwarden/secure_fs.py`) that validates every
-security-sensitive path **fail-closed** before it is trusted:
+The plugin enforces a shared filesystem-hardening layer (`plugins/vaultwarden/secure_fs.py`) that validates every security-sensitive path **fail-closed** before it is trusted:
 
-* the **secret-injection directory** (runtime placeholder temp files,
-  `$XDG_RUNTIME_DIR/vw-secrets`) is validated at plugin load — an insecure
-  directory aborts activation; no tools or hooks are registered;
-* the **Bitwarden appdata directory** (`.bw-data`, exported to `bw` as
-  `BITWARDENCLI_APPDATA_DIR`) is validated before *any* `bw` subprocess
-  invocation — an insecure directory blocks `bw` execution;
-* the **bootstrap secret file** (`secrets.yaml`) is validated *before* YAML
-  parsing — an existing but insecure `secrets.yaml` is NEVER parsed and no
-  bootstrap secret is loaded from it.
+- the **secret-injection directory** (runtime placeholder temp files, `$XDG_RUNTIME_DIR/vw-secrets`) is validated at plugin load;
+- the **Bitwarden appdata directory** (`.bw-data`, exported to `bw` as `BITWARDENCLI_APPDATA_DIR`) is validated before _any_ `bw` subprocess invocation;
+- the **bootstrap secret file** (`secrets.yaml`) is validated _before_ YAML parsing.
 
-All validators use `os.lstat()` (symlinks are never followed), reject
-symlinks, require ownership by the current effective UID, and enforce strict
-permissions. Insecure paths are **never silently repaired** — the operator
-must fix them explicitly. Validation failures raise
-`FilesystemSecurityError`, which is never caught-and-ignored: plugin
-activation aborts or `bw` execution is blocked. Error logs contain paths and
-reasons only — never secret values, file contents, or environment variables.
+All validators use `os.lstat()` (symlinks are never followed), reject symlinks, require ownership by the current effective UID, and enforce strict permissions. Insecure paths are **never silently repaired** — the operator must fix them explicitly.
 
 ### Required permissions
 
@@ -445,20 +300,14 @@ chown "$USER":"$USER" /path/to/secrets.yaml
 chmod 600 /path/to/secrets.yaml
 ```
 
-If a security-sensitive path is a **symlink**, remove it and recreate a real
-directory (a symlink could redirect secret material to an
-attacker-controlled location):
+If a security-sensitive path is a **symlink**, remove it and recreate a real directory:
 
 ```bash
 rm /path/to/symlink
 mkdir -m 700 /path/to/real-dir
 ```
 
-> ⚠️ **Validation is fail-closed.** Existing installations with unsafe
-> permissions (world-readable dirs, symlinked paths, wrong owner) will
-> **stop working after updating to v0.6.2** until the operator applies the
-> remediation commands above. The plugin refuses to load, `bw` is refused,
-> and `secrets.yaml` is refused rather than silently relaxing security.
+> ⚠️ **Validation is fail-closed.** Existing installations with unsafe permissions will **stop working after updating** until the operator applies the remediation commands above.
 
 ## Security Architecture
 
@@ -468,28 +317,21 @@ mkdir -m 700 /path/to/real-dir
 | Subprocess env isolation | All `bw` calls run with a minimal, controlled environment |
 | Session key in memory only | Bitwarden session key is never written to disk |
 | RedactingFilter | All secrets registered; redacted from logs and errors |
-| SSH passphrase delivery | Via the `SSH_ASKPASS` mechanism: a temporarily generated helper script whose body is only `echo "$VW_SSH_PASS"` (no secret material) runs as the askpass program with `SSH_ASKPASS_REQUIRE=force`; the passphrase itself is passed to the subprocess **environment only** (never a file, never argv), and `stdin` is `/dev/null` so `ssh-keygen` / `ssh-add` can never prompt on a tty. All passphrase-handling subprocesses additionally run with `start_new_session=True`, detaching them from any controlling terminal. The helper script is removed in a `finally` block. |
+| SSH passphrase delivery | Via the `SSH_ASKPASS` mechanism (env var only, never stdin/argv). Helper script removed in `finally` block. |
 | SSH key temp file | `tempfile.mkstemp()` (atomic), `0600` perms, deleted in `finally` |
 | Fail-closed auth | Authentication failures never fall back silently |
-| bw version enforcement | `bw --version` checked at startup against a hardcoded minimum (2026.9.1); plugin refuses to load if below or unparseable — no override |
-| Structured error classification | Errors classified by source stability (Node.js codes → rate limit → bw state → server API); retry only on idempotent network errors with exponential backoff + jitter |
-| Metadata masking (opt-in) | `metadata_masking=true` masks `username`/`uris` in list/search responses; `name` never masked. Default OFF preserves search usability |
-| Binary path pinning | `bw` is executed ONLY from the REQUIRED absolute `bw_cli_path` (config.yaml). No PATH lookup, no env override. Validated before use: regular file, no symlink in chain, executable, not group/world-writable, owned by root/current user; otherwise the plugin fails closed and does not load |
-| Bootstrap secrets via secrets.yaml | `client_secret` / `master_password` are read directly from `$HERMES_HOME/plugins/vaultwarden/secrets.yaml` (mode 0600 enforced, fail-closed `ConfigError`). They never enter `.env`, an OS environment variable, or the Hermes secret_scope — closing the `printenv` and `cat .env` attack surfaces. The plugin REFUSES to load when the terminal backend is `local`/unset (the LLM could `cat` the file as the same OS user) unless `allow_insecure_local_backend: true` is set explicitly (privilege separation via `docker`/`ssh`/`modal` remains the recommended production posture) |
-| Local-backend fail-closed policy | `register()` determines the Hermes terminal backend before any tool/middleware registration. A `local` or unset backend means the LLM-driven terminal shares this OS user and can read `secrets.yaml` directly, so the plugin refuses to load (CRITICAL log, returns `False`) unless the operator opts in via the native config flag `allow_insecure_local_backend` (boolean, default `false`; ambiguity always resolves to `false`). Opting in logs a WARNING that the same-user secret-exposure risk has been explicitly accepted. `docker` / `ssh` / `modal` backends load normally regardless of the flag |
-| Middleware fail-closed | If placeholder-injection middleware cannot be registered, the plugin refuses to load. No silent fallback without secret protection |
-| File-injected placeholder injection | Secrets are written to a chmod 600 temp file (mkstemp, atomic) in a dedicated chmod 700 directory under `$XDG_RUNTIME_DIR` (`vw-secrets/`, typically tmpfs). The rewritten command only ever references `$(< path)` — the raw secret never enters the command string, argv, shell history, or logs. Temp files are deleted in a `finally` block even if the command fails |
-| Atomic placeholder resolution | If a command contains the same placeholder multiple times, it is resolved exactly once via `consume_and_resolve()`, creating a single temp file per unique token. Prevents sequential consumption hazards and guarantees single-use semantics even on repeated references |
-| Strict directory validation & cleanup observability | `_secrets_dir()` enforces non-symlink, ownership by the current effective UID, and exact `0700` permissions via the shared `secure_fs.ensure_hardened_directory()` validator — fail-closed, NEVER silently repaired (v0.6.2 removed the implicit chmod). Temp file deletions are wrapped in `try/except` to log sanitized warnings on failure, preventing silent secret leaks on disk. Stale cleanup respects `placeholder_ttl_seconds`. |
-| AUD-03: Secrets directory fail-closed validation at plugin load | `register()` validates the secret-injection directory (`$XDG_RUNTIME_DIR/vw-secrets`) through `secure_fs.ensure_hardened_directory()` BEFORE any tool or hook registration. A symlinked, wrong-owner, or mode-≠0700 directory aborts plugin activation (`FilesystemSecurityError` → sanitized error log with path only → `register()` returns `False`) — the plugin never becomes partially active with an insecure secrets directory. |
-| AUD-04: `.bw-data` fail-closed validation before bw invocation | The Bitwarden appdata directory is validated through `secure_fs.ensure_hardened_directory()` before `BITWARDENCLI_APPDATA_DIR` is exported and before every `bw` subprocess call (`auth.ensure_appdata_dir()` + `BwCli.base_env()` choke point). An insecure `.bw-data` blocks `bw` execution entirely — the CLI can never run against a symlinked or world-accessible vault cache. |
-| AUD-08: `secrets.yaml` fail-closed validation before YAML parsing | `load_secrets()` calls `secure_fs.ensure_hardened_secret_file()` BEFORE any YAML parse: absolute path, regular file (never a symlink, checked via `os.lstat()`), owned by the current effective UID, no group/other access bits. An existing but insecure `secrets.yaml` is NEVER parsed and no bootstrap secret is loaded from it. |
+| bw version enforcement | `bw --version` checked at startup (minimum 2026.9.1); plugin refuses to load if below |
+| Binary path pinning | `bw` is executed ONLY from the REQUIRED absolute `bw_cli_path`. No PATH lookup, no env override. |
+| Bootstrap secrets via secrets.yaml | Read directly from `secrets.yaml` (mode 0600 enforced). Never enter `.env` or OS environment. |
+| Local-backend fail-closed policy | Plugin refuses to load on `local` backend unless `allow_insecure_local_backend: true` is set. |
+| HTTPS enforcement | `server_url` MUST use `https://` scheme; HTTP is rejected fail-closed unless `allow_insecure_http: true` is explicitly set. |
+| Filesystem hardening | Secrets dir, `.bw-data`, and `secrets.yaml` validated via `secure_fs.py` before use. Symlinks, wrong owners, and loose permissions abort execution. |
 
 See SECURITY.md for the full threat model and all security controls.
 
 ## Development
 
-```
+```text
 plugins/vaultwarden/
 ├── __init__.py           # Plugin registration (register(ctx))
 ├── plugin.yaml           # Plugin manifest (name, version, tools)
@@ -505,6 +347,7 @@ plugins/vaultwarden/
 ├── errors.py             # Error taxonomy
 ├── compat.py             # Centralized compatibility layer (Hermes API, bw version)
 ├── secret_source.py      # Optional SecretSource adapter (startup injection, disabled by default)
+├── secure_fs.py          # Shared filesystem-hardening helpers (symlink/owner/mode fail-closed)
 ├── secret.yaml.template  # Template users copy to $HERMES_HOME/plugins/vaultwarden/secrets.yaml
 └── tests/                # pytest suite
 ```
@@ -514,7 +357,7 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 
 ### Running tests
 
-```
+```bash
 pytest plugins/vaultwarden/tests/ -q
 ```
 
@@ -523,8 +366,7 @@ Current suite: **440 tests** — including positive-control suites for:
 - Placeholder lifecycle (single-use, expiry, replay rejection)
 - Fail-closed behaviour (missing hooks, broken config, refused loads)
 - Auth and secret-source isolation (bootstrap secrets never enter the env)
-- E2E pipeline redaction (the "Leaky Cat" scenario verifying
-  `transform_tool_result` prevents secret exfiltration to the LLM context)
+- E2E pipeline redaction (the "Leaky Cat" scenario verifying `transform_tool_result` prevents secret exfiltration to the LLM context)
 
 ## License
 
