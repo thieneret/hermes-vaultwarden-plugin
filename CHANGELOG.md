@@ -5,6 +5,13 @@ Author: **thieneret**
 
 ---
 
+## v0.6.3
+
+- feat(security): fail-closed lifecycle hook registration for critical lifecycle hooks (AUD-06)
+- `register()` now refuses plugin load if required `post_tool_call` or session-end lifecycle hook cannot be registered
+- existing `transform_tool_result` and `tool_execution` middleware fail-closed behavior remains unchanged
+- add lifecycle-hook registration regression tests
+
 ## [0.6.2] - 2026-10-30
 
 v0.6.2 — filesystem fail-closed hardening (AUD-03 + AUD-04 + AUD-08)

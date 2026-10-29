@@ -17,6 +17,7 @@ import sys
 
 import pytest
 
+import vaultwarden
 from vaultwarden import compat, errors
 
 # ── helpers ──────────────────────────────────────────────────────────
