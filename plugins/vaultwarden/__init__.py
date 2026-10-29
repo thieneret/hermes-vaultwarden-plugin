@@ -31,8 +31,8 @@ from .hooks import (
     make_post_cleanup_hook,
     make_result_redactor,
     make_session_end_hook,
+    resolve_secrets_dir_path,
 )
-from .hooks import resolve_secrets_dir_path
 from .placeholders import PlaceholderRegistry
 from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
 from .security import get_logger

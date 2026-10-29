@@ -5,6 +5,60 @@ Author: **thieneret**
 
 ---
 
+## [0.6.2] - 2026-10-30
+
+v0.6.2 — filesystem fail-closed hardening (AUD-03 + AUD-04 + AUD-08)
+- SECURITY: new shared filesystem-hardening module `secure_fs.py` with
+  `FilesystemSecurityError`, `ensure_hardened_directory()` and
+  `ensure_hardened_secret_file()`. All checks use `os.lstat()` (symlinks are
+  never followed), reject symlinks, require ownership by the CURRENT
+  effective UID, and enforce strict permissions (directories EXACTLY 0700,
+  secret files with NO group/other access bits — canonically 0600). Missing
+  directories are created hardened (umask-forced 0700); insecure existing
+  paths are NEVER silently repaired (the v0.5.8 implicit chmod was removed —
+  a silent repair would mask an attack or misconfiguration).
+- AUD-03 (resolved): the secrets directory (`$XDG_RUNTIME_DIR/vw-secrets`)
+  is now validated FAIL-CLOSED at plugin LOAD time. `register()` calls
+  `ensure_hardened_directory(resolve_secrets_dir_path(), create_if_missing=True)`
+  BEFORE any tool or hook registration; on `FilesystemSecurityError` it logs
+  a sanitized error (path + reason only, never secret values) and returns
+  False — no tools exposed, no hooks registered, no partial activation.
+  `_cleanup_stale_secrets()` no longer swallows validation errors, and the
+  injection middleware blocks placeholder injection fail-closed (placeholders
+  stay verbatim = shell-expands-empty) with a sanitized PlaceholderError.
+- AUD-04 (resolved): `.bw-data` (Bitwarden appdata dir, exported to `bw` as
+  `BITWARDENCLI_APPDATA_DIR`) is validated through the same hardened-directory
+  validator before ANY `bw` invocation — at setup (`auth.ensure_appdata_dir()`)
+  and at the single subprocess choke point (`BwCli.base_env()` feeding every
+  `subprocess.run` site and the version check). An insecure appdata dir
+  raises `FilesystemSecurityError`: `BITWARDENCLI_APPDATA_DIR` is not set for
+  an unvalidated path and `bw` is not executed. A missing dir is created with
+  mode 0700; symlink / wrong owner / group- or world-accessible dirs block
+  `bw` execution.
+- AUD-08 (resolved): `secrets.yaml` is validated through
+  `ensure_hardened_secret_file(path, allow_missing=False)` BEFORE any YAML
+  parsing in `load_secrets()`. An existing but insecure file (symlink, wrong
+  owner, group/other access) raises `FilesystemSecurityError` — the YAML is
+  never parsed and no bootstrap secret is loaded. The error propagates to
+  `register()`, which logs it sanitized and refuses to activate the plugin.
+- Fail-closed contract (all three gates): validation failure →
+  `FilesystemSecurityError` → plugin activation aborts / `bw` blocked /
+  secrets unparsed. The error is never caught-and-ignored, never downgraded
+  to a warning-only path, and never allows partial plugin activation. Error
+  messages may include paths but NEVER secret values, YAML content, or
+  environment variables. RedactingFilter, session isolation, env isolation,
+  and HTTPS enforcement are unchanged.
+- Docs: README.md gains a "Filesystem Security Requirements" section
+  (required-permissions table, operator chown/chmod remediation commands,
+  symlink remediation, fail-closed breaking-change note) and three new rows
+  in the Security Architecture table (AUD-03 / AUD-04 / AUD-08). SECURITY.md
+  Audit Status table marks AUD-03, AUD-04 and AUD-08 resolved in v0.6.2.
+- Tests: new `tests/test_secure_fs.py` (symlink rejection via lstat, wrong
+  ownership, mode drift, umask-forced creation, allow_missing semantics,
+  absolute-path enforcement, no-silent-repair assertions) plus updated
+  crash-recovery tests for the new propagation contract.
+- Bump version to 0.6.2 (plugin.yaml, pyproject.toml, README header).
+
 ## [0.6.1] - 2026-10-29
 
 v0.6.1 (VWP-18) — hotfix: detect transform_tool_result via host VALID_HOOKS registry

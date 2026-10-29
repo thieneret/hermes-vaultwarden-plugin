@@ -18,7 +18,6 @@ from vaultwarden.secure_fs import (
     ensure_hardened_secret_file,
 )
 
-
 # ---------------------------------------------------------------------------
 # ensure_hardened_directory
 # ---------------------------------------------------------------------------
@@ -148,7 +147,12 @@ def test_file_rejects_directory(tmp_path):
         ensure_hardened_secret_file(d)
 
 
-@pytest.mark.parametrize("bad_mode", [0o644, 0o666, 0o604, 0o640, 0o700])
+# NOTE: 0o700 is deliberately NOT in this list — it has no GROUP/OTHER bits
+# (mode & 0o077 == 0), so the file validator's documented rule ("no group or
+# other access") accepts it; the executable owner bit is unusual for a secret
+# file but does not expose its CONTENTS to other users. Modes that DO grant
+# group/other access must all be rejected:
+@pytest.mark.parametrize("bad_mode", [0o644, 0o666, 0o604, 0o640, 0o606, 0o660])
 def test_file_rejects_group_other_access(tmp_path, bad_mode):
     f = tmp_path / f"f{bad_mode:o}"
     f.write_text("x")

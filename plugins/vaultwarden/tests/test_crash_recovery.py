@@ -102,10 +102,20 @@ class TestCrashRecovery:
 
         # A path that simply does not exist on disk: the SHARED validator
         # creates it hardened (mode 0o700, umask-forced) and the scan finds
-        # nothing stale — no exception.
+        # nothing stale — no exception.  (resolve_secrets_dir_path alone is
+        # not enough here: _secrets_dir() runs the REAL validator, which
+        # requires the tmp_path ancestors to be euid-owned with mode exactly
+        # 0700 — pytest's per-test dirs are typically 0755.  Patch the whole
+        # hardened-dir resolver instead; the create-hardened behaviour of
+        # secure_fs.ensure_hardened_directory itself is covered by
+        # tests/test_secure_fs.py::test_dir_creates_missing_with_0700_even_under_hostile_umask.)
         missing = tmp_path / "vw-secrets"
-        monkeypatch.setattr("vaultwarden.hooks.resolve_secrets_dir_path",
-                            lambda: missing)
+
+        def hardened_dir():
+            from vaultwarden.secure_fs import ensure_hardened_directory
+            return str(ensure_hardened_directory(missing,
+                                                 create_if_missing=True))
+        monkeypatch.setattr("vaultwarden.hooks._secrets_dir", hardened_dir)
         _cleanup_stale_secrets()
         assert missing.is_dir()
         assert missing.stat().st_mode & 0o777 == 0o700
