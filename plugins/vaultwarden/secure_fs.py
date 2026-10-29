@@ -116,15 +116,35 @@ def ensure_hardened_directory(
                 from None
         prev_umask = os.umask(0o077)
         try:
-            os.mkdir(str(p), mode=0o700)
-        except FileExistsError:
-            # Lost a creation race — fall through and validate whatever
-            # exists (symlink / wrong owner / wrong mode all fail closed).
-            pass
-        except OSError as exc:
-            raise FilesystemSecurityError(
-                f"Cannot create hardened directory {p}: "
-                f"{type(exc).__name__}") from exc
+            try:
+                os.mkdir(str(p), mode=0o700)
+            except FileExistsError:
+                # Lost a creation race — fall through and validate whatever
+                # exists (symlink / wrong owner / wrong mode all fail closed).
+                pass
+            except FileNotFoundError:
+                # A PARENT directory is missing — mkdir cannot create the
+                # whole chain. Create ancestors owner-only, then retry the
+                # leaf once; every created level is still re-validated by
+                # the checks below (fail-closed, no silent repair).
+                try:
+                    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                except OSError as exc:
+                    raise FilesystemSecurityError(
+                        f"Cannot create hardened directory {p}: "
+                        f"{type(exc).__name__}") from exc
+                try:
+                    os.mkdir(str(p), mode=0o700)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise FilesystemSecurityError(
+                        f"Cannot create hardened directory {p}: "
+                        f"{type(exc).__name__}") from exc
+            except OSError as exc:
+                raise FilesystemSecurityError(
+                    f"Cannot create hardened directory {p}: "
+                    f"{type(exc).__name__}") from exc
         finally:
             os.umask(prev_umask)
         st = os.lstat(str(p))

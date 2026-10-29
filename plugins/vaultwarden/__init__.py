@@ -32,7 +32,9 @@ from .hooks import (
     make_result_redactor,
     make_session_end_hook,
 )
+from .hooks import resolve_secrets_dir_path
 from .placeholders import PlaceholderRegistry
+from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
 from .security import get_logger
 from .tools import get_tools
 
@@ -71,11 +73,29 @@ def register(ctx: Any) -> bool:
         log.warning("Vaultwarden plugin load FAILED: plugin disabled (enabled=false)")
         return False
 
+    # AUD-03 (v0.6.2, FAIL-CLOSED): validate the secret-injection directory
+    # BEFORE any tool or hook registration. The shared hardening validator
+    # (secure_fs.ensure_hardened_directory) requires an absolute, real
+    # (non-symlink) directory owned by the current effective UID with mode
+    # EXACTLY 0700; a missing directory is created hardened. An insecure
+    # directory aborts plugin activation — no partial state, no tools, no
+    # hooks. The error is never silently swallowed; the log line contains
+    # the path + reason only, NEVER secret values.
+    secrets_dir = resolve_secrets_dir_path()
+    try:
+        ensure_hardened_directory(secrets_dir, create_if_missing=True)
+    except FilesystemSecurityError as exc:
+        log.warning("Vaultwarden plugin load FAILED: insecure secrets "
+                    "directory: %s", exc)
+        return False
+
     # VWP-20 (v0.4.5): cleanup stale temp files from previous crashed runs
     # (SIGKILL/SIGTERM where the middleware's finally block did not run).
     # v0.5.8: the TTL now respects the configured placeholder_ttl_seconds
     # instead of a hardcoded lifetime — any file older than the registry
     # TTL is stale by definition.
+    # AUD-03 (v0.6.2): this also re-validates the directory fail-closed;
+    # FilesystemSecurityError propagating here would likewise abort loading.
     _cleanup_stale_secrets(ttl_seconds=config.placeholder_ttl_seconds)
 
     # VWP-02 (v0.4.6): remove stale ssh-agent sockets (file exists but no
@@ -153,7 +173,12 @@ def register(ctx: Any) -> bool:
         log.info("Terminal backend '%s' is sandboxed — privilege-separation "
                  "policy satisfied.", backend)
 
-    # 4. isolated appdata dir (chmod 700)
+    # 4. isolated appdata dir (.bw-data) — AUD-04 (v0.6.2): validated
+    # FAIL-CLOSED via the shared hardening validator (absolute, real
+    # non-symlink directory, owned by the current effective UID, mode
+    # exactly 0700; created hardened when missing, NEVER silently repaired).
+    # A FilesystemSecurityError here aborts plugin activation through the
+    # handler below (sanitized log + return False — no tools, no hooks).
     try:
         appdata_dir = ensure_appdata_dir(config.appdata_dir())
     except Exception as exc:

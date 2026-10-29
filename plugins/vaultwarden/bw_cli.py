@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import compat, errors
+from .secure_fs import ensure_hardened_directory
 from .security import audit_subprocess_env, get_logger
 
 log = get_logger("bw_cli")
@@ -191,7 +192,19 @@ class BwCli:
 
     # ------------------------------------------------------------------ env
     def base_env(self, extra: Mapping[str, str] | None = None) -> dict:
-        """Build the minimal isolated subprocess environment."""
+        """Build the minimal isolated subprocess environment.
+
+        AUD-04 (v0.6.2, FAIL-CLOSED): the appdata directory is re-validated
+        through :func:`secure_fs.ensure_hardened_directory` BEFORE
+        ``BITWARDENCLI_APPDATA_DIR`` is set — every ``bw`` subprocess runs
+        through this single choke point, so ``bw`` can NEVER be invoked
+        against an insecure appdata dir (symlink / wrong owner / mode not
+        exactly 0700). A missing dir is created hardened; an insecure one
+        raises ``FilesystemSecurityError``, which propagates to the caller
+        and blocks execution (never caught and ignored here).
+        """
+        ensure_hardened_directory(Path(self.appdata_dir),
+                                  create_if_missing=True)
         env = {
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
             "HOME": os.environ.get("HOME", str(Path.home())),

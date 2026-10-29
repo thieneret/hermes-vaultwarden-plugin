@@ -45,10 +45,32 @@ def test_load_secrets_missing_file_raises_config_error(tmp_path):
 
 
 def test_load_secrets_wrong_permissions_raises_config_error(tmp_path):
+    """AUD-08 (v0.6.2): an existing-but-insecure secrets.yaml fails CLOSED
+    with FilesystemSecurityError BEFORE any YAML parsing — and the file is
+    never silently repaired."""
     home = _make_secrets_home(tmp_path, mode=0o644)
-    with pytest.raises(errors.ConfigError) as exc:
+    from vaultwarden.secure_fs import FilesystemSecurityError
+    with pytest.raises(FilesystemSecurityError) as exc:
         secrets_mod.load_secrets(str(home))
-    assert "chmod 600" in (exc.value.suggestion or "")
+    assert "chmod 600" in str(exc.value)
+    # permissions untouched — no silent repair
+    path = home / "plugins" / "vaultwarden" / "secrets.yaml"
+    assert path.stat().st_mode & 0o777 == 0o644
+
+
+def test_load_secrets_symlink_never_parsed(tmp_path):
+    """AUD-08 (v0.6.2): a symlinked secrets.yaml is rejected via lstat() and
+    NEVER read/parsed."""
+    from vaultwarden.secure_fs import FilesystemSecurityError
+    target = tmp_path / "elsewhere.yaml"
+    target.write_text("client_secret: s3cr3t-cs\nmaster_password: s3cr3t-mp\n")
+    os.chmod(target, 0o600)
+    plugin_dir = tmp_path / "plugins" / "vaultwarden"
+    plugin_dir.mkdir(parents=True)
+    link = plugin_dir / "secrets.yaml"
+    link.symlink_to(target)
+    with pytest.raises(FilesystemSecurityError):
+        secrets_mod.load_secrets(str(tmp_path))
 
 
 def test_load_secrets_valid_returns_tuple(tmp_path):

@@ -109,6 +109,29 @@ def test_ensure_appdata_dir_chmod700(tmp_path):
     assert mode == 0o700
 
 
+def test_ensure_appdata_dir_rejects_insecure_dir(tmp_path):
+    """AUD-04 (v0.6.2): an existing-but-insecure .bw-data is NEVER silently
+    repaired — ensure_appdata_dir fails closed with FilesystemSecurityError."""
+    from vaultwarden.secure_fs import FilesystemSecurityError
+    d = tmp_path / ".bw-data"
+    d.mkdir(mode=0o755)  # group/world readable — insecure
+    with pytest.raises(FilesystemSecurityError):
+        ensure_appdata_dir(d)
+    # still insecure afterwards: no silent chmod repair happened
+    assert d.stat().st_mode & 0o777 == 0o755
+
+
+def test_ensure_appdata_dir_rejects_symlink(tmp_path):
+    """AUD-04 (v0.6.2): a symlinked appdata dir is rejected via lstat()."""
+    from vaultwarden.secure_fs import FilesystemSecurityError
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    link = tmp_path / ".bw-data"
+    link.symlink_to(real, target_is_directory=True)
+    with pytest.raises(FilesystemSecurityError):
+        ensure_appdata_dir(link)
+
+
 def test_unavailable_before_init():
     # fresh manager without ensure_authenticated is still CONFIGURED-capable;
     # UNINITIALIZED gate exercised via check_fn semantics:
