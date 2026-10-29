@@ -470,7 +470,15 @@ from vaultwarden.tests.conftest import RecordingCtx  # noqa: E402
 
 
 def _vw_register_ctx(tmp_path, fake_bw, monkeypatch, cls=None):
-    """Build a register()-ready stand-in host context for lifecycle tests."""
+    """Build a register()-ready stand-in host context for lifecycle tests.
+
+    AUD-06 detection is layered: context attribute -> declared
+    ``supported_hooks`` collection -> module-level VALID_HOOKS registry
+    (VWP-18). The default RecordingCtx declares the hooks; subclasses that
+    clear the declaration force detection onto the registry, so every test
+    installs the production-shaped VALID_HOOKS registry here — tests that
+    need a *reduced* registry overwrite it afterwards.
+    """
     from vaultwarden.tests.conftest import BASE_SECTION as _BASE
     from vaultwarden.tests.test_integration import _write_secrets_yaml
 
@@ -478,6 +486,7 @@ def _vw_register_ctx(tmp_path, fake_bw, monkeypatch, cls=None):
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "docker")
+    _install_fake_hermes_cli(monkeypatch, PRODUCTION_VALID_HOOKS)
     return (cls or RecordingCtx)({**_BASE, "enabled": True,
                                   "bw_cli_path": fake_bw})
 
@@ -590,6 +599,10 @@ def test_register_mandatory_hook_success_none_is_not_failure():
     """A successful registration returning None must NOT be treated as
     failure (the host API does not define None as failure)."""
     ctx = _CtxWithHooks()
+    # No VALID_HOOKS registry and no declared collection in this plain
+    # unit-test env: opt the stand-in host in via a hook-name attribute,
+    # exactly like a Hermes build exposing hooks as bound methods.
+    setattr(ctx, "post_tool_call", lambda *a, **kw: None)
     fn = lambda *a, **kw: None  # noqa: E731
     compat.register_mandatory_lifecycle_hook(ctx, "post_tool_call", fn)
     assert ctx.hooks == [("post_tool_call", fn)]
@@ -612,9 +625,13 @@ def test_register_mandatory_hook_exception_converted(caplog):
         def register_hook(self, kind, fn):
             raise ValueError("internal detail with possible secret leak")
 
+    exploding = ExplodingCtx()
+    # Attribute-based opt-in so capability detection succeeds and the
+    # registration call itself is what explodes.
+    setattr(exploding, "on_session_end", lambda *a, **kw: None)
     with pytest.raises(errors.PluginInitializationError) as ei:
         compat.register_mandatory_lifecycle_hook(
-            ExplodingCtx(), "on_session_end", lambda *a: None)
+            exploding, "on_session_end", lambda *a: None)
     msg = str(ei.value)
     assert "on_session_end" in msg
     assert "ValueError" in msg                    # type name kept
@@ -626,10 +643,14 @@ def test_register_mandatory_hook_explicit_false_raises():
         def register_hook(self, kind, fn):
             return False
 
+    false_ctx = FalseCtx()
+    # Attribute-based opt-in so detection succeeds and the host's explicit
+    # False return is what trips the fail-closed path.
+    setattr(false_ctx, "post_tool_call", lambda *a, **kw: None)
     with pytest.raises(errors.PluginInitializationError,
                        match="explicit failure"):
         compat.register_mandatory_lifecycle_hook(
-            FalseCtx(), "post_tool_call", lambda *a: None)
+            false_ctx, "post_tool_call", lambda *a: None)
 
 
 def test_plugin_initialization_error_taxonomy():

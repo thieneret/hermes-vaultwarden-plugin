@@ -81,10 +81,12 @@ def supports_lifecycle_hook(ctx: Any, hook_name: str) -> bool:
     3. via the module-level ``hermes_cli.plugins.VALID_HOOKS`` registry
        (VWP-18, current production Hermes builds).
 
-    When the host declares a ``supported_hooks`` collection (or ships a
-    ``VALID_HOOKS`` registry) but the requested hook is absent from it, the
-    host does NOT support the hook — the plugin fails closed instead of
-    optimistically registering into a hook the dispatcher never calls.
+    Detection order mirrors :func:`supports_transform_tool_result` exactly
+    (SEC-01 / VWP-18): context attribute first, then a declared collection,
+    and ONLY as a last resort the module-level registry. A declared
+    ``supported_hooks`` collection that omits the hook means the host does
+    NOT support it — the plugin fails closed instead of optimistically
+    registering into a hook the dispatcher never calls.
     """
     if not callable(getattr(ctx, "register_hook", None)):
         return False
