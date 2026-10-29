@@ -132,6 +132,32 @@ def test_ensure_appdata_dir_rejects_symlink(tmp_path):
         ensure_appdata_dir(link)
 
 
+def test_base_env_blocks_bw_on_insecure_appdata(fake_bw, tmp_path):
+    """AUD-04 (v0.6.2): the single bw-subprocess choke point re-validates
+    the appdata dir BEFORE exporting BITWARDENCLI_APPDATA_DIR — an insecure
+    dir raises FilesystemSecurityError and no env (hence no bw run) results."""
+    from vaultwarden.bw_cli import BwCli
+    from vaultwarden.secure_fs import FilesystemSecurityError
+    d = tmp_path / ".bw-data"
+    d.mkdir(mode=0o755)  # group/world accessible — insecure
+    cli = BwCli(fake_bw, d)
+    with pytest.raises(FilesystemSecurityError):
+        cli.base_env({"BW_SESSION": "x"})
+    # no silent repair: dir keeps its insecure mode
+    assert d.stat().st_mode & 0o777 == 0o755
+
+
+def test_base_env_creates_missing_appdata_hardened(fake_bw, tmp_path):
+    """AUD-04 (v0.6.2): a missing .bw-data is created hardened (0700)."""
+    from vaultwarden.bw_cli import BwCli
+    d = tmp_path / "fresh" / ".bw-data"
+    cli = BwCli(fake_bw, str(d))
+    env = cli.base_env()
+    assert d.is_dir()
+    assert d.stat().st_mode & 0o777 == 0o700
+    assert env["BITWARDENCLI_APPDATA_DIR"] == str(d)
+
+
 def test_unavailable_before_init():
     # fresh manager without ensure_authenticated is still CONFIGURED-capable;
     # UNINITIALIZED gate exercised via check_fn semantics:
