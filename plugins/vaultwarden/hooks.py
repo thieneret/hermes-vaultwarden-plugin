@@ -69,11 +69,13 @@ import tempfile
 import threading
 import time
 from collections.abc import MutableMapping
+from pathlib import Path
 from typing import Any, Callable
 
 from . import errors
 from .auth import AuthManager
 from .placeholders import PlaceholderRegistry
+from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
 from .security import get_logger, get_redacting_filter
 from .tools import _field_value
 
@@ -105,81 +107,42 @@ _DEFAULT_COMMAND_KEYS = ("command", "cmd", "input", "script", "code")
 _DEFAULT_STALE_TTL_SECONDS = 300
 
 
-def _validate_secrets_dir(d: str) -> None:
-    """Strictly validate the secrets directory *d* (fail-closed).
+def resolve_secrets_dir_path() -> Path:
+    """Resolve (WITHOUT creating or validating) the secrets directory path.
 
-    Defense-in-depth checks enforced on EVERY use of the directory, after
-    creation/resolution:
-
-    1. symlink: the directory itself must NOT be a symlink (a redirected
-       secrets dir would let a local attacker move secret material);
-    2. ownership: ``st_uid`` must be the current effective user or root;
-    3. permissions: the mode (masked with ``0o777``) must be EXACTLY
-       ``0o700``. A drifted mode is repaired once via ``chmod 0o700``; if
-       the repair fails or the resulting mode is still not ``0o700``, the
-       check fails closed.
-
-    Raises:
-        errors.SecurityError: on ANY validation failure. There is NO
-        fallback path — an insecure secrets directory must abort plugin
-        load / middleware registration instead of silently writing secret
-        material into an attacker-controlled location.
+    Prefers ``$XDG_RUNTIME_DIR/vw-secrets`` (typically tmpfs/RAM-backed);
+    falls back to ``<tempdir>/vw-secrets-<uid>`` when XDG_RUNTIME_DIR is
+    unusable. This is the single source of truth for WHERE the runtime
+    placeholder temp files live — both the injection middleware
+    (:func:`_secrets_dir`) and plugin load (AUD-03, ``register()``) derive
+    the path from here so they can never disagree.
     """
-    if os.path.islink(d):
-        raise errors.SecurityError(
-            "Secrets directory cannot be a symlink",
-            suggestion=f"Remove the symlink at {d!r} and recreate it as a "
-                       "real directory owned by the agent user (mode 0700).")
-    try:
-        st = os.stat(d)
-    except OSError as exc:
-        raise errors.SecurityError(
-            f"Cannot stat secrets directory: {type(exc).__name__}",
-            suggestion=f"Ensure {d!r} exists and is accessible.") from exc
-    if st.st_uid not in (0, os.geteuid()):
-        raise errors.SecurityError(
-            f"Secrets directory has unexpected owner uid {st.st_uid}; it "
-            "must be owned by root or the current effective user.",
-            suggestion=f"Run: chown root {d!r} (or remove the directory and "
-                       "let the plugin recreate it).")
-    if st.st_mode & 0o777 != 0o700:
-        # Attempt a one-shot repair, then re-validate — fail closed if the
-        # mode still drifts (chmod refused, filesystem quirks, races).
-        try:
-            os.chmod(d, 0o700)
-        except OSError as exc:
-            raise errors.SecurityError(
-                f"Cannot enforce 0700 on secrets directory: "
-                f"{type(exc).__name__}",
-                suggestion=f"Run: chmod 700 {d!r}") from exc
-        if os.stat(d).st_mode & 0o777 != 0o700:
-            raise errors.SecurityError(
-                "Secrets directory mode is not exactly 0700 after chmod.")
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    if xdg and os.path.isdir(xdg) and os.access(xdg, os.W_OK):
+        return Path(os.path.join(xdg, "vw-secrets"))
+    return Path(tempfile.gettempdir()) / f"vw-secrets-{os.getuid()}"
 
 
 def _secrets_dir() -> str:
     """Return the dedicated secrets directory, creating it if needed.
 
-    Prefers $XDG_RUNTIME_DIR/vw-secrets (typically tmpfs/RAM-backed).
-    Falls back to /tmp/vw-secrets-<uid> if XDG_RUNTIME_DIR is unavailable.
-    The directory is chmod 700 so no other user can list its contents.
+    AUD-03 (v0.6.2): hardened through the SHARED validator module
+    :func:`vaultwarden.secure_fs.ensure_hardened_directory` — absolute
+    path, real directory (never a symlink, checked via ``os.lstat()``),
+    owned by the CURRENT EFFECTIVE UID, mode EXACTLY ``0700``. A missing
+    directory is created with mode 0700 (umask-forced); an existing but
+    INSECURE directory is NEVER silently repaired (no implicit chmod/chown
+    any more) — the operator must fix it explicitly.
 
-    v0.5.8: STRICT VALIDATION (fail-closed defense-in-depth). Before the
-    resolved/created directory is returned it is validated by
-    :func:`_validate_secrets_dir`: non-symlink, owned by the current
-    effective user (or root), and mode EXACTLY 0700. Any violation raises
-    ``errors.SecurityError`` — the plugin refuses to load / inject rather
-    than falling back to an insecure path.
+    Raises:
+        FilesystemSecurityError: on ANY validation failure (fail-closed —
+        there is no fallback path). ``register()`` treats this as fatal
+        and refuses to activate the plugin; the injection middleware
+        surfaces it as a sanitized ``PlaceholderError``.
     """
-    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
-    if xdg and os.path.isdir(xdg) and os.access(xdg, os.W_OK):
-        d = os.path.join(xdg, "vw-secrets")
-    else:
-        d = os.path.join(tempfile.gettempdir(), f"vw-secrets-{os.getuid()}")
-    os.makedirs(d, mode=0o700, exist_ok=True)
-    os.chmod(d, 0o700)
-    _validate_secrets_dir(d)
-    return d
+    d = resolve_secrets_dir_path()
+    ensure_hardened_directory(d, create_if_missing=True)
+    return str(d)
 
 
 def _cleanup_stale_secrets(ttl_seconds: int | None = None):
@@ -200,16 +163,23 @@ def _cleanup_stale_secrets(ttl_seconds: int | None = None):
 
     Called at plugin startup (in register()) to ensure stale files are
     cleaned up even if the previous process crashed.
+
+    AUD-03 (v0.6.2) load-time gate: the secrets directory is validated
+    FAIL-CLOSED here before the scan runs — ``_secrets_dir()`` raises
+    ``FilesystemSecurityError`` for an existing-but-insecure directory
+    (symlink / wrong owner / mode != 0700) and the error PROPAGATES to
+    register(), which refuses to activate the plugin. A merely-missing
+    directory is created hardened (0700). Only after validation passes does
+    the best-effort scan run; transient SCAN errors stay best-effort
+    (sanitized warnings) because attempting removal of leftover secret
+    files is always safe and never reads secret VALUES.
     """
     if ttl_seconds is None or ttl_seconds <= 0:
         ttl_seconds = _DEFAULT_STALE_TTL_SECONDS
-    try:
-        secrets_dir = _secrets_dir()
-    except (OSError, errors.VaultwardenError):
-        # Cannot create/access/validate the dir — the strict validation
-        # inside _secrets_dir() already surfaces loudly wherever it is
-        # enforced; startup stale cleanup stays best-effort and skips.
-        return
+    # Fail-closed load-time validation (AUD-03): do NOT catch
+    # FilesystemSecurityError / OSError here — an insecure secrets
+    # directory must abort plugin activation, not skip cleanup silently.
+    secrets_dir = _secrets_dir()
 
     if not os.path.isdir(secrets_dir):
         return
@@ -427,7 +397,28 @@ def make_placeholder_resolver(auth: AuthManager,
         # surface to the agent.
         with _PENDING_LOCK:
             task_errors = _PENDING_ERRORS.setdefault(task_id or "", [])
-        secrets_dir = _secrets_dir()
+        try:
+            secrets_dir = _secrets_dir()
+        except FilesystemSecurityError as exc:
+            # AUD-03 (v0.6.2) fail-closed injection gate: the hardened
+            # secrets-dir validation now also runs at plugin LOAD, so this
+            # path only triggers when the directory became insecure AFTER
+            # activation (e.g. an operator chmod/chown mid-session). NEVER
+            # write secret material into an unsafe directory and NEVER fall
+            # back to another path: every token in this command stays
+            # verbatim ($__VW_SECRET_x__ expands to an empty string in the
+            # shell — fail-safe, no leak, the command simply fails on the
+            # empty value). The sanitized reason (PATH + error class only,
+            # never secret values) is recorded for post_tool_call to
+            # surface to the agent.
+            log.error("fail-closed: secrets directory rejected by "
+                      "hardening validation (%s); placeholders left "
+                      "unresolved for %s", exc, tool_name)
+            task_errors.append(
+                errors.PlaceholderError(
+                    "Secrets directory failed filesystem hardening "
+                    "validation; injection blocked (fail-closed).").to_dict())
+            return next_call(args)
         temp_files: list[str] = []
         injected_values: list[str] = []
         new_args = dict(args)

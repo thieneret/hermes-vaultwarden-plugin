@@ -51,13 +51,6 @@ class FilesystemSecurityError(Exception):
 #: Owner-only directory mode enforced by ensure_hardened_directory().
 DIRECTORY_MODE = 0o700
 
-#: Trusted owners for a security-sensitive path: the current effective UID
-#: (the plugin's own privilege domain) or root (uid 0) — the deployment
-#: superuser that legitimately provisions operator directories. This mirrors
-#: the long-standing ownership policy of the v0.5.8 secrets-dir validation
-#: and VWP-01 binary validation; anything else fails closed.
-_TRUSTED_DIR_UIDS = (0,)
-
 
 def _require_absolute(path: Path, kind: str) -> None:
     if not str(path) or not os.path.isabs(str(path)):
@@ -66,23 +59,19 @@ def _require_absolute(path: Path, kind: str) -> None:
 
 
 def _check_ownership(st: os.stat_result, path: Path, kind: str) -> None:
+    """Ownership gate — fail closed unless the CURRENT EFFECTIVE UID owns it.
+
+    Root-owned paths are NOT trusted either: a root-owned 0700 directory is
+    unwritable by the plugin and an attacker that swapped an operator path
+    for a root-owned decoy must not pass validation silently. Operators fix
+    ownership explicitly via ``chown`` (see README remediation commands).
+    """
     euid = os.geteuid()
     if st.st_uid != euid:
         raise FilesystemSecurityError(
             f"{kind} {path} is owned by uid {st.st_uid}, not the current "
-            f"effective uid {euid}; refusing to use it")
-
-
-def _check_directory_trust(st: os.stat_result, path: Path) -> None:
-    """Ownership gate for shared/operator-managed DIRECTORIES.
-
-    Accepts the current effective UID or root (see _TRUSTED_DIR_UIDS).
-    """
-    euid = os.geteuid()
-    if st.st_uid not in _TRUSTED_DIR_UIDS + (euid,):
-        raise FilesystemSecurityError(
-            f"Directory {path} is owned by uid {st.st_uid}; it must be "
-            "owned by root or the current effective user")
+            f"effective uid {euid}; refusing to use it. Fix it explicitly "
+            f'with: chown "$USER":"$USER" {path}')
 
 
 # ── directories (AUD-03 secrets dir, AUD-04 .bw-data) ───────────────────────
