@@ -5,20 +5,6 @@ Author: **thieneret**
 
 ---
 
-## [0.6.0] - 2026-10-29
-
-v0.6.0 (AUD-01) — enforce HTTPS for server_url configuration
-- BREAKING: `server_url` now strictly requires the `https://` scheme by
-  default. Cleartext `http://` URLs are rejected with a ConfigError and
-  prevent the plugin from loading.
-- New config flag `allow_insecure_http` (default: false). When set to true,
-  `http://` is permitted for any hostname (developer's explicit risk
-  acceptance), and a WARNING is logged. This replaces the previously
-  unrestricted scheme parsing.
-- Invalid schemes (ftp://, file://, ws://, empty) are now explicitly rejected.
-- Docs: README.md updated with the new flag and its security implications.
-- Bump version to 0.6.0.
-
 ## [0.5.9] - 2026-10-29
 
 v0.5.9 — SEC-01 E2E integration test ("Leaky Cat" scenario)
