@@ -59,6 +59,96 @@ def register_hook_if_available(ctx: Any, hook_name: str, hook_fn: Any) -> bool:
 #: The single hook name whose presence is MANDATORY since SEC-01 (v0.5.4).
 TRANSFORM_TOOL_RESULT_HOOK = "transform_tool_result"
 
+#: Lifecycle hooks that are MANDATORY since AUD-06 (v0.6.3). These are the
+#: hooks the plugin ACTUALLY implements and dispatches on: ``post_tool_call``
+#: (placeholder cleanup, temp-file cleanup observability, metrics, post-call
+#: hygiene) and ``on_session_end`` (session-end cleanup / session lifecycle
+#: termination — the equivalent session-end hook implemented by this plugin
+#: is named exactly ``on_session_end``; no other name is invented).
+MANDATORY_LIFECYCLE_HOOKS = ("post_tool_call", "on_session_end")
+
+
+def supports_lifecycle_hook(ctx: Any, hook_name: str) -> bool:
+    """AUD-06 (v0.6.3): explicit capability detection for a lifecycle hook.
+
+    Follows the SAME VWP-06 rule as every other capability check in this
+    module: explicit introspection (``callable()`` / ``hasattr()`` /
+    membership tests), NEVER exception-based probing. A host exposes a
+    hook in one of three ways:
+
+    1. as a bound attribute/method on the PluginContext,
+    2. by declaring the hook name in a ``supported_hooks`` collection,
+    3. via the module-level ``hermes_cli.plugins.VALID_HOOKS`` registry
+       (VWP-18, current production Hermes builds).
+
+    When the host declares a ``supported_hooks`` collection (or ships a
+    ``VALID_HOOKS`` registry) but the requested hook is absent from it, the
+    host does NOT support the hook — the plugin fails closed instead of
+    optimistically registering into a hook the dispatcher never calls.
+    """
+    if not callable(getattr(ctx, "register_hook", None)):
+        return False
+    if hasattr(ctx, hook_name):
+        return True
+    declared = getattr(ctx, "supported_hooks", None)
+    if isinstance(declared, (list, tuple, set, frozenset)):
+        return hook_name in set(declared)
+    # VWP-18 hosts advertise ALL dispatchable hook names (lifecycle hooks
+    # included) through the module-level VALID_HOOKS registry. Guarded
+    # membership test — never raises, conservative False when absent.
+    return _valid_hooks_registry_supports(hook_name)
+
+
+def register_mandatory_lifecycle_hook(ctx: Any, hook_name: str,
+                                      handler: Any) -> None:
+    """AUD-06 (v0.6.3): register a MANDATORY lifecycle hook, FAIL-CLOSED.
+
+    Raises ``errors.PluginInitializationError`` when:
+      * the host does not support ``hook_name`` (explicit capability
+        detection via :func:`supports_lifecycle_hook`), or
+      * ``ctx.register_hook`` itself raises (the original exception type is
+        reported as the sanitized failure reason), or
+      * the host API signals failure EXPLICITLY by returning ``False``.
+
+    A ``None`` return (or any non-``False`` return) from a supported host
+    means SUCCESS: some Hermes builds' ``register_hook`` has no return
+    value at all, and treating ``None`` as failure would falsely refuse
+    healthy hosts. Only an explicit ``False`` is a failure indicator.
+
+    Error messages contain the hook name and a sanitized failure reason
+    ONLY — never secrets, YAML contents, environment values, or session
+    material. Callers MUST NOT wrap this function in a swallowing
+    try/except: failures propagate out of ``register()`` so the plugin
+    never reaches a partially active state and tools are never exposed
+    without their required lifecycle hooks.
+    """
+    from . import errors
+
+    if not supports_lifecycle_hook(ctx, hook_name):
+        raise errors.PluginInitializationError(
+            f"fail-closed: host Hermes does not support the mandatory "
+            f"lifecycle hook '{hook_name}'. Refusing to load the "
+            f"Vaultwarden plugin without it — cleanup/session-termination "
+            f"guarantees cannot be met on this host. Upgrade Hermes or "
+            f"disable this plugin.")
+    try:
+        result = ctx.register_hook(hook_name, handler)
+    except Exception as exc:
+        # Re-raise as an initialization failure; keep the ORIGINAL
+        # exception TYPE NAME only (sanitized reason), never its args —
+        # host exception payloads are not trusted to be secret-free.
+        raise errors.PluginInitializationError(
+            f"fail-closed: register_hook('{hook_name}') raised "
+            f"{type(exc).__name__}. Refusing to load the Vaultwarden "
+            f"plugin without the mandatory lifecycle hook.") from None
+    if result is False:
+        # Explicit host-API failure indicator ONLY. None / truthy returns
+        # are success (see docstring).
+        raise errors.PluginInitializationError(
+            f"fail-closed: register_hook('{hook_name}') returned an "
+            f"explicit failure indicator. Refusing to load the "
+            f"Vaultwarden plugin without the mandatory lifecycle hook.")
+
 
 def supports_transform_tool_result(ctx: Any) -> bool:
     """SEC-01 (v0.5.4): capability detection for the authoritative result

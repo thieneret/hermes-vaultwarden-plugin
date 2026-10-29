@@ -462,3 +462,343 @@ def test_vwp18_register_loads_on_bare_valid_hooks_host(monkeypatch, tmp_path,
     assert not hasattr(ctx, "transform_tool_result")
     assert vaultwarden.register(ctx) is True
     assert [kind for kind, _ in ctx.hooks][0] == "transform_tool_result"
+
+
+# ── AUD-06 (v0.6.3): fail-closed mandatory lifecycle-hook registration ──
+
+from vaultwarden.tests.conftest import RecordingCtx  # noqa: E402
+
+
+def _vw_register_ctx(tmp_path, fake_bw, monkeypatch, cls=None):
+    """Build a register()-ready stand-in host context for lifecycle tests."""
+    from vaultwarden.tests.conftest import BASE_SECTION as _BASE
+    from vaultwarden.tests.test_integration import _write_secrets_yaml
+
+    _write_secrets_yaml(tmp_path)
+    monkeypatch.delenv("BW_CLI_PATH", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    return (cls or RecordingCtx)({**_BASE, "enabled": True,
+                                  "bw_cli_path": fake_bw})
+
+
+class _NoLifecycleRegistryCtx(RecordingCtx):
+    """Host whose VALID_HOOKS registry lists transform_tool_result but NOT
+    the mandatory lifecycle hooks — the hook is missing from the host hook
+    registry entirely."""
+
+    supported_hooks = None  # force detection onto the VALID_HOOKS registry
+
+
+class _RaisingPostToolCallCtx(RecordingCtx):
+    def register_hook(self, kind, fn):
+        if kind == "post_tool_call":
+            raise RuntimeError("host rejects post_tool_call")
+        self.hooks.append((kind, fn))
+
+
+class _RaisingSessionEndCtx(RecordingCtx):
+    def register_hook(self, kind, fn):
+        if kind == "on_session_end":
+            raise RuntimeError("host rejects on_session_end")
+        self.hooks.append((kind, fn))
+
+
+class _FalsePostToolCallCtx(RecordingCtx):
+    """Host that signals explicit registration failure with a False return."""
+
+    def register_hook(self, kind, fn):
+        if kind == "post_tool_call":
+            return False
+        self.hooks.append((kind, fn))
+        return None
+
+
+class _FalseSessionEndCtx(RecordingCtx):
+    def register_hook(self, kind, fn):
+        if kind == "on_session_end":
+            return False
+        self.hooks.append((kind, fn))
+        return None
+
+
+class _NoneReturningCtx(RecordingCtx):
+    """register_hook returns None explicitly — success per the host API."""
+
+    def register_hook(self, kind, fn):
+        result = super().register_hook(kind, fn)
+        assert result is None          # list.append contract
+        return None
+
+
+# -- supports_lifecycle_hook: explicit capability detection -------------------
+
+def test_supports_lifecycle_hook_declared_true():
+    ctx = RecordingCtx()
+    assert compat.supports_lifecycle_hook(ctx, "post_tool_call") is True
+    assert compat.supports_lifecycle_hook(ctx, "on_session_end") is True
+
+
+def test_supports_lifecycle_hook_declared_missing_false():
+    """Declared supported_hooks collection WITHOUT the hook -> unsupported
+    (fail-closed). No exception-based probing involved."""
+    ctx = RecordingCtx()
+    ctx.supported_hooks = frozenset({"transform_tool_result"})
+    assert compat.supports_lifecycle_hook(ctx, "post_tool_call") is False
+    assert compat.supports_lifecycle_hook(ctx, "on_session_end") is False
+
+
+def test_supports_lifecycle_hook_no_register_hook_false():
+    class NoHooks:
+        supported_hooks = frozenset({"post_tool_call"})
+
+    assert compat.supports_lifecycle_hook(NoHooks(), "post_tool_call") is False
+
+
+def test_supports_lifecycle_hook_valid_registry(monkeypatch):
+    """VWP-18-style hosts: hook support advertised ONLY via the module-level
+    hermes_cli.plugins.VALID_HOOKS registry is detected explicitly."""
+    _install_fake_hermes_cli(monkeypatch, PRODUCTION_VALID_HOOKS)
+    ctx = _BareCtx()
+    assert compat.supports_lifecycle_hook(ctx, "post_tool_call") is True
+    assert compat.supports_lifecycle_hook(ctx, "on_session_end") is True
+
+
+def test_supports_lifecycle_hook_valid_registry_missing_hook(monkeypatch):
+    """Required lifecycle hook MISSING from the host hook registry -> False
+    (fail-closed), even though transform_tool_result IS present."""
+    _install_fake_hermes_cli(
+        monkeypatch, ["pre_tool_call", "transform_tool_result"])
+    ctx = _BareCtx()
+    assert compat.supports_lifecycle_hook(ctx, "post_tool_call") is False
+    assert compat.supports_lifecycle_hook(ctx, "on_session_end") is False
+    assert compat.supports_lifecycle_hook(ctx, "transform_tool_result") is True
+
+
+def test_supports_lifecycle_hook_no_host_signal_false(monkeypatch):
+    """No attribute, no declared collection, no registry -> conservative
+    False. Never raises (no exception-based capability probing)."""
+    monkeypatch.delitem(sys.modules, "hermes_cli", raising=False)
+    monkeypatch.delitem(sys.modules, "hermes_cli.plugins", raising=False)
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)
+    assert compat.supports_lifecycle_hook(_BareCtx(), "post_tool_call") is False
+
+
+# -- register_mandatory_lifecycle_hook ----------------------------------------
+
+def test_register_mandatory_hook_success_none_is_not_failure():
+    """A successful registration returning None must NOT be treated as
+    failure (the host API does not define None as failure)."""
+    ctx = _CtxWithHooks()
+    fn = lambda *a, **kw: None  # noqa: E731
+    compat.register_mandatory_lifecycle_hook(ctx, "post_tool_call", fn)
+    assert ctx.hooks == [("post_tool_call", fn)]
+
+
+def test_register_mandatory_hook_unsupported_raises():
+    class LegacyCtx(_CtxWithHooks):
+        supported_hooks = frozenset({"transform_tool_result"})
+
+    with pytest.raises(errors.PluginInitializationError,
+                       match="post_tool_call"):
+        compat.register_mandatory_lifecycle_hook(
+            LegacyCtx(), "post_tool_call", lambda *a: None)
+
+
+def test_register_mandatory_hook_exception_converted(caplog):
+    """Registration raising -> PluginInitializationError with a SANITIZED
+    reason: original exception TYPE NAME only, never its payload."""
+    class ExplodingCtx(_CtxWithHooks):
+        def register_hook(self, kind, fn):
+            raise ValueError("internal detail with possible secret leak")
+
+    with pytest.raises(errors.PluginInitializationError) as ei:
+        compat.register_mandatory_lifecycle_hook(
+            ExplodingCtx(), "on_session_end", lambda *a: None)
+    msg = str(ei.value)
+    assert "on_session_end" in msg
+    assert "ValueError" in msg                    # type name kept
+    assert "possible secret leak" not in msg      # payload sanitized away
+
+
+def test_register_mandatory_hook_explicit_false_raises():
+    class FalseCtx(_CtxWithHooks):
+        def register_hook(self, kind, fn):
+            return False
+
+    with pytest.raises(errors.PluginInitializationError,
+                       match="explicit failure"):
+        compat.register_mandatory_lifecycle_hook(
+            FalseCtx(), "post_tool_call", lambda *a: None)
+
+
+def test_plugin_initialization_error_taxonomy():
+    """AUD-06 error type: dedicated fail-closed initialization/security
+    error with its own taxonomy code."""
+    assert issubclass(errors.PluginInitializationError, errors.SecurityError)
+    assert errors.PluginInitializationError.code == "PLUGIN_INITIALIZATION_ERROR"
+    exc = errors.PluginInitializationError("boom")
+    assert exc.to_dict()["error_code"] == "PLUGIN_INITIALIZATION_ERROR"
+    assert compat.get_error_code(exc) == "PLUGIN_INITIALIZATION_ERROR"
+
+
+# -- register(): lifecycle hooks are MANDATORY (fail-closed) ------------------
+
+def test_aud06_post_tool_call_unsupported_refuses_load(tmp_path, fake_bw,
+                                                       monkeypatch):
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch,
+                           _NoLifecycleRegistryCtx)
+    _install_fake_hermes_cli(
+        monkeypatch, ["pre_tool_call", "transform_tool_result"])
+    assert compat.TRANSFORM_TOOL_RESULT_HOOK in \
+        set(sys.modules["hermes_cli.plugins"].VALID_HOOKS)
+    ok = vaultwarden.register(ctx)
+    assert ok is False
+    kinds = [k for k, _ in ctx.hooks]
+    assert "post_tool_call" not in kinds
+    # NO partial state: tools are never exposed when a required lifecycle
+    # hook cannot be registered.
+    assert ctx.tools == []
+
+
+def test_aud06_on_session_end_unsupported_refuses_load(tmp_path, fake_bw,
+                                                       monkeypatch):
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch,
+                           _NoLifecycleRegistryCtx)
+    _install_fake_hermes_cli(
+        monkeypatch,
+        ["pre_tool_call", "transform_tool_result", "post_tool_call"])
+    ok = vaultwarden.register(ctx)
+    assert ok is False
+    kinds = [k for k, _ in ctx.hooks]
+    assert "post_tool_call" in kinds       # first hook landed...
+    assert "on_session_end" not in kinds   # ...second one refused the load
+    assert ctx.tools == []                 # ...and tools were never exposed
+
+
+def test_aud06_post_tool_call_registration_raises_refuses_load(tmp_path,
+                                                               fake_bw,
+                                                               monkeypatch,
+                                                               caplog):
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch,
+                           _RaisingPostToolCallCtx)
+    with caplog.at_level(logging.ERROR):
+        ok = vaultwarden.register(ctx)
+    assert ok is False
+    assert "post_tool_call" in caplog.text
+    assert ctx.tools == []
+    assert all(k != "post_tool_call" for k, _ in ctx.hooks)
+
+
+def test_aud06_on_session_end_registration_raises_refuses_load(tmp_path,
+                                                               fake_bw,
+                                                               monkeypatch,
+                                                               caplog):
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch,
+                           _RaisingSessionEndCtx)
+    with caplog.at_level(logging.ERROR):
+        ok = vaultwarden.register(ctx)
+    assert ok is False
+    assert "on_session_end" in caplog.text
+    assert ctx.tools == []
+
+
+def test_aud06_post_tool_call_explicit_false_refuses_load(tmp_path, fake_bw,
+                                                          monkeypatch):
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch,
+                           _FalsePostToolCallCtx)
+    assert vaultwarden.register(ctx) is False
+    assert ctx.tools == []
+
+
+def test_aud06_on_session_end_explicit_false_refuses_load(tmp_path, fake_bw,
+                                                          monkeypatch):
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch,
+                           _FalseSessionEndCtx)
+    assert vaultwarden.register(ctx) is False
+    assert ctx.tools == []
+
+
+def test_aud06_all_hooks_registered_none_success_loads(tmp_path, fake_bw,
+                                                       monkeypatch):
+    """Happy path: all mandatory hooks supported and registration succeeds
+    (including a register_hook that returns None) -> plugin loads and the
+    12 tools are exposed AFTER the hooks landed."""
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch, _NoneReturningCtx)
+    assert vaultwarden.register(ctx) is True
+    assert [k for k, _ in ctx.hooks] == ["transform_tool_result",
+                                         "post_tool_call", "on_session_end"]
+    assert len(ctx.tools) == 12
+
+
+def test_aud06_tools_exposed_only_after_mandatory_hooks(tmp_path, fake_bw,
+                                                        monkeypatch):
+    """Ordering guard: every mandatory registration completes BEFORE the
+    first tool is exposed (tools appended last on the recording ctx)."""
+    events: list[str] = []
+
+    class OrderedCtx(RecordingCtx):
+        def register_hook(self, kind, fn):
+            events.append(f"hook:{kind}")
+            super().register_hook(kind, fn)
+
+        def register_middleware(self, kind, fn):
+            events.append(f"middleware:{kind}")
+            super().register_middleware(kind, fn)
+
+        def register_tool(self, *, name, toolset, schema, handler,
+                          check_fn=None):
+            events.append(f"tool:{name}")
+            super().register_tool(name=name, toolset=toolset, schema=schema,
+                                  handler=handler, check_fn=check_fn)
+
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch, OrderedCtx)
+    assert vaultwarden.register(ctx) is True
+    first_tool = next(i for i, e in enumerate(events) if e.startswith("tool:"))
+    for required in ("hook:transform_tool_result", "middleware:tool_execution",
+                     "hook:post_tool_call", "hook:on_session_end"):
+        assert required in events[:first_tool], f"{required} after tools!"
+    assert sum(1 for e in events if e.startswith("tool:")) == 12
+
+
+def test_aud06_sanitized_failure_logs_contain_no_secrets(tmp_path, fake_bw,
+                                                         monkeypatch, caplog):
+    """Failure logs carry the hook name + sanitized reason only — never
+    secrets, YAML contents, env values, or session material."""
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch,
+                           _RaisingPostToolCallCtx)
+    with caplog.at_level(logging.ERROR):
+        assert vaultwarden.register(ctx) is False
+    text = caplog.text
+    assert "post_tool_call" in text
+    assert "PLUGIN_INITIALIZATION_ERROR" in text
+    for forbidden in ("cs-secret", "mp-secret", "client_secret",
+                      "master_password", "session"):
+        assert forbidden not in text.lower()
+
+
+def test_aud06_transform_tool_result_fail_closed_unchanged(tmp_path,
+                                                           fake_bw,
+                                                           monkeypatch):
+    """SEC-01 regression: transform_tool_result failure handling stays a
+    SEPARATE, dedicated path (not merged into the generic lifecycle
+    catch-all) and still refuses the load FIRST — before middleware and
+    lifecycle hooks are even attempted."""
+    events: list[str] = []
+
+    class LegacyCtx(RecordingCtx):
+        supported_hooks = frozenset({"post_tool_call", "on_session_end"})
+
+        def register_hook(self, kind, fn):
+            events.append(kind)
+            super().register_hook(kind, fn)
+
+        def register_middleware(self, kind, fn):
+            events.append(kind)
+            super().register_middleware(kind, fn)
+
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch, LegacyCtx)
+    assert vaultwarden.register(ctx) is False
+    # Refused before ANY middleware/hook registration was attempted.
+    assert events == []
+    assert ctx.tools == []

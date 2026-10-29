@@ -183,6 +183,22 @@ class SecurityError(PluginError):
     recoverable = False
 
 
+# ---------------------------------------------------- v0.6.3 error taxonomy
+class PluginInitializationError(SecurityError):
+    """AUD-06: fail-closed plugin-initialization failure raised when a
+    MANDATORY lifecycle hook cannot be registered (unsupported by the host,
+    registration raised, or registration returned an explicit failure).
+
+    The plugin refuses to load — tools are never exposed on a partially
+    initialized plugin. Messages may contain hook names and sanitized
+    failure reasons ONLY — never secrets, YAML contents, environment
+    variable values, or session material.
+    """
+
+    code = "PLUGIN_INITIALIZATION_ERROR"
+    recoverable = False
+
+
 def error_response(exc: Exception) -> dict:
     """Convert any exception into the standard, secret-free error dict."""
     if isinstance(exc, VaultwardenError):
