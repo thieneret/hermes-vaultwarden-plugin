@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import enum
 import os
-import stat
 import threading
 import time
 from pathlib import Path
@@ -27,6 +26,7 @@ from pathlib import Path
 from . import compat, errors
 from .bw_cli import BwCli
 from .config import PluginConfig
+from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
 from .security import get_logger, get_redacting_filter
 
 log = get_logger("auth")
@@ -41,16 +41,30 @@ class AuthState(str, enum.Enum):
 
 
 def ensure_appdata_dir(path: str | Path) -> Path:
-    """Create the isolated bw appdata dir with mode 700 (plan §10)."""
+    """Validate/create the isolated bw appdata dir (.bw-data), fail-closed.
+
+    AUD-04 (v0.6.2): hardened through the SHARED validator module
+    :func:`vaultwarden.secure_fs.ensure_hardened_directory` — absolute,
+    real (non-symlink) directory owned by the CURRENT EFFECTIVE UID with
+    mode EXACTLY 0700. A missing directory is created hardened (umask-
+    forced); an existing but INSECURE directory is NEVER silently repaired
+    (the old implicit chmod is gone) — the operator must fix it explicitly.
+
+    Raises:
+        FilesystemSecurityError: on ANY validation failure (fail-closed —
+        ``bw`` must not be invoked against an insecure appdata dir).
+        errors.AppdataError: when creation itself fails at the OS level.
+    """
     p = Path(path).expanduser()
     try:
-        p.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(p, stat.S_IRWXU)  # rwx------ (idempotent, fixes umask effects)
+        return ensure_hardened_directory(p, create_if_missing=True)
+    except FilesystemSecurityError:
+        # Fail closed — never downgrade; register()/callers abort on this.
+        raise
     except OSError as exc:
         raise errors.AppdataError(
             f"Cannot create isolated bw data directory ({type(exc).__name__}).",
             suggestion="Check permissions of the plugin directory or set VW_APPDATA_DIR.") from exc
-    return p
 
 
 class AuthManager:

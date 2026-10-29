@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from . import errors
+from .secure_fs import FilesystemSecurityError, ensure_hardened_secret_file
 
 log = logging.getLogger("hermes.plugins.vaultwarden.secrets")
 
@@ -167,23 +168,28 @@ def load_secrets(hermes_home: str) -> tuple[str, str]:
     """
     path = Path(hermes_home).expanduser() / "plugins" / "vaultwarden" / "secrets.yaml"
 
-    if not path.is_file():
-        raise errors.ConfigError(
-            f"Bootstrap secrets file not found: {path}",
-            suggestion=(
-                "Copy plugins/vaultwarden/secret.yaml.template to "
-                f"{path}, fill in 'client_secret' and 'master_password', "
-                "then run: chmod 600 secrets.yaml"),
-        )
-
-    # v0.5.0: strict permission check — the file holds raw secret VALUES,
-    # so owner read/write only (0600) is mandatory. Fail closed otherwise.
-    mode = path.stat().st_mode & 0o777
-    if mode != 0o600:
-        raise errors.ConfigError(
-            f"Insecure permissions on {path}: {oct(mode)} (expected 0600)",
-            suggestion=f"Run: chmod 600 {path}",
-        )
+    # AUD-08 (v0.6.2, FAIL-CLOSED): validate the file through the SHARED
+    # hardening validator BEFORE any YAML parsing or read: absolute path,
+    # regular file (never a symlink — checked via os.lstat()), owned by the
+    # CURRENT EFFECTIVE UID, no group/other access (mode & 0o077 == 0;
+    # canonical mode 0600). An existing but insecure secrets.yaml is NEVER
+    # parsed and NEVER silently repaired. FilesystemSecurityError propagates
+    # to register(), which aborts plugin activation (sanitized log only —
+    # path + reason, never secret values).
+    try:
+        ensure_hardened_secret_file(path, allow_missing=False)
+    except FilesystemSecurityError as exc:
+        if "does not exist" in str(exc):
+            raise errors.ConfigError(
+                f"Bootstrap secrets file not found: {path}",
+                suggestion=(
+                    "Copy plugins/vaultwarden/secret.yaml.template to "
+                    f"{path}, fill in 'client_secret' and 'master_password', "
+                    "then run: chmod 600 secrets.yaml"),
+            ) from None
+        # Insecure-but-present file: fail closed, do NOT parse. Keep the
+        # dedicated error type so callers/tests can distinguish it.
+        raise
 
     try:
         data = _load_yaml_mapping(path)

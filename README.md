@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.6.1**
+**Current version: v0.6.2**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without
 > traditional manual code review of every line. Use at your own
@@ -398,6 +398,68 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
     instead. Do NOT repeat the secret value in your reply."}
 ```
 
+## Filesystem Security Requirements
+
+v0.6.2 (AUD-03 / AUD-04 / AUD-08) introduced a shared filesystem-hardening
+layer (`plugins/vaultwarden/secure_fs.py`) that validates every
+security-sensitive path **fail-closed** before it is trusted:
+
+* the **secret-injection directory** (runtime placeholder temp files,
+  `$XDG_RUNTIME_DIR/vw-secrets`) is validated at plugin load — an insecure
+  directory aborts activation; no tools or hooks are registered;
+* the **Bitwarden appdata directory** (`.bw-data`, exported to `bw` as
+  `BITWARDENCLI_APPDATA_DIR`) is validated before *any* `bw` subprocess
+  invocation — an insecure directory blocks `bw` execution;
+* the **bootstrap secret file** (`secrets.yaml`) is validated *before* YAML
+  parsing — an existing but insecure `secrets.yaml` is NEVER parsed and no
+  bootstrap secret is loaded from it.
+
+All validators use `os.lstat()` (symlinks are never followed), reject
+symlinks, require ownership by the current effective UID, and enforce strict
+permissions. Insecure paths are **never silently repaired** — the operator
+must fix them explicitly. Validation failures raise
+`FilesystemSecurityError`, which is never caught-and-ignored: plugin
+activation aborts or `bw` execution is blocked. Error logs contain paths and
+reasons only — never secret values, file contents, or environment variables.
+
+### Required permissions
+
+| Path | Required mode | Ownership | Notes |
+| --- | --- | --- | --- |
+| Secrets directory (`$XDG_RUNTIME_DIR/vw-secrets`) | `0700` exactly | current user (effective UID) | created hardened if missing; must NOT be a symlink |
+| `.bw-data` (Bitwarden appdata dir) | `0700` exactly | current user (effective UID) | created hardened if missing; must NOT be a symlink |
+| `secrets.yaml` (bootstrap secrets) | `0600` (no group/other bits) | current user (effective UID) | regular file only; must NOT be a symlink |
+
+### Operator remediation commands
+
+Fix ownership and permissions explicitly (the plugin will not do this for you):
+
+```bash
+chown "$USER":"$USER" /path/to/secrets-dir
+chmod 700 /path/to/secrets-dir
+
+chown "$USER":"$USER" /path/to/.bw-data
+chmod 700 /path/to/.bw-data
+
+chown "$USER":"$USER" /path/to/secrets.yaml
+chmod 600 /path/to/secrets.yaml
+```
+
+If a security-sensitive path is a **symlink**, remove it and recreate a real
+directory (a symlink could redirect secret material to an
+attacker-controlled location):
+
+```bash
+rm /path/to/symlink
+mkdir -m 700 /path/to/real-dir
+```
+
+> ⚠️ **Validation is fail-closed.** Existing installations with unsafe
+> permissions (world-readable dirs, symlinked paths, wrong owner) will
+> **stop working after updating to v0.6.2** until the operator applies the
+> remediation commands above. The plugin refuses to load, `bw` is refused,
+> and `secrets.yaml` is refused rather than silently relaxing security.
+
 ## Security Architecture
 
 | Mechanism | Description |
@@ -418,7 +480,10 @@ vaultwarden_store(name="raw-test", username="u", password="hunter2")
 | Middleware fail-closed | If placeholder-injection middleware cannot be registered, the plugin refuses to load. No silent fallback without secret protection |
 | File-injected placeholder injection | Secrets are written to a chmod 600 temp file (mkstemp, atomic) in a dedicated chmod 700 directory under `$XDG_RUNTIME_DIR` (`vw-secrets/`, typically tmpfs). The rewritten command only ever references `$(< path)` — the raw secret never enters the command string, argv, shell history, or logs. Temp files are deleted in a `finally` block even if the command fails |
 | Atomic placeholder resolution | If a command contains the same placeholder multiple times, it is resolved exactly once via `consume_and_resolve()`, creating a single temp file per unique token. Prevents sequential consumption hazards and guarantees single-use semantics even on repeated references |
-| Strict directory validation & cleanup observability | `_secrets_dir()` enforces non-symlink, correct ownership, and exact `0700` permissions (fail-closed). Temp file deletions are wrapped in `try/except` to log sanitized warnings on failure, preventing silent secret leaks on disk. Stale cleanup respects `placeholder_ttl_seconds`. |
+| Strict directory validation & cleanup observability | `_secrets_dir()` enforces non-symlink, ownership by the current effective UID, and exact `0700` permissions via the shared `secure_fs.ensure_hardened_directory()` validator — fail-closed, NEVER silently repaired (v0.6.2 removed the implicit chmod). Temp file deletions are wrapped in `try/except` to log sanitized warnings on failure, preventing silent secret leaks on disk. Stale cleanup respects `placeholder_ttl_seconds`. |
+| AUD-03: Secrets directory fail-closed validation at plugin load | `register()` validates the secret-injection directory (`$XDG_RUNTIME_DIR/vw-secrets`) through `secure_fs.ensure_hardened_directory()` BEFORE any tool or hook registration. A symlinked, wrong-owner, or mode-≠0700 directory aborts plugin activation (`FilesystemSecurityError` → sanitized error log with path only → `register()` returns `False`) — the plugin never becomes partially active with an insecure secrets directory. |
+| AUD-04: `.bw-data` fail-closed validation before bw invocation | The Bitwarden appdata directory is validated through `secure_fs.ensure_hardened_directory()` before `BITWARDENCLI_APPDATA_DIR` is exported and before every `bw` subprocess call (`auth.ensure_appdata_dir()` + `BwCli.base_env()` choke point). An insecure `.bw-data` blocks `bw` execution entirely — the CLI can never run against a symlinked or world-accessible vault cache. |
+| AUD-08: `secrets.yaml` fail-closed validation before YAML parsing | `load_secrets()` calls `secure_fs.ensure_hardened_secret_file()` BEFORE any YAML parse: absolute path, regular file (never a symlink, checked via `os.lstat()`), owned by the current effective UID, no group/other access bits. An existing but insecure `secrets.yaml` is NEVER parsed and no bootstrap secret is loaded from it. |
 
 See SECURITY.md for the full threat model and all security controls.
 

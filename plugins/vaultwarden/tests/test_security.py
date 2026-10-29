@@ -489,6 +489,38 @@ def test_bw_data_permissions_700(tmp_path):
     assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
 
 
+def test_bw_rejected_when_appdata_insecure(fake_bw, tmp_path):
+    """AUD-04 (v0.6.2): bw must NEVER run against an insecure .bw-data —
+    BwCli.base_env() validates fail-closed via the shared hardening layer."""
+    from vaultwarden.bw_cli import BwCli
+    from vaultwarden.secure_fs import FilesystemSecurityError
+
+    a = tmp_path / "a"
+    a.mkdir(mode=0o755)  # group/world accessible — insecure
+    cli = BwCli.__new__(BwCli)  # bypass __init__ (no version probe needed)
+    cli.appdata_dir = str(a)
+    with pytest.raises(FilesystemSecurityError):
+        cli.base_env()
+    # BITWARDENCLI_APPDATA_DIR was never produced for an insecure dir and
+    # no silent repair happened:
+    assert (tmp_path / "a").stat().st_mode & 0o777 == 0o755
+
+
+def test_bw_rejected_when_appdata_symlink(fake_bw, tmp_path):
+    """AUD-04 (v0.6.2): symlinked appdata dir blocks every bw invocation."""
+    from vaultwarden.bw_cli import BwCli
+    from vaultwarden.secure_fs import FilesystemSecurityError
+
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    link = tmp_path / ".bw-data"
+    link.symlink_to(real, target_is_directory=True)
+    cli = BwCli.__new__(BwCli)
+    cli.appdata_dir = str(link)
+    with pytest.raises(FilesystemSecurityError):
+        cli.base_env()
+
+
 def test_plugin_state_isolated_from_host_profile(fake_bw, tmp_path):
     """A pre-existing 'host' profile must be neither read nor modified."""
     from vaultwarden.bw_cli import BwCli
@@ -511,8 +543,8 @@ def test_no_cross_contamination_between_two_profiles(fake_bw, tmp_path):
     from vaultwarden.bw_cli import BwCli
     a = tmp_path / "a"
     b = tmp_path / "b"
-    a.mkdir()
-    b.mkdir()
+    a.mkdir(mode=0o700)
+    b.mkdir(mode=0o700)
     ca, cb = BwCli(fake_bw, a), BwCli(fake_bw, b)
     ca.login_apikey("user.x", "cs-secret")
     assert ca.status()["status"] == "locked"

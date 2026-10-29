@@ -85,18 +85,40 @@ class TestCrashRecovery:
         assert not stale_file.exists(), "Stale file should be cleaned up"
         assert fresh_file.exists(), "Fresh file should remain"
 
-    def test_startup_cleanup_handles_missing_dir(self, monkeypatch):
-        """Startup cleanup gracefully handles a missing/unreachable secrets dir."""
-        # _secrets_dir() itself raising OSError must be swallowed...
-        def boom():
-            raise OSError("cannot access runtime dir")
-        monkeypatch.setattr("vaultwarden.hooks._secrets_dir", boom)
-        _cleanup_stale_secrets()  # must not raise
+    def test_startup_cleanup_handles_missing_dir(self, tmp_path, monkeypatch):
+        """AUD-03 (v0.6.2) FAIL-CLOSED contract: a merely-missing secrets dir
+        is created hardened (0700) and cleanup proceeds; an insecure dir
+        raises FilesystemSecurityError which PROPAGATES to register() (it is
+        never swallowed)."""
+        from vaultwarden.secure_fs import FilesystemSecurityError
 
-        # ...and so must a path that simply does not exist on disk
-        monkeypatch.setattr("vaultwarden.hooks._secrets_dir",
-                            lambda: "/nonexistent/path")
-        _cleanup_stale_secrets()  # must not raise
+        # _secrets_dir() raising FilesystemSecurityError must PROPAGATE —
+        # plugin activation aborts, cleanup does not silently skip.
+        def boom():
+            raise FilesystemSecurityError("insecure secrets dir (test)")
+        monkeypatch.setattr("vaultwarden.hooks._secrets_dir", boom)
+        with pytest.raises(FilesystemSecurityError):
+            _cleanup_stale_secrets()
+
+        # A path that simply does not exist on disk: the SHARED validator
+        # creates it hardened (mode 0o700, umask-forced) and the scan finds
+        # nothing stale — no exception.  (resolve_secrets_dir_path alone is
+        # not enough here: _secrets_dir() runs the REAL validator, which
+        # requires the tmp_path ancestors to be euid-owned with mode exactly
+        # 0700 — pytest's per-test dirs are typically 0755.  Patch the whole
+        # hardened-dir resolver instead; the create-hardened behaviour of
+        # secure_fs.ensure_hardened_directory itself is covered by
+        # tests/test_secure_fs.py::test_dir_creates_missing_with_0700_even_under_hostile_umask.)
+        missing = tmp_path / "vw-secrets"
+
+        def hardened_dir():
+            from vaultwarden.secure_fs import ensure_hardened_directory
+            return str(ensure_hardened_directory(missing,
+                                                 create_if_missing=True))
+        monkeypatch.setattr("vaultwarden.hooks._secrets_dir", hardened_dir)
+        _cleanup_stale_secrets()
+        assert missing.is_dir()
+        assert missing.stat().st_mode & 0o777 == 0o700
 
     def test_cleanup_boundary_at_ttl(self, tmp_path, monkeypatch):
         """Files just inside/outside the 300s TTL boundary are kept/removed."""
