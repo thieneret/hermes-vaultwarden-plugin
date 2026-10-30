@@ -610,6 +610,7 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
                                injected_values_out: list[str] | None = None,
                                task_errors: list[dict] | None = None,
                                exec_id: str = "",
+                               scoped_retained_out: list[str] | None = None,
                                ) -> str | None:
     """SEC-02 (v0.5.7): atomically consume one unique token and create its
     single temp file; return the file path or ``None`` (fail-safe).
@@ -694,10 +695,15 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
         # reference in the shared refcount, so no owner's close can remove
         # the value while another active execution still needs it.
         scope.retain(value)
-        # NOTE: no _PENDING_PATH_RETENTIONS entry for scoped retains -- the
-        # owning scope releases exactly this reference at close(), which is
+        # AUD-02 (v0.6.5): report the scoped retention back to the calling
+        # middleware execution so its fail-safe closure can release exactly
+        # this reference if no later lifecycle point runs. NOTE: no
+        # _PENDING_PATH_RETENTIONS entry for scoped retains -- the owning
+        # scope releases exactly this reference at close(), which is
         # dispatched to the safe final lifecycle point (post_tool_call),
         # AFTER transform_tool_result authoritative redaction has run.
+        if scoped_retained_out is not None:
+            scoped_retained_out.append(value)
     else:
         # No active execution scope (legacy/direct callers): fall back to
         # PROCESS-scoped retention so the value stays redactable; the
@@ -802,6 +808,14 @@ def make_placeholder_resolver(auth: AuthManager,
                     "validation; injection blocked (fail-closed).").to_dict())
             return next_call(args)
         temp_files: list[str] = []
+        #: AUD-02 (v0.6.5): plaintexts retained THROUGH this execution's
+        #: scope, one entry per resolved token occurrence. The fail-safe
+        #: closure below releases exactly these references when the
+        #: execution cannot be attributed to a lifecycle id (or dies on an
+        #: exceptional path); scoped retains deliberately have NO
+        #: _PENDING_PATH_RETENTIONS entry so temp-file cleanup alone can
+        #: never strip redaction coverage before transform_tool_result ran.
+        scoped_retained: list[str] = []
         injected_values: list[str] = []
         new_args = dict(args)
         resolved_any = False
@@ -830,7 +844,8 @@ def make_placeholder_resolver(auth: AuthManager,
                 for suffix in unique_suffixes:
                     path = _resolve_placeholder_token(
                         suffix, auth, registry, secrets_dir, temp_files,
-                        task_id, injected_values, task_errors, exec_id)
+                        task_id, injected_values, task_errors, exec_id,
+                        scoped_retained_out=scoped_retained)
                     if path is None:
                         continue  # unknown/expired/used -> leave verbatim
                     replacements[f"$__VW_SECRET_{suffix}__"] = f"$(< {path})"
@@ -908,8 +923,28 @@ def make_placeholder_resolver(auth: AuthManager,
         if not exec_id:
             # No attributable id: this finally block IS the guaranteed
             # release point -- close now and clear the published slot.
+            # AUD-02 fail-safe for the EXCEPTIONAL path: when next_call
+            # raised, the code after the try/finally above never runs, so
+            # release every plaintext this execution retained through its
+            # scope HERE (release_value is silent no-op for values already
+            # handed back; process-fallback entries were released by the
+            # _release_path_retention loop above). On the normal path this
+            # is symmetric with -- and consumed by -- the immediate close()
+            # below, which then finds nothing outstanding left to release.
+            for _value in scoped_retained:
+                scope.release_value(_value)
             close_execution_scope(cv_scope_token, exec_id)
             _clear_execution_scope_slot()
+        elif scoped_retained:
+            # Attributable id but the middleware frame is unwinding via an
+            # exception: no later lifecycle hook may run for this call, so
+            # the scope's own references must not strand. Releasing them
+            # here keeps the refcount exact; the scope object itself stays
+            # registered under its id so a post_tool_call that DOES arrive
+            # still closes it as a harmless no-op (release-once).
+            if sys.exc_info()[0] is not None:
+                for _value in scoped_retained:
+                    scope.release_value(_value)
 
     return vaultwarden_inject_secrets
 
