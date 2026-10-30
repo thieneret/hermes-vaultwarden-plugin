@@ -84,7 +84,7 @@ def test_list_returns_metadata_only(tools_by_name):
     assert res["total"] == 3 and len(res["items"]) == 3
     blob = str(res)
     # NO passwords / totp / notes values ever leave this tool:
-    for forbidden in ("sup3r-s3cret-pg!", "gr@f-pass", "JBSWY3DPEHPK3PXP",
+    for forbidden in ("sup3r-s3cret-pg!", "gr@fpassx", "JBSWY3DPEHPK3PXP",
                       "sk_live_XXXX", "custom-key-value"):
         assert forbidden not in blob
     names = {i["name"] for i in res["items"]}

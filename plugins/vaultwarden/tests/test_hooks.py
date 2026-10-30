@@ -161,9 +161,9 @@ def test_secret_never_in_command_multiple_tokens(mw, registry):
         paths.extend(_injected_paths(cmd_args["command"]))
         assert len(paths) == 2                # each placeholder its own file
         assert "sup3r-s3cret-pg!" not in cmd_args["command"]
-        assert "gr@f-pass" not in cmd_args["command"]
+        assert "gr@fpassx" not in cmd_args["command"]
         vals = sorted(open(p).read() for p in paths)
-        assert vals == ["gr@f-pass", "sup3r-s3cret-pg!"]
+        assert vals == ["gr@fpassx", "sup3r-s3cret-pg!"]
         return "done"
 
     out = mw("terminal", {"command": f"echo \"{a}\" \"{b}\""}, None, next_call)

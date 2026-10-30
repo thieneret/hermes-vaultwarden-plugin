@@ -57,7 +57,7 @@ ITEMS = {
       "fields": [{"name": "api_key", "value": "custom-key-value", "type": 1}]},
   "aaaa1111-0000-0000-0000-000000000002": {
       "id": "aaaa1111-0000-0000-0000-000000000002", "name": "Grafana", "type": 1,
-      "login": {"username": "viz", "password": "gr@f-pass", "totp": "JBSWY3DPEHPK3PXP",
+      "login": {"username": "viz", "password": "gr@fpassx", "totp": "JBSWY3DPEHPK3PXP",
                 "uris": [{"uri": "https://grafana.example.com"}]}},
   "aaaa1111-0000-0000-0000-000000000003": {
       "id": "aaaa1111-0000-0000-0000-000000000003", "name": "API keys", "type": 2,

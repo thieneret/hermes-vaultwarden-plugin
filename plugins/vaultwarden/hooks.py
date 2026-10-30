@@ -131,6 +131,10 @@ class ExecutionSecretScope:
     def __init__(self, redactor: Any) -> None:
         self._redactor = redactor
         self._values: set[str] = set()
+        # Values whose shared-refcount reference is still OUTSTANDING (not
+        # yet returned via release_value/close). Normally 0/1 per value;
+        # counted so a double bookkeeping call can never double-decrement.
+        self._outstanding: dict[str, int] = {}
         self._closed = False
         self._lock = threading.Lock()
 
@@ -152,6 +156,7 @@ class ExecutionSecretScope:
             if value in self._values:
                 return  # same secret within one execution: ONE reference
             self._values.add(value)
+            self._outstanding[value] = self._outstanding.get(value, 0) + 1
         self._redactor.retain_secret(value)
 
     def has_value(self, value: str) -> bool:
@@ -183,6 +188,7 @@ class ExecutionSecretScope:
             if self._closed or value not in self._values:
                 return  # already released / never retained here: no-op
             self._values.discard(value)
+            self._outstanding.pop(value, None)
         self._redactor.release_secret(value)
 
     def close(self) -> None:
@@ -197,10 +203,15 @@ class ExecutionSecretScope:
             if self._closed:
                 return
             self._closed = True
-            values = list(self._values)
+            # Release EXACTLY the outstanding references: release_value()
+            # (per-placeholder early release on the no-attributable-id
+            # fail-safe path) may already have dropped some of them.
+            outstanding = list(self._outstanding.items())
             self._values.clear()
-        for v in values:
-            self._redactor.release_secret(v)
+            self._outstanding.clear()
+        for v, n in outstanding:
+            for _ in range(n):
+                self._redactor.release_secret(v)
 
     @property
     def closed(self) -> bool:
@@ -669,15 +680,24 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
     scope = current_execution_scope()
     redactor = get_redacting_filter()
     if scope is not None:
-        # Execution-scoped retention, exactly ONE reference per (scope,
-        # value): the scope's retain() dedupes and the symmetric
-        # release_value() at temp-file cleanup drops precisely that one
-        # reference. Overlapping executions sharing this secret each hold
-        # their own reference in the shared refcount, so no owner's cleanup
-        # can remove the value while another active execution still needs
-        # it for redaction.
+        # Execution-scoped retention, ONE reference per (scope, value):
+        # the scope's retain() dedupes identical values inside a single
+        # execution, and the symmetric close()-time release drops exactly
+        # that one reference when the execution reaches its safe final
+        # lifecycle point (post_tool_call -- AFTER transform_tool_result
+        # authoritative redaction and observer cleanup consumed the
+        # plaintexts). Temp-file cleanup must NOT release this reference:
+        # the middleware finally block runs BEFORE transform_tool_result,
+        # and releasing there would strip the redaction state while the
+        # result is still being scrubbed (AUD-02 release-timing rule).
+        # Overlapping executions sharing this secret each hold their own
+        # reference in the shared refcount, so no owner's close can remove
+        # the value while another active execution still needs it.
         scope.retain(value)
-        _PENDING_PATH_RETENTIONS[path] = ("scope", value, exec_id or task_id)
+        # NOTE: no _PENDING_PATH_RETENTIONS entry for scoped retains -- the
+        # owning scope releases exactly this reference at close(), which is
+        # dispatched to the safe final lifecycle point (post_tool_call),
+        # AFTER transform_tool_result authoritative redaction has run.
     else:
         # No active execution scope (legacy/direct callers): fall back to
         # PROCESS-scoped retention so the value stays redactable; the
@@ -861,11 +881,13 @@ def make_placeholder_resolver(auth: AuthManager,
                     os.unlink(path)
                 except OSError as exc:
                     log.warning("Failed to remove temp file %s: %s", path, exc)
-                # AUD-02 (v0.6.5): release EXACTLY the retention attached to
-                # this resolved temp file once the file is gone — symmetric
-                # to the retain done at resolve time. The scope's primary
-                # per-value reference stays until close(); only this path's
-                # private reference (or process-fallback baseline) drops.
+                # AUD-02 (v0.6.5): release the PROCESS-FALLBACK baseline
+                # retention attached to this resolved temp file (legacy /
+                # direct callers with no active scope). Execution-scoped
+                # retains have NO entry here: their single reference is
+                # owned by the scope and released at its close() -- the
+                # deferred safe final lifecycle point, never before
+                # transform_tool_result has run.
                 _release_path_retention(path, exec_id)
             # SEC-01 (v0.5.4): forget this execution's per-task plaintext set
             # too (the ContextVar was already restored above). The middleware

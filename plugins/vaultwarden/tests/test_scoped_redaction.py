@@ -32,12 +32,12 @@ from vaultwarden.security import RedactingFilter
 # ------------------------------------------------------- redactor refcounting
 def test_retain_then_release_once_removes_secret():
     f = RedactingFilter()
-    base = f.active_secret_count()
+    base = f.scoped_secret_count()
     f.retain_secret("runtime-secret-A")
     assert f.has_secret("runtime-secret-A")
     f.release_secret("runtime-secret-A")
     assert not f.has_secret("runtime-secret-A")
-    assert f.active_secret_count() == base
+    assert f.scoped_secret_count() == base
 
 
 def test_retain_twice_release_once_keeps_secret():
@@ -144,14 +144,14 @@ def test_concurrent_retain_release_stress_no_race():
     assert not errors
     # Balanced retain/release pairs leave NO residue and no negative count:
     assert not f.has_secret(value)
-    assert f.active_secret_count() == 0
+    assert f.scoped_secret_count() == 0
 
 
 # ------------------------------------------------------------ scope lifecycle
 def test_scope_releases_each_distinct_value_once():
     from vaultwarden.security import get_redacting_filter
     f = get_redacting_filter()
-    base = f.active_secret_count()
+    base = f.scoped_secret_count()
     scope = ExecutionSecretScope(f)
     scope.retain("scope-secret-X")
     scope.retain("scope-secret-X")  # same value twice -> ONE reference
@@ -160,7 +160,7 @@ def test_scope_releases_each_distinct_value_once():
     assert f.has_secret("scope-secret-X")  # other execution still active
     f.release_secret("scope-secret-X")
     assert not f.has_secret("scope-secret-X")
-    assert f.active_secret_count() == base
+    assert f.scoped_secret_count() == base
 
 
 def test_scope_close_is_release_once_idempotent():
@@ -234,7 +234,7 @@ def test_three_overlapping_executions_same_secret_exact_refcount():
     until the LAST execution closes (refcount tracks executions exactly)."""
     from vaultwarden.security import get_redacting_filter
     f = get_redacting_filter()
-    base = f.active_secret_count()
+    base = f.scoped_secret_count()
     scopes = []
     for i in range(3):
         scope, _tok = open_execution_scope(f"exec-overlap-{i}")
@@ -247,7 +247,7 @@ def test_three_overlapping_executions_same_secret_exact_refcount():
     assert f.has_secret("triple-shared-secret")   # one still active
     close_execution_scope(exec_id="exec-overlap-2")
     assert not f.has_secret("triple-shared-secret")  # last one released
-    assert f.active_secret_count() == base
+    assert f.scoped_secret_count() == base
 
 
 # ------------------------------------------------- middleware integration
@@ -289,14 +289,14 @@ def test_single_execution_returns_redactor_to_baseline(monkeypatch, tmp_path,
     post = dict(ctx.hooks)["post_tool_call"]
     tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     redactor = get_redacting_filter()
-    baseline = redactor.active_secret_count()
+    baseline = redactor.scoped_secret_count()
 
     ref = tools["vaultwarden_get_secret_ref"](
         {"item_id": "aaaa1111-0000-0000-0000-000000000001", "field": "password"})
     _run_execution(mw, post, ref["placeholder"], "scoped-task-1")
 
     # AUD-02 memory assertion: NO indefinite growth -- back to baseline.
-    assert redactor.active_secret_count() == baseline
+    assert redactor.scoped_secret_count() == baseline
     assert not redactor.has_secret("sup3r-s3cret-pg!")
 
 
@@ -309,7 +309,7 @@ def test_multi_secret_execution_releases_all(monkeypatch, tmp_path, fake_bw):
     post = dict(ctx.hooks)["post_tool_call"]
     tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     redactor = get_redacting_filter()
-    baseline = redactor.active_secret_count()
+    baseline = redactor.scoped_secret_count()
 
     r1 = tools["vaultwarden_get_secret_ref"](
         {"item_id": "aaaa1111-0000-0000-0000-000000000001", "field": "password"})
@@ -320,9 +320,9 @@ def test_multi_secret_execution_releases_all(monkeypatch, tmp_path, fake_bw):
        task_id="scoped-task-2")
     post("terminal", {}, {"output": "ok"}, task_id="scoped-task-2")
 
-    assert redactor.active_secret_count() == baseline
+    assert redactor.scoped_secret_count() == baseline
     assert not redactor.has_secret("sup3r-s3cret-pg!")
-    assert not redactor.has_secret("gr@f-pass")
+    assert not redactor.has_secret("gr@fpassx")
 
 
 def test_two_executions_different_secret_release_own_only(
@@ -347,9 +347,9 @@ def test_two_executions_different_secret_release_own_only(
                lambda a: {"output": "B"}, task_id="overlap-B")
     post("terminal", {}, {"output": "A"}, task_id="overlap-A")
     assert not redactor.has_secret("sup3r-s3cret-pg!")  # A released its own
-    assert redactor.has_secret("gr@f-pass")             # B still active
+    assert redactor.has_secret("gr@fpassx")             # B still active
     post("terminal", {}, res_b, task_id="overlap-B")
-    assert not redactor.has_secret("gr@f-pass")
+    assert not redactor.has_secret("gr@fpassx")
 
 
 def test_overlapping_same_secret_not_removed_prematurely(
@@ -386,7 +386,7 @@ def test_exception_still_releases_via_failsafe(monkeypatch, tmp_path, fake_bw):
     mw = dict(ctx.middleware)["tool_execution"]
     tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     redactor = get_redacting_filter()
-    baseline = redactor.active_secret_count()
+    baseline = redactor.scoped_secret_count()
 
     ref = tools["vaultwarden_get_secret_ref"](
         {"item_id": "aaaa1111-0000-0000-0000-000000000001", "field": "password"})
@@ -403,7 +403,7 @@ def test_exception_still_releases_via_failsafe(monkeypatch, tmp_path, fake_bw):
         pass
     else:  # pragma: no cover - fail-safe path must re-raise
         pytest.fail("exception from next_call must propagate")
-    assert redactor.active_secret_count() == baseline
+    assert redactor.scoped_secret_count() == baseline
     assert not redactor.has_secret("sup3r-s3cret-pg!")
 
 

@@ -257,6 +257,13 @@ class RedactingFilter(logging.Filter):
                 "ignoring.", len(value))
 
     # ------------------------------------------------------- observability
+    def scoped_secret_count(self) -> int:
+        """Observability helper (AUD-02): number of EXECUTION-scoped retained
+        values (refcount > 0). Never exposes secret values and never logs
+        them."""
+        with self._lock:
+            return sum(1 for c in self._secret_refcounts.values() if c > 0)
+
     def active_secret_count(self) -> int:
         """Number of currently retained secret VALUES (observability only).
 

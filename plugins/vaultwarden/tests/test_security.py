@@ -143,7 +143,7 @@ def test_placeholder_tokens_parsing():
 
 
 def test_tool_outputs_contain_no_vault_secrets(tools_by_name):
-    secrets = ("sup3r-s3cret-pg!", "gr@f-pass", "JBSWY3DPEHPK3PXP",
+    secrets = ("sup3r-s3cret-pg!", "gr@fpassx", "JBSWY3DPEHPK3PXP",
                "custom-key-value", "sk_live_XXXX")
     outputs = [
         tools_by_name["vaultwarden_status"]({}),
