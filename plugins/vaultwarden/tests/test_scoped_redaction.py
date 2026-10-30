@@ -94,10 +94,17 @@ def test_process_scoped_survives_execution_release():
 
 
 def test_register_secret_maps_to_process_baseline():
+    # AUD-02 symmetric legacy API: register_secret() takes ONE baseline
+    # reference that execution-scoped release can never remove; a stray
+    # release_secret() (an unpaired execution release) also keeps it. Only
+    # the PAIRED forget_secret() drops exactly that one baseline again --
+    # so legacy call sites cannot leak permanent state into the filter.
     f = RedactingFilter()
     f.register_secret("legacy-bootstrap-secret")
     f.release_secret("legacy-bootstrap-secret")  # stray exec release
     assert f.has_secret("legacy-bootstrap-secret")
+    f.forget_secret("legacy-bootstrap-secret")   # paired legacy release
+    assert not f.has_secret("legacy-bootstrap-secret")
 
 
 def test_overlapping_threaded_retains_final_count_correct():

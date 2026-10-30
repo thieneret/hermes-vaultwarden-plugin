@@ -114,12 +114,16 @@ class RedactingFilter(logging.Filter):
       by execution-scoped cleanup.
 
     ``register_secret()`` / ``forget_secret()`` remain available for
-    backward compatibility: ``register_secret()`` maps onto the process-
-    scoped baseline (unscoped callers cannot participate in retain/release
-    pairing), and ``forget_secret()`` drops BOTH layers of an explicitly
-    forgotten value (e.g. a rotated session key). Runtime injected secrets
-    must migrate to the scoped ``retain_secret()`` / ``release_secret()``
-    APIs instead of unbounded global registration.
+    backward compatibility but are now SYMMETRIC one-shot helpers for
+    legacy call sites: each ``register_secret()`` takes exactly ONE
+    baseline reference that its paired ``forget_secret()`` drops again —
+    so a legacy caller can never leak a permanent baseline into the
+    shared filter (AUD-02: no unbounded global retention). Values with
+    several owners keep one baseline count per distinct value; the last
+    paired forget removes it. New code must NOT use these: runtime
+    injected secrets go through the scoped ``retain_secret()`` /
+    ``release_secret()`` APIs, genuinely long-lived secrets through
+    :meth:`register_process_scoped_secret`.
     """
 
     def __init__(self) -> None:
@@ -131,24 +135,42 @@ class RedactingFilter(logging.Filter):
         # AUD-02: thread-safe reference-counted scoped retention.
         self._secret_refcounts: dict[str, int] = {}
         self._process_scoped: dict[str, int] = {}
+        # AUD-02: number of symmetric one-shot baselines taken via
+        # register_secret() per value. forget_secret() drops exactly one
+        # such reference when available; values with several legacy
+        # registrants keep the baseline until the LAST paired forget.
+        self._legacy_baselines: dict[str, int] = {}
 
     # ------------------------------------------------------------- legacy API
     def register_secret(self, value: str) -> None:
-        """Register a secret value to scrub from every log record.
+        """Take ONE symmetric baseline reference for *value* (legacy API).
 
-        Backward-compatible wrapper around :meth:`register_process_scoped_secret`
-        (AUD-02): unscoped registrations get a process-lifetime baseline
-        retention that execution-scoped release can never remove.
+        AUD-02: pairs with :meth:`forget_secret` — every registration is
+        releasable, so legacy/unscoped call sites can never grow the
+        redaction state indefinitely. Internally backed by the same
+        process-baseline layer as :meth:`register_process_scoped_secret`,
+        but tracked per value so the paired ``forget_secret()`` releases
+        precisely this one reference. Never logs the value.
         """
-        self.register_process_scoped_secret(value)
+        if not value or len(value) < 4:
+            return
+        with self._lock:
+            self._secrets.add(value)
+            self._process_scoped[value] = self._process_scoped.get(value, 0) + 1
+            self._legacy_baselines[value] = self._legacy_baselines.get(value, 0) + 1
 
     def forget_secret(self, value: str) -> None:
-        """Drop ALL retention layers for *value* (explicit forget semantics).
+        """Drop ONE retention layer for *value* (paired legacy API).
 
-        Used by lifecycle owners that invalidate a value outright (e.g. a
-        locked/expired session key). Execution-scoped cleanup must NOT use
-        this — it goes through :meth:`release_secret` instead. Never logs
-        the value.
+        AUD-02 symmetric semantics: when the value carries a
+        :meth:`register_secret` baseline reference, exactly that one
+        reference is dropped (mirroring the paired registration); other
+        owners' baselines and execution-scoped references are untouched.
+        For values WITHOUT any tracked owner (e.g. an explicit session-key
+        invalidation by its lifecycle owner), falls back to dropping ALL
+        layers so a rotated/expired key can never stay registered —
+        fail-safe direction for that explicit-invalidate use case. Never
+        logs the value.
         """
         if not value:
             return
@@ -164,9 +186,31 @@ class RedactingFilter(logging.Filter):
             # over-redaction over under-redaction).
             if len(value) < 4:
                 return
-            self._secrets.discard(value)
-            self._secret_refcounts.pop(value, None)
-            self._process_scoped.pop(value, None)
+            legacy = self._legacy_baselines.get(value, 0)
+            if legacy > 0 or value in self._process_scoped:
+                # Paired legacy release: drop exactly ONE baseline
+                # reference (prefer the tracked legacy count when present).
+                if legacy > 0:
+                    if legacy <= 1:
+                        del self._legacy_baselines[value]
+                    else:
+                        self._legacy_baselines[value] = legacy - 1
+                base = self._process_scoped.get(value, 0)
+                if base > 0:
+                    if base <= 1:
+                        del self._process_scoped[value]
+                    else:
+                        self._process_scoped[value] = base - 1
+                if (value not in self._process_scoped
+                        and value not in self._secret_refcounts):
+                    self._secrets.discard(value)
+            else:
+                # Untracked value: explicit invalidate-everything fallback
+                # (e.g. a locked/expired session key whose owner already
+                # released its own bookkeeping).
+                self._secrets.discard(value)
+                self._secret_refcounts.pop(value, None)
+                self._process_scoped.pop(value, None)
 
     # ---------------------------------------------------- AUD-02 scoped API
     def retain_secret(self, value: str) -> None:
