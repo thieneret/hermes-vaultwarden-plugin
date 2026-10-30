@@ -100,22 +100,165 @@ class RedactingFilter(logging.Filter):
 
     Session keys are rendered as [SESSION:****]; master password / client
     secret / resolved credentials are replaced entirely with [REDACTED].
+
+    AUD-02 (v0.6.5): retention is reference-counted and SCOPED. Every
+    retained value carries two independent counts behind one RLock:
+
+    - ``_secret_refcounts`` — execution-scoped references held by active
+      tool executions (see ``hooks.ExecutionSecretScope``). A value leaves
+      the redaction state only when its execution refcount reaches zero
+      AND no process-scoped baseline remains, so overlapping executions
+      that share a secret can never cause premature removal;
+    - ``_process_scoped`` — long-lived bootstrap/startup secrets that must
+      stay redactable for the whole process lifetime and are NEVER released
+      by execution-scoped cleanup.
+
+    ``register_secret()`` / ``forget_secret()`` remain available for
+    backward compatibility: ``register_secret()`` maps onto the process-
+    scoped baseline (unscoped callers cannot participate in retain/release
+    pairing), and ``forget_secret()`` drops BOTH layers of an explicitly
+    forgotten value (e.g. a rotated session key). Runtime injected secrets
+    must migrate to the scoped ``retain_secret()`` / ``release_secret()``
+    APIs instead of unbounded global registration.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._lock = threading.Lock()
+        # RLock: redact()/snapshot_secrets() run inside logging calls made
+        # while other public methods hold the lock — re-entrancy is required.
+        self._lock = threading.RLock()
         self._secrets: set[str] = set()
+        # AUD-02: thread-safe reference-counted scoped retention.
+        self._secret_refcounts: dict[str, int] = {}
+        self._process_scoped: dict[str, int] = {}
 
+    # ------------------------------------------------------------- legacy API
     def register_secret(self, value: str) -> None:
-        """Register a runtime secret value to scrub from every log record."""
-        if value and len(value) >= 4:
-            with self._lock:
-                self._secrets.add(value)
+        """Register a secret value to scrub from every log record.
+
+        Backward-compatible wrapper around :meth:`register_process_scoped_secret`
+        (AUD-02): unscoped registrations get a process-lifetime baseline
+        retention that execution-scoped release can never remove.
+        """
+        self.register_process_scoped_secret(value)
 
     def forget_secret(self, value: str) -> None:
+        """Drop ALL retention layers for *value* (explicit forget semantics).
+
+        Used by lifecycle owners that invalidate a value outright (e.g. a
+        locked/expired session key). Execution-scoped cleanup must NOT use
+        this — it goes through :meth:`release_secret` instead. Never logs
+        the value.
+        """
+        if not value:
+            return
         with self._lock:
             self._secrets.discard(value)
+            self._secret_refcounts.pop(value, None)
+            self._process_scoped.pop(value, None)
+
+    # ---------------------------------------------------- AUD-02 scoped API
+    def retain_secret(self, value: str) -> None:
+        """Increment the execution-scoped reference count for a secret value.
+
+        Used by execution scopes for runtime-injected secrets: the value
+        stays redactable until every scope that retained it has released it.
+        Empty/short values follow the same minimum-length policy as
+        :meth:`register_secret`. Never logs the value.
+        """
+        if not value or len(value) < 4:
+            return
+        with self._lock:
+            self._secrets.add(value)
+            self._secret_refcounts[value] = self._secret_refcounts.get(value, 0) + 1
+
+    def release_secret(self, value: str) -> None:
+        """Decrement the execution-scoped reference count for a secret value.
+
+        The value is removed from the redaction state ONLY when its count
+        reaches zero and no process-scoped baseline retention remains.
+        Releasing an unknown value emits a sanitized WARNING (length +
+        error class only — NEVER the value itself) and never decrements
+        below zero.
+        """
+        if not value:
+            return
+        warn_unknown = False
+        with self._lock:
+            count = self._secret_refcounts.get(value)
+            if count is None:
+                warn_unknown = True
+            elif count <= 1:
+                del self._secret_refcounts[value]
+                if value not in self._process_scoped:
+                    self._secrets.discard(value)
+            else:
+                self._secret_refcounts[value] = count - 1
+        if warn_unknown:
+            # Sanitized diagnostic, emitted OUTSIDE the lock: never expose
+            # the secret value — length only.
+            _logger.warning(
+                "RedactingFilter.release_secret called for an unknown "
+                "runtime secret (len=%d); ignoring (no negative counts).",
+                len(value))
+
+    def register_process_scoped_secret(self, value: str) -> None:
+        """Retain a long-lived secret for the process lifetime.
+
+        Bootstrap secrets (client secret / master password), startup-
+        injection secrets and live session keys go through here: execution-
+        scoped release must NEVER remove their baseline retention.
+        Idempotent per call site — repeated registrations add one baseline
+        reference each and require a matching :meth:`release_process_scoped_secret`
+        (or an explicit :meth:`forget_secret`) to drop.
+        """
+        if not value or len(value) < 4:
+            return
+        with self._lock:
+            self._secrets.add(value)
+            self._process_scoped[value] = self._process_scoped.get(value, 0) + 1
+
+    def release_process_scoped_secret(self, value: str) -> None:
+        """Drop ONE process-scoped baseline retention for *value*.
+
+        Only used by shutdown paths that explicitly invalidate a long-lived
+        secret (e.g. a locked/expired session key). When both the execution
+        refcount and the remaining process baseline reach zero, the value
+        leaves the redaction state. Never logs the value.
+        """
+        if not value:
+            return
+        warn_missing = False
+        with self._lock:
+            count = self._process_scoped.get(value)
+            if count is None:
+                warn_missing = True
+            elif count <= 1:
+                del self._process_scoped[value]
+                if value not in self._secret_refcounts:
+                    self._secrets.discard(value)
+            else:
+                self._process_scoped[value] = count - 1
+        if warn_missing:
+            _logger.warning(
+                "RedactingFilter.release_process_scoped_secret called "
+                "for a value without process-scoped retention (len=%d); "
+                "ignoring.", len(value))
+
+    # ------------------------------------------------------- observability
+    def active_secret_count(self) -> int:
+        """Number of currently retained secret VALUES (observability only).
+
+        Safe for tests and sanitized diagnostics: returns a bare count and
+        never exposes or logs any secret value.
+        """
+        with self._lock:
+            return len(self._secrets)
+
+    def has_secret(self, value: str) -> bool:
+        """Whether *value* is currently retained. Never logs the value."""
+        with self._lock:
+            return value in self._secrets
 
     def snapshot_secrets(self) -> list[str]:
         """Thread-safe copy of the registered secret values, LONGEST first.
@@ -154,6 +297,11 @@ class RedactingFilter(logging.Filter):
             record.args = ()
         return True
 
+
+#: Sanitized diagnostic logger for the redactor itself (AUD-02). Defined at
+#: module scope AFTER ``get_logger``; resolved lazily at call time from the
+#: methods above. NEVER receives secret values — only lengths / counts.
+_logger = logging.getLogger("hermes.plugins.vaultwarden.security")
 
 #: shared filter instance used by all plugin modules
 _shared_filter = RedactingFilter()
