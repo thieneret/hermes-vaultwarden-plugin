@@ -65,7 +65,6 @@ import contextvars
 import os
 import re
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -934,13 +933,14 @@ def make_placeholder_resolver(auth: AuthManager,
             return next_call(args)
         temp_files: list[str] = []
         #: AUD-02 (v0.6.5): plaintexts this execution retained THROUGH its
-        #: own scope (deduplicated, live-state snapshot). The exceptional-
-        #: path fail-safe closure below releases precisely these — never
-        #: anything a foreign holder happens to share — so refcount
-        #: bookkeeping stays symmetric on every path. Scoped retains
-        #: deliberately have NO _PENDING_PATH_RETENTIONS decrement until
-        #: cleanup runs so temp-file handling alone can never strip redaction
-        #: coverage before transform_tool_result ran.
+        #: own scope (deduplicated, live-state snapshot taken right BEFORE
+        #: next_call). The exceptional-path fail-safe closure below releases
+        #: precisely these — never anything a foreign holder happens to
+        #: share — so refcount bookkeeping stays symmetric on every path.
+        #: Scoped retains deliberately have NO _PENDING_PATH_RETENTIONS
+        #: shared-refcount increment until cleanup runs so temp-file
+        #: handling alone can never strip redaction coverage before
+        #: transform_tool_result ran.
         scope_owned_values: set[str] = set()
         injected_values: list[str] = []
         new_args = dict(args)
@@ -982,15 +982,43 @@ def make_placeholder_resolver(auth: AuthManager,
                     new_args[key] = new_command
                     resolved_any = True
             if not resolved_any:
+                # Nothing was injected: this early return runs BEFORE the
+                # outer finally, so drop every temp file created during
+                # resolution (each unlink is paired with its retention
+                # release; unlink failure still releases — a missing file
+                # means another path already consumed it) and forget this
+                # execution's per-task plaintext set. The freshly opened
+                # scope owns no references (nothing resolved), so close()
+                # is a cheap idempotent bookkeeping reset; the ContextVar
+                # slot is un-published via the token below.
+                for path in temp_files:
+                    try:
+                        os.unlink(path)
+                    except OSError as exc:
+                        log.warning("Failed to remove temp file %s: %s",
+                                    path, exc)
+                    _release_path_retention(path, exec_id)
+                take_task_secrets(task_id)
+                scope.close()
+                try:
+                    _execution_secret_scope.reset(cv_scope_token)
+                except ValueError:  # token from a different context
+                    pass
                 return next_call(args)
             # AUD-02 (v0.6.5): snapshot exactly which plaintexts THIS
-            # execution's scope still owns (deduplicated, live state). The
-            # exceptional-path fail-safe closure below releases precisely
-            # these — never anything a foreign holder happens to share —
-            # so refcount bookkeeping stays symmetric on every path.
+            # execution's scope still owns (deduplicated, live state) RIGHT
+            # BEFORE next_call runs. The exceptional-path fail-safe closure
+            # below releases precisely these — never anything a foreign
+            # holder happens to share — so refcount bookkeeping stays
+            # symmetric on every path. Scoped retains deliberately have NO
+            # shared-refcount increment in _PENDING_PATH_RETENTIONS until
+            # cleanup runs, so temp-file handling alone can never strip
+            # redaction coverage before transform_tool_result ran.
             scope_owned_values.update(scope.retained_values())
-            log.debug("Injected %d secret temp file(s) for %s.",
-                      len(temp_files), tool_name)
+            # Exception tracker for the OUTER frame: an exception raised by
+            # the injection loop itself (before next_call) must also trigger
+            # the attributable-id fail-safe closure below.
+            outer_raised = False
             # SEC-01 (v0.5.4) handoff: publish the exact plaintext set that is
             # about to enter the shell into the ContextVar IMMEDIATELY BEFORE
             # the tool runs, so the authoritative transform_tool_result
@@ -1013,6 +1041,16 @@ def make_placeholder_resolver(auth: AuthManager,
                 # different instance than the one the shell actually ran.
                 result = next_call(new_args)
                 return result
+            except BaseException:
+                # AUD-02 (v0.6.5): remember that the frame is unwinding via
+                # an exception. sys.exc_info() is NOT a reliable exception
+                # detector inside the outer finally block once the inner
+                # finally has completed (CPython restores the previous
+                # exception state when the inner frame exits), so this
+                # explicit flag makes the attributable-id fail-safe closure
+                # below deterministic. Never logs secret values.
+                outer_raised = True
+                raise
             finally:
                 _restore_injected_secrets(cv_token)
         finally:
@@ -1079,37 +1117,35 @@ def make_placeholder_resolver(auth: AuthManager,
                 _execution_secret_scope.reset(cv_scope_token)
             except ValueError:  # token from a different context (asyncio)
                 pass
-        elif scope_owned_values:
-            # Attributable id but the middleware frame is unwinding via an
-            # exception (or a sync host that shares one context across the
-            # whole call stack, where the ContextVar token cannot be reset):
-            # no later lifecycle hook may reliably run for this call, so the
-            # scope's own references must not strand. Release precisely this
-            # execution's outstanding references through the id-keyed registry
-            # entry -- close() is release-once and decrements EXACTLY the
-            # references this scope retained, so overlapping executions
-            # sharing the same secret keep their own coverage and a late
-            # post_tool_call close for the same id is a harmless no-op.
+        elif scope_owned_values and outer_raised:
+            # Attributable id AND the middleware frame is unwinding via an
+            # exception: no later lifecycle hook may reliably run for this
+            # call, so the scope's own references must not strand. Release
+            # precisely this execution's outstanding references through the
+            # id-keyed registry entry -- close() is release-once and
+            # decrements EXACTLY the references this scope retained, so
+            # overlapping executions sharing the same secret keep their own
+            # coverage and a late post_tool_call close for the same id is a
+            # harmless no-op.
             # On the NORMAL path this branch never runs: the scope stays open
             # for the deferred release at post_tool_call (after
             # transform_tool_result consumed the plaintexts). Never logs
             # secret values.
-            if sys.exc_info()[0] is not None:
-                # Fail-safe for the exceptional path with an attributable
-                # id: the per-path cleanup loop above already handed back
-                # every entry-owned "path-ref" bookkeeping decrement of
-                # THIS execution, so first release exactly this scope's
-                # remaining PRIMARY references (per distinct value it
-                # actually owns — derived from the live scope state, never
-                # from foreign holders), then close (release-once; a late
-                # post_tool_call close for the same id is a harmless
-                # no-op). Symmetric with the normal path — never
-                # double-decrements, never strands.
-                for _value in sorted(scope_owned_values):
-                    scope.release_value(_value)
-                closed = close_execution_scope(None, exec_id)
-                if not closed:  # pragma: no cover - defensive fallback
-                    scope.close()
+            # Fail-safe for the exceptional path with an attributable
+            # id: the per-path cleanup loop above already handed back
+            # every entry-owned "path-ref" bookkeeping decrement of
+            # THIS execution, so first release exactly this scope's
+            # remaining PRIMARY references (per distinct value it
+            # actually owns — derived from the live scope state, never
+            # from foreign holders), then close (release-once; a late
+            # post_tool_call close for the same id is a harmless
+            # no-op). Symmetric with the normal path — never
+            # double-decrements, never strands.
+            for _value in sorted(scope_owned_values):
+                scope.release_value(_value)
+            closed = close_execution_scope(None, exec_id)
+            if not closed:  # pragma: no cover - defensive fallback
+                scope.close()
 
     return vaultwarden_inject_secrets
 
