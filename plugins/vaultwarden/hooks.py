@@ -894,22 +894,25 @@ def make_placeholder_resolver(auth: AuthManager,
             # is the single OWNER that forgets injected values — neither the
             # transformer nor the observer pops them.
             take_task_secrets(task_id)
-        # AUD-02 (v0.6.5) FAIL-SAFE scope closure: when this execution can be
-        # attributed to a task/execution id, post_tool_call is the SAFE FINAL
-        # lifecycle point and closes the scope THERE -- after
-        # transform_tool_result and observer cleanup have consumed the
-        # plaintexts for redaction. Here we only reset the ContextVar so no
-        # scope reference leaks into other contexts; the scope object stays
-        # open for the deferred release. When NO id is available the observer
-        # cannot attribute the call to this scope, so this finally block IS
-        # the guaranteed release point (fail-safe for exceptional paths where
-        # no later lifecycle hook will run). close() is release-once: double
-        # release can never occur and secrets can never leak across turns.
-        if not exec_id:
-            # No attributable id: this finally block IS the guaranteed
-            # release point -- close now and clear the published slot.
-            close_execution_scope(cv_scope_token, exec_id)
-            _clear_execution_scope_slot()
+            # AUD-02 (v0.6.5) FAIL-SAFE scope closure -- INSIDE the finally
+            # so it runs on EVERY path, including when next_call raises and
+            # no later lifecycle hook will execute. When this execution can
+            # be attributed to a task/execution id, post_tool_call is the
+            # SAFE FINAL lifecycle point and closes the scope THERE -- after
+            # transform_tool_result and observer cleanup have consumed the
+            # plaintexts for redaction. Here we only reset the ContextVar so
+            # no scope reference leaks into other contexts; the scope object
+            # stays open for the deferred release. When NO id is available
+            # the observer cannot attribute the call to this scope, so this
+            # finally block IS the guaranteed release point (fail-safe for
+            # exceptional paths where no later lifecycle hook will run).
+            # close() is release-once: double release can never occur and
+            # secrets can never leak across turns.
+            if not exec_id:
+                # No attributable id: this finally block IS the guaranteed
+                # release point -- close now and clear the published slot.
+                close_execution_scope(cv_scope_token, exec_id)
+                _clear_execution_scope_slot()
 
     return vaultwarden_inject_secrets
 
