@@ -332,7 +332,13 @@ def close_execution_scope(token: Any = None, exec_id: str = "",
 
 
 def clear_execution_scopes() -> None:
-    """Close EVERY open execution scope (session-end fail-safe)."""
+    """Close EVERY open execution scope (session-end fail-safe).
+
+    Also drains :data:`_PENDING_PATH_RETENTIONS`: every temp-file retention
+    still pending belongs to an execution that just ended, so releasing it
+    here keeps the scoped refcounts symmetric even when a host tears the
+    session down before the per-path cleanup loop ran.
+    """
     with _EXEC_SCOPES_LOCK:
         scopes = list(_EXEC_SCOPES_BY_ID.values())
         _EXEC_SCOPES_BY_ID.clear()
@@ -342,6 +348,10 @@ def clear_execution_scopes() -> None:
     if cur is not None:
         cur.close()
         _execution_secret_scope.set(None)
+    with _PATH_RETENTION_LOCK:
+        pending = list(_PENDING_PATH_RETENTIONS.keys())
+    for path in pending:
+        _release_path_retention(path)
 
 #: Kept for backward-compat with tests/consumers that still import it.
 #: VWP-04 does not inject sentinels anymore — unresolved references stay

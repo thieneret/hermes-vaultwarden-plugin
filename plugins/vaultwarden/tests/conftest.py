@@ -250,6 +250,47 @@ def fake_bw(tmp_path: Path) -> str:
     return str(script)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_redaction_state():
+    """AUD-02 test isolation.
+
+    The plugin shares ONE module-level RedactingFilter across the whole
+    test session; process-scoped registrations (auth bootstrap, startup
+    injection) from earlier tests would otherwise leak into later
+    baseline assertions and pending path-retentions would accumulate.
+    Reset both layers before and after every test. Production code never
+    sees this — it is a test-only fixture.
+    """
+    import importlib
+
+    def _reset() -> None:
+        for pkg, names in (
+            ("vaultwarden.hooks", ("clear_execution_scopes",)),
+            ("plugins.vaultwarden.hooks", ("clear_execution_scopes",)),
+        ):
+            try:
+                mod = importlib.import_module(pkg)
+            except ImportError:
+                continue
+            fn = getattr(mod, names[0], None)
+            if callable(fn):
+                fn()
+                break
+        for pkg in ("vaultwarden.security", "plugins.vaultwarden.security"):
+            try:
+                mod = importlib.import_module(pkg)
+            except ImportError:
+                continue
+            getf = getattr(mod, "get_redacting_filter", None)
+            if callable(getf):
+                getf().reset_for_tests()
+                break
+
+    _reset()
+    yield
+    _reset()
+
+
 @pytest.fixture()
 def appdata(tmp_path: Path) -> Path:
     d = tmp_path / ".bw-data"

@@ -278,6 +278,21 @@ class RedactingFilter(logging.Filter):
         with self._lock:
             return value in self._secrets
 
+    def reset_for_tests(self) -> None:
+        """Drop ALL redaction state (both retention layers). TEST-ONLY.
+
+        The plugin shares one module-level filter instance across every
+        import; without this hook, process-scoped registrations performed
+        by earlier tests leak into later baseline assertions. Production
+        code must NEVER call this — secrets registered for the process
+        lifetime are only dropped via :meth:`forget_secret` /
+        :meth:`release_process_scoped_secret` by their owners.
+        """
+        with self._lock:
+            self._secrets.clear()
+            self._secret_refcounts.clear()
+            self._process_scoped.clear()
+
     def snapshot_secrets(self) -> list[str]:
         """Thread-safe copy of the registered secret values, LONGEST first.
 
