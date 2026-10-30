@@ -230,6 +230,17 @@ class ExecutionSecretScope:
         baselines are untouched  -- the redactor only drops THIS scope's
         execution reference (a value stays redactable while any other
         active execution or the process baseline still holds it).
+
+        AUD-02 (v0.6.5) stranding guard: when the middleware fail-safe
+        closes the scope BEFORE its temp-file cleanup loop runs, the
+        entry-owned "path-ref" references recorded via
+        :meth:`retain_path_reference` can no longer be handed back through
+        :func:`_release_path_retention` (a late post_tool_call close makes
+        those entries unreachable pops). ``close`` therefore releases any
+        path-ref count still outstanding at closure time — symmetric to
+        how ``release_value`` floors at that same count, so neither path
+        ever double-decrements: whichever cleanup runs second finds the
+        bookkeeping already consumed and becomes a silent no-op.
         """
         with self._lock:
             if self._closed:
@@ -238,11 +249,16 @@ class ExecutionSecretScope:
             # Release EXACTLY the outstanding references: release_value()
             # (per-placeholder early release on the no-attributable-id
             # fail-safe path) may already have dropped some of them.
-            outstanding = list(self._outstanding.items())
+            outstanding = {v: n for v, n in self._outstanding.items()}
+            # Plus every path-ref reference still owned by this scope's
+            # bookkeeping (see docstring: stranding guard for fail-safe
+            # closures that run before the per-path release loop).
+            for v, n in self._path_owned.items():
+                outstanding[v] = outstanding.get(v, 0) + n
             self._values.clear()
             self._outstanding.clear()
             self._path_owned.clear()
-        for v, n in outstanding:
+        for v, n in outstanding.items():
             for _ in range(n):
                 self._redactor.release_secret(v)
 
@@ -772,9 +788,11 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
             _PENDING_PATH_RETENTIONS[path] = ("path-ref", value, exec_id)
         # AUD-02 (v0.6.5): report the scoped retention back to the calling
         # middleware execution so its fail-safe closure can release exactly
-        # this reference if no later lifecycle point runs.
+        # this reference (primary + entry-owned path ref) if no later
+        # lifecycle point runs. The pair carries BOTH the plaintext and the
+        # resolved temp-file path for precise per-token bookkeeping.
         if scoped_retained_out is not None:
-            scoped_retained_out.append(value)
+            scoped_retained_out.append((value, path))
     else:
         # No active execution scope (legacy/direct callers): fall back to
         # PROCESS-scoped retention so the value stays redactable; the
@@ -879,14 +897,15 @@ def make_placeholder_resolver(auth: AuthManager,
                     "validation; injection blocked (fail-closed).").to_dict())
             return next_call(args)
         temp_files: list[str] = []
-        #: AUD-02 (v0.6.5): plaintexts retained THROUGH this execution's
-        #: scope, one entry per resolved token occurrence. The fail-safe
-        #: closure below releases exactly these references when the
-        #: execution cannot be attributed to a lifecycle id (or dies on an
-        #: exceptional path); scoped retains deliberately have NO
-        #: _PENDING_PATH_RETENTIONS entry so temp-file cleanup alone can
-        #: never strip redaction coverage before transform_tool_result ran.
-        scoped_retained: list[str] = []
+        #: AUD-02 (v0.6.5): per-token resolution bookkeeping for THIS
+        #: execution — ``(value, path)`` for every successfully resolved
+        #: placeholder. The fail-safe closure below releases exactly these
+        #: references when the execution cannot be attributed to a lifecycle
+        #: id (or dies on an exceptional path); scoped retains deliberately
+        #: have NO _PENDING_PATH_RETENTIONS entry until cleanup runs so
+        #: temp-file handling alone can never strip redaction coverage
+        #: before transform_tool_result ran.
+        scoped_retained: list[tuple[str, str]] = []
         injected_values: list[str] = []
         new_args = dict(args)
         resolved_any = False
@@ -993,16 +1012,17 @@ def make_placeholder_resolver(auth: AuthManager,
         # release can never occur and secrets can never leak across turns.
         if not exec_id:
             # No attributable id: this finally block IS the guaranteed
-            # release point -- close now and clear the published slot.
-            # AUD-02 fail-safe for the EXCEPTIONAL path: when next_call
-            # raised, the code after the try/finally above never runs, so
-            # release every plaintext this execution retained through its
-            # scope HERE (release_value is silent no-op for values already
-            # handed back; process-fallback entries were released by the
-            # _release_path_retention loop above). On the normal path this
-            # is symmetric with -- and consumed by -- the immediate close()
-            # below, which then finds nothing outstanding left to release.
-            for _value in scoped_retained:
+            # release point. The per-path cleanup loop above already popped
+            # every "path-ref" entry of THIS execution and handed back its
+            # one owned decrement; close() now drops exactly the scope's
+            # remaining primary references (release-once, so a double close
+            # is a silent no-op). Both paths floor at the scope's _path_owned
+            # bookkeeping, so neither can ever double-decrement or strand a
+            # reference, and an overlapping execution sharing the same
+            # secret keeps its OWN primary + path references untouched until
+            # its own lifecycle completes. Process baselines are never
+            # touched here.
+            for _value in {v for v, _p in scoped_retained}:
                 scope.release_value(_value)
             close_execution_scope(cv_scope_token, exec_id)
             _clear_execution_scope_slot()
@@ -1022,10 +1042,19 @@ def make_placeholder_resolver(auth: AuthManager,
             # transform_tool_result consumed the plaintexts). Never logs
             # secret values.
             if sys.exc_info()[0] is not None:
+                # Fail-safe for the exceptional path with an attributable
+                # id: the per-path cleanup loop above already handed back
+                # every entry-owned "path-ref" decrement of THIS execution,
+                # so first release exactly this scope's remaining PRIMARY
+                # references (per distinct value), then close (release-once;
+                # a late post_tool_call close for the same id is a harmless
+                # no-op). Symmetric with the normal path — never
+                # double-decrements, never strands.
+                for _value in {v for v, _p in scoped_retained}:
+                    scope.release_value(_value)
                 closed = close_execution_scope(None, exec_id)
                 if not closed:  # pragma: no cover - defensive fallback
-                    for _value in scoped_retained:
-                        scope.release_value(_value)
+                    scope.close()
 
     return vaultwarden_inject_secrets
 
