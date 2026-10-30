@@ -5,6 +5,12 @@ Author: **thieneret**
 
 ---
 
+## v0.6.4
+
+- fix(bw-cli): restore `BW_SESSION` environment variable injection for vault read/write operations
+- fixes regression where `vaultwarden_list` returned empty and `vaultwarden_store` failed with exit 1 due to missing session key in subprocess environment
+- improve `bw` subprocess error reporting for locked/expired session states
+
 ## v0.6.3
 
 - feat(security): fail-closed lifecycle hook registration for critical lifecycle hooks (AUD-06)

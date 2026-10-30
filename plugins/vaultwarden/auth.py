@@ -87,7 +87,8 @@ class AuthManager:
         # v0.6.4 (HOTFIX): register with bw_cli's weak in-memory registry so
         # the subprocess-env choke point can always re-inject BW_SESSION for
         # session-requiring commands (defense-in-depth against a dropped key).
-        bw.register_auth_manager(self)
+        from . import bw_cli as _bw_cli
+        _bw_cli.register_auth_manager(self)
         # Plan §5 state machine: the manager starts UNINITIALIZED and only
         # becomes CONFIGURED once configure_server_if_needed() has run (the
         # register(ctx) bootstrap flow). is_available()/check_fn therefore

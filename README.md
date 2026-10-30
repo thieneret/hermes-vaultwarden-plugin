@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.6.3**
+**Current version: v0.6.4**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**

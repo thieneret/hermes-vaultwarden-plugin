@@ -36,6 +36,11 @@ log = get_logger("bw_cli")
 import weakref  # noqa: E402
 
 _AUTH_MANAGER_HOLDER: list = []  # single-slot holder: [weakref.ref(AuthManager)]
+# v0.6.4: keep a strong ref to the *dummy* objects registered by tests only.
+# Production AuthManagers are held weakly (no reference cycle); CPython can
+# garbage-collect an inline-constructed test double between the registration
+# call and its use, so non-AuthManager registrations are pinned strongly.
+_AUTH_MANAGER_STRONG_HOLDER: list = []
 
 
 def register_auth_manager(auth) -> None:
@@ -45,10 +50,15 @@ def register_auth_manager(auth) -> None:
     most recently constructed manager wins (tests construct throwaway
     managers frequently).
     """
+    _AUTH_MANAGER_HOLDER.clear()
+    _AUTH_MANAGER_STRONG_HOLDER.clear()
     if auth is None:
         return
-    _AUTH_MANAGER_HOLDER.clear()
     _AUTH_MANAGER_HOLDER.append(weakref.ref(auth))
+    if type(auth).__name__ != "AuthManager":
+        # test double (duck-typed stub): pin it so GC cannot collect it
+        # before the assertion that exercises the fallback path.
+        _AUTH_MANAGER_STRONG_HOLDER.append(auth)
 
 
 def get_auth_manager():
