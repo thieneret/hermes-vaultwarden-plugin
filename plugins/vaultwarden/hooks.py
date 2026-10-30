@@ -163,20 +163,27 @@ class ExecutionSecretScope:
         with self._lock:
             return (not self._closed) and value in self._values
 
-    def forget_value(self, value: str) -> None:
-        """Drop THIS scope's ownership bookkeeping for *value*.
+    def release_value(self, value: str) -> None:
+        """Release THIS scope's execution reference for *value* exactly once.
 
-        AUD-02 per-path release: when the middleware releases a placeholder's
-        private execution reference after temp-file cleanup, the scope must
-        not attempt to release that same reference again at close(). This
-        only removes the value from the scope's internal set; the shared
-        refcount decrement already happened (or belongs to another owner).
-        Never logs the value; no-op on a closed scope.
+        AUD-02 per-placeholder release: called when the temp file carrying
+        the plaintext is removed during middleware cleanup. The scope drops
+        its ownership of the value and performs precisely ONE shared
+        refcount decrement; a second call for the same value is a silent
+        no-op (release-once per value), so close() can never double-release
+        it and an early release can never strip redaction coverage from a
+        value another active execution (or the process baseline) still
+        retains. Process-scoped baselines are untouched — the redactor only
+        removes the value from its state when BOTH the execution refcount
+        and the process baseline reach zero. Never logs the value.
         """
         if not value:
             return
         with self._lock:
+            if self._closed or value not in self._values:
+                return  # already released / never retained here: no-op
             self._values.discard(value)
+        self._redactor.release_secret(value)
 
     def close(self) -> None:
         """Release every execution-scoped reference held by this scope.
@@ -530,33 +537,57 @@ def _release_path_retention(path: str, exec_id: str = "") -> None:
     that built their own cleanup loop).
 
     Ownership rule: a ("scope", ...) entry marks a placeholder whose value
-    was retained THROUGH the owning :class:`ExecutionSecretScope` — the
-    scope holds exactly ONE reference per distinct value and releases it at
-    close() (the safe final lifecycle point, AFTER this cleanup ran inside
-    the middleware finally while the scope is still open). We therefore do
-    NOT decrement here: an early decrement would strip redaction coverage
-    from the result echoes that transform_tool_result/post_tool_call still
-    have to scrub. Only the "process" fallback entries (no active scope at
-    resolve time) are released symmetrically here via
-    :meth:`release_process_scoped_secret`.
+    was retained THROUGH the owning :class:`ExecutionSecretScope`. The
+    scope holds exactly ONE execution reference per distinct value; this
+    cleanup hands that single reference back via ``scope.release_value``
+    (release-once per value) as soon as the temp file carrying the
+    plaintext is gone -- symmetric with the retain at resolve time. The
+    shared refcount makes this safe for every later lifecycle consumer:
+    transform_tool_result and the post_tool_call observer redact from the
+    authoritative per-task injected-secret store (not from this registry),
+    any overlapping execution still retaining the same value keeps its own
+    reference so the value stays in the redaction state, and a value that
+    is ALSO process-scoped keeps its baseline. Only when the LAST holder
+    releases does the value leave the redaction state. ("process", ...)
+    fallback entries (no active scope at resolve time) are released
+    symmetrically here via :meth:`release_process_scoped_secret`.
     """
     with _PATH_RETENTION_LOCK:
         entry = _PENDING_PATH_RETENTIONS.pop(path, None)
     if entry is None:
         return
-    kind, value = entry[0], entry[1]
+    kind, value, owner_id = entry[0], entry[1], entry[2]
     try:
         redactor = get_redacting_filter()
-        if kind != "scope":
+        if kind == "scope":
+            # Release precisely the ONE execution reference the owning
+            # scope took for this value. Prefer the scope published under
+            # this execution's id; fall back to the ContextVar scope (same
+            # context). release_value is a silent no-op if the scope
+            # already closed/released it, so double release can never
+            # occur.
+            scope = None
+            lookup = exec_id or owner_id
+            if lookup:
+                with _EXEC_SCOPES_LOCK:
+                    scope = _EXEC_SCOPES_BY_ID.get(lookup)
+            if scope is None:
+                scope = current_execution_scope()
+            if scope is not None:
+                scope.release_value(value)
+            else:
+                # Scope vanished (session-end sweep / host teardown): drop
+                # exactly one execution reference directly so nothing
+                # accumulates globally. Refcount protection still guards
+                # any other live holder.
+                redactor.release_secret(value)
+        else:
             # Fallback process baseline taken when NO execution scope was
             # published at resolve time: drop precisely that one baseline
             # reference now that the temp file carrying the plaintext is
             # gone. (If the same value is ALSO a genuine process-scoped
             # secret, its own baseline count keeps it redactable.)
             redactor.release_process_scoped_secret(value)
-        # kind == "scope": nothing to do here — the OWNING scope performs
-        # the single, release-once decrement when the execution's deferred
-        # close runs at the safe final lifecycle point.
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("AUD-02: retention release failed for temp file %s (%s)",
                     os.path.basename(path), type(exc).__name__)
@@ -638,20 +669,14 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
     scope = current_execution_scope()
     redactor = get_redacting_filter()
     if scope is not None:
-        was_retained = scope.has_value(value)
+        # Execution-scoped retention, exactly ONE reference per (scope,
+        # value): the scope's retain() dedupes and the symmetric
+        # release_value() at temp-file cleanup drops precisely that one
+        # reference. Overlapping executions sharing this secret each hold
+        # their own reference in the shared refcount, so no owner's cleanup
+        # can remove the value while another active execution still needs
+        # it for redaction.
         scope.retain(value)
-        if was_retained:
-            # Same secret referenced by ANOTHER placeholder inside THIS
-            # execution: the scope holds exactly one reference per distinct
-            # value, so this temp file gets its OWN private execution
-            # reference. The per-path release below drops precisely that
-            # reference when the temp file is removed; the scope's own
-            # reference is released once at close (release-once bookkeeping
-            # in ExecutionSecretScope forgets values it has already
-            # released). Overlapping executions are protected by the shared
-            # refcount — nothing here can remove a value another active
-            # execution still retains.
-            redactor.retain_secret(value)
         _PENDING_PATH_RETENTIONS[path] = ("scope", value, exec_id or task_id)
     else:
         # No active execution scope (legacy/direct callers): fall back to
