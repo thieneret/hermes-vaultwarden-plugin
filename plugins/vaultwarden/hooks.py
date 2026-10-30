@@ -95,7 +95,7 @@ log = get_logger("hooks")
 #     executions each own their own scope;
 #   - the middleware retains every injected plaintext in the scope (each
 #     value at most once per scope) BEFORE running the tool;
-#   - release is DEFERRED to the latest safe lifecycle point — after the
+#   - release is DEFERRED to the latest safe lifecycle point  -- after the
 #     authoritative transform_tool_result pass and after the observer-side
 #     post_tool_call cleanup/metrics have run (Hermes dispatch order:
 #     middleware wraps next_call; transform runs on the returned result;
@@ -111,7 +111,7 @@ log = get_logger("hooks")
 #     execution scope; releasing a scope only ever drops the scope's OWN
 #     execution reference, never the process baseline.
 #
-# NEVER log secret values anywhere in this machinery — sanitized
+# NEVER log secret values anywhere in this machinery  -- sanitized
 # diagnostics carry lengths/counts only.
 # ---------------------------------------------------------------------------
 
@@ -122,7 +122,7 @@ class ExecutionSecretScope:
     Every plaintext runtime secret retained through this scope increments
     the shared RedactingFilter's execution refcount exactly once per scope
     (a value referenced by several placeholders in one command keeps a
-    single reference). :meth:`close` releases precisely those references —
+    single reference). :meth:`close` releases precisely those references  --
     idempotently, so closing twice (post_tool_call + middleware fail-safe)
     never double-decrements and never removes a value another active
     execution still retains.
@@ -137,7 +137,7 @@ class ExecutionSecretScope:
     def retain(self, value: str) -> None:
         """Retain *value* for this execution scope (once per distinct value).
 
-        No-op after close (sanitized warning only — never the value).
+        No-op after close (sanitized warning only  -- never the value).
         """
         if not value:
             return
@@ -158,7 +158,7 @@ class ExecutionSecretScope:
         """Release every execution-scoped reference held by this scope.
 
         Release-once: subsequent calls are a no-op. Process-scoped
-        baselines are untouched — the redactor only drops THIS scope's
+        baselines are untouched  -- the redactor only drops THIS scope's
         execution reference (a value stays redactable while any other
         active execution or the process baseline still holds it).
         """
@@ -190,7 +190,7 @@ class ExecutionSecretScope:
 _execution_secret_scope: contextvars.ContextVar["ExecutionSecretScope | None"] \
     = contextvars.ContextVar("vaultwarden_execution_secret_scope", default=None)
 
-#: Fallback registry keyed by execution/task id — covers hosts that
+#: Fallback registry keyed by execution/task id  -- covers hosts that
 #: dispatch post_tool_call on a different context than the middleware
 #: (same belt-and-braces pattern as the task-keyed injected-secret store).
 _EXEC_SCOPES_BY_ID: dict[str, "ExecutionSecretScope"] = {}
@@ -512,8 +512,18 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
         return None
     # Write the secret to a mkstemp file (chmod 600, atomic, symlink-protected).
     path = _write_secret_file(six_hex, value, secrets_dir, temp_files)
-    # Register the value so it gets scrubbed from any log line / output echo.
-    get_redacting_filter().register_secret(value)
+    # AUD-02 (v0.6.5): retain the plaintext for redaction through the ACTIVE
+    # EXECUTION SCOPE (reference-counted) instead of unbounded global
+    # registration. The scope releases the reference once the execution has
+    # passed every lifecycle point that may still need redaction
+    # (transform_tool_result + post_tool_call observer). If no scope is active
+    # (legacy/direct callers), fall back to process-scoped retention so the
+    # value stays redactable  a runtime secret must never go unredacted.
+    scope = current_execution_scope()
+    if scope is not None:
+        scope.retain(value)
+    else:
+        get_redacting_filter().register_secret(value)
     # v0.1.4 (FAIL-6): also record the plaintext per-task so the redaction
     # layer can scrub it from this specific tool call's output even when the
     # global filter state was reset by another component in between.
@@ -614,6 +624,18 @@ def make_placeholder_resolver(auth: AuthManager,
         injected_values: list[str] = []
         new_args = dict(args)
         resolved_any = False
+        # AUD-02 (v0.6.5): ONE execution scope per tool execution. Opened
+        # here (after the no-op gates so non-injection calls never touch the
+        # registry); every placeholder resolved below is retained THROUGH this
+        # scope, reference-counted in the shared redactor. The scope is closed
+        # at the safe final lifecycle point  post_tool_call (deferred release,
+        # after transform_tool_result and observer cleanup have run), with the
+        # finally block below as the FAIL-SAFE for exceptional paths where no
+        # later hook will execute. close() is release-once: double-close is a
+        # silent no-op and overlapping executions sharing a secret can never
+        # cause premature removal.
+        exec_id = _exec_id_for(task_id, kwargs)
+        scope, cv_scope_token = open_execution_scope(exec_id)
         try:
             for key in targets:
                 command = new_args[key]
@@ -683,6 +705,24 @@ def make_placeholder_resolver(auth: AuthManager,
             # is the single OWNER that forgets injected values â€” neither the
             # transformer nor the observer pops them.
             take_task_secrets(task_id)
+        # AUD-02 (v0.6.5) FAIL-SAFE scope closure: when this execution can be
+        # attributed to a task/execution id, post_tool_call is the SAFE FINAL
+        # lifecycle point and closes the scope THERE -- after
+        # transform_tool_result and observer cleanup have consumed the
+        # plaintexts for redaction. Here we only reset the ContextVar so no
+        # scope reference leaks into other contexts; the scope object stays
+        # open for the deferred release. When NO id is available the observer
+        # cannot attribute the call to this scope, so this finally block IS
+        # the guaranteed release point (fail-safe for exceptional paths where
+        # no later lifecycle hook will run). close() is release-once: double
+        # release can never occur and secrets can never leak across turns.
+        if exec_id:
+            try:
+                _execution_secret_scope.reset(cv_scope_token)
+            except ValueError:  # token from a different context (asyncio)
+                pass
+        else:
+            close_execution_scope(cv_scope_token, exec_id)
 
     return vaultwarden_inject_secrets
 
@@ -1009,6 +1049,16 @@ def make_post_cleanup_hook(auth: AuthManager,
         n = registry.cleanup_used()
         if n:
             log.debug("post_tool_call cleaned %d used placeholder(s).", n)
+        # AUD-02 (v0.6.5): SAFE FINAL LIFECYCLE POINT for execution-scoped
+        # secret release. Hermes dispatch order: middleware wraps next_call;
+        # transform_tool_result redacts the returned result; post_tool_call
+        # observes LAST. Closing the scope here guarantees the authoritative
+        # redaction and observer-side sanitized error surfacing already ran
+        # while the plaintexts were still retained. When the execution cannot
+        # be attributed (no task_id / exec kwarg), leave the scope open: the
+        # middleware's finally fail-safe (or on_session_end) closes it  never
+        # guess and never release another execution's scope prematurely.
+        close_execution_scope(exec_id=_exec_id_for(task_id, kwargs))
         # Surface fail-closed resolution errors to the agent (secret-free).
         # v0.2.2 (BUGFIX): pop only THIS task's errors â€” other in-flight
         # tasks keep their pending errors until their own post_tool_call.
