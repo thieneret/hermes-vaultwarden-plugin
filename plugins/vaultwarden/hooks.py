@@ -1414,13 +1414,21 @@ def make_result_redactor(auth: AuthManager,
         # AUD-02 (v0.6.5): belt-and-braces — when both handoff stores are
         # blind for this dispatch (cross-context/thread host), the still-
         # OPEN execution scope itself knows exactly which plaintexts it
-        # retains. A closed scope contributes nothing, so this can never
-        # re-introduce stale values after release.
+        # retains. Prefer OUR OWN attributed scope (registry lookup by the
+        # canonical id) over whatever slot happens to be published in this
+        # context: on hosts that dispatch the transformer on a foreign
+        # context, the ContextVar may point at ANOTHER execution's scope —
+        # scrubbing with foreign plaintexts would leak one execution's
+        # secret into another execution's redaction pass. A closed scope
+        # contributes nothing, so this can never re-introduce stale values
+        # after release.
         if not values:
-            scoped = _execution_secret_scope.get()
-            if scoped is None and exec_id:
+            scoped = None
+            if exec_id:
                 with _EXEC_SCOPES_LOCK:
                     scoped = _EXEC_SCOPES_BY_ID.get(exec_id)
+            if scoped is None:
+                scoped = _execution_secret_scope.get()
             if scoped is not None:
                 values = scoped.retained_values()
         # 2) exact plaintext replacement of every injected value with the
