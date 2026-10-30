@@ -527,16 +527,17 @@ def _cleanup_stale_sockets():
 
 
 def _write_secret_file(token: str, value: str, secrets_dir: str,
-                       temp_files: list[str]) -> tuple[str, str]:
+                       temp_files: list[str]) -> str:
     """Write *value* to a fresh mkstemp file (chmod 600, atomic, symlink-
     protected) inside *secrets_dir*; register it for finally-block cleanup.
 
     SEC-02 (v0.5.7): extracted from the old ``_inject_one`` helper so the
     atomic resolve loop can call it exactly once per unique token.
 
-    AUD-02 (v0.6.5): returns ``(path, six_hex_body)`` — the token body is
-    safe to log and lets the caller attach the placeholder's scoped
-    retention to the exact temp file that carries the plaintext.
+    Returns the temp-file path. The ``$__VW_SECRET_<token>__`` reference
+    body itself is already known to (and safe to log for) every caller, so
+    no extra token plumbing is needed to correlate a file with its
+    placeholder.
     """
     fd, path = tempfile.mkstemp(dir=secrets_dir, prefix=f"vw_{token}_")
     try:
@@ -549,20 +550,30 @@ def _write_secret_file(token: str, value: str, secrets_dir: str,
 
 
 #: AUD-02 (v0.6.5): resolved temp-file path -> (retention kind, plaintext,
-#: owning execution id), where kind is "scope" (a PRIVATE execution-scoped
-#: reference held by the ExecutionSecretScope identified by the third field)
-#: or "process" (fallback process baseline when no scope was active).
-#: :func:`_resolve_placeholder_token` records the entry; the middleware
-#: cleanup loop releases EXACTLY ONE matching reference per resolved temp
-#: file once the file has been removed — i.e. after next_call returned and
-#: the SEC-01 ContextVar handoff was restored, which is a safe lifecycle
-#: point for the placeholder path (the authoritative transform_tool_result
-#: redaction consumes its own ContextVar/task-store copies, not this
-#: registry). The scope's OWN primary reference per distinct value is
-#: released exactly once at close() (release-once); these per-path private
-#: references are dropped here, symmetric to how they were taken.
-#: Thread-safe; entries are popped on release so nothing accumulates across
-#: executions. NEVER logged — values stay in memory only.
+#: owning execution id), where kind is "process" (fallback process baseline
+#: taken when NO execution scope was active at resolve time) or "path-ref"
+#: (an EXTRA execution-scoped reference taken alongside the scope's own
+#: deduplicated primary reference, so a LATE attributable post_tool_call
+#: can still redact exact plaintexts from a result even after the
+#: middleware's finally block already deleted the temp files and restored
+#: the SEC-01 handoff stores).
+#: :func:`_resolve_placeholder_token` records the entries; the middleware
+#: cleanup loop drops EXACTLY ONE matching reference per resolved temp file
+#: once the file has been removed — i.e. after next_call returned AND the
+#: authoritative transform_tool_result pass consumed every handoff channel
+#: it can reach while the middleware frame is still alive (Hermes dispatch
+#: order: middleware wraps next_call; transform runs on the returned result
+#: BEFORE the middleware frame unwinds; post_tool_call observes last).
+#: A "path-ref" is owned by the ENTRY ITSELF, not by the scope bookkeeping:
+#: :meth:`ExecutionSecretScope.close` never re-touches it and
+#: :meth:`ExecutionSecretScope.release_value` refuses to drop below the
+#: number of path references still outstanding for that value, so neither
+#: double-release nor premature removal can occur — an overlapping
+#: execution sharing the same secret keeps its OWN primary + path
+#: references untouched. When the LAST holder releases, the value leaves
+#: the redaction state. Thread-safe; entries are popped on release so
+#: nothing accumulates across executions. NEVER logged — values stay in
+#: memory only.
 _PENDING_PATH_RETENTIONS: dict[str, tuple[str, str, str]] = {}
 _PATH_RETENTION_LOCK = threading.Lock()
 
@@ -574,21 +585,24 @@ def _release_path_retention(path: str, exec_id: str = "") -> None:
     value. Missing entries are a harmless no-op (e.g. legacy/direct callers
     that built their own cleanup loop).
 
-    Ownership rule: a ("scope", ...) entry marks a placeholder whose value
-    was retained THROUGH the owning :class:`ExecutionSecretScope`. The
-    scope holds exactly ONE execution reference per distinct value; this
-    cleanup hands that single reference back via ``scope.release_value``
-    (release-once per value) as soon as the temp file carrying the
-    plaintext is gone -- symmetric with the retain at resolve time. The
-    shared refcount makes this safe for every later lifecycle consumer:
-    transform_tool_result and the post_tool_call observer redact from the
-    authoritative per-task injected-secret store (not from this registry),
-    any overlapping execution still retaining the same value keeps its own
-    reference so the value stays in the redaction state, and a value that
-    is ALSO process-scoped keeps its baseline. Only when the LAST holder
-    releases does the value leave the redaction state. ("process", ...)
-    fallback entries (no active scope at resolve time) are released
-    symmetrically here via :meth:`release_process_scoped_secret`.
+    Ownership rules per retention kind:
+
+    - ``("path-ref", value, owner_exec_id)`` — an EXTRA execution-scoped
+      reference taken by :func:`_resolve_placeholder_token` alongside the
+      owning scope's deduplicated primary reference. The ENTRY owns this
+      single reference: releasing it goes straight through
+      :meth:`RedactingFilter.release_secret` (one decrement), symmetric to
+      how it was taken. ``scope.release_value`` deliberately does NOT drop
+      path-owned references (it floors at the outstanding path-ref count),
+      so close() and this release can never double-decrement the same
+      reference; every other holder (an overlapping execution's primary or
+      path reference, a process baseline) keeps the value redactable until
+      its OWN release.
+    - ``("process", value, "")`` — fallback process baseline taken when NO
+      execution scope was published at resolve time; dropped symmetrically
+      here via :meth:`release_process_scoped_secret`. (If the same value is
+      ALSO a genuine process-scoped secret, its own baseline count keeps it
+      redactable.)
     """
     with _PATH_RETENTION_LOCK:
         entry = _PENDING_PATH_RETENTIONS.pop(path, None)
@@ -597,28 +611,13 @@ def _release_path_retention(path: str, exec_id: str = "") -> None:
     kind, value, owner_id = entry[0], entry[1], entry[2]
     try:
         redactor = get_redacting_filter()
-        if kind == "scope":
-            # Release precisely the ONE execution reference the owning
-            # scope took for this value. Prefer the scope published under
-            # this execution's id; fall back to the ContextVar scope (same
-            # context). release_value is a silent no-op if the scope
-            # already closed/released it, so double release can never
-            # occur.
-            scope = None
-            lookup = exec_id or owner_id
-            if lookup:
-                with _EXEC_SCOPES_LOCK:
-                    scope = _EXEC_SCOPES_BY_ID.get(lookup)
-            if scope is None:
-                scope = current_execution_scope()
-            if scope is not None:
-                scope.release_value(value)
-            else:
-                # Scope vanished (session-end sweep / host teardown): drop
-                # exactly one execution reference directly so nothing
-                # accumulates globally. Refcount protection still guards
-                # any other live holder.
-                redactor.release_secret(value)
+        if kind == "path-ref":
+            # Drop precisely the ONE extra execution reference this temp
+            # file's resolution took. Refcount protection still guards any
+            # other live holder (overlapping executions, baselines) — the
+            # value leaves the redaction state only when the LAST holder
+            # releases. Never logs the value.
+            redactor.release_secret(value)
         else:
             # Fallback process baseline taken when NO execution scope was
             # published at resolve time: drop precisely that one baseline
