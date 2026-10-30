@@ -956,6 +956,15 @@ def make_placeholder_resolver(auth: AuthManager,
         # silent no-op and overlapping executions sharing a secret can never
         # cause premature removal.
         exec_id = _exec_id_for(task_id, kwargs)
+        # AUD-02 (v0.6.5): exception tracker for the OUTER frame, declared
+        # BEFORE the scope try block so EVERY exceptional path — the
+        # injection loop itself AND next_call — deterministically sets it.
+        # sys.exc_info() is NOT a reliable exception detector inside the
+        # outer finally once an inner finally has completed (CPython
+        # restores the previous exception state when the inner frame
+        # exits), so this explicit flag makes the attributable-id fail-safe
+        # closure deterministic. Never logs secret values.
+        outer_raised = False
         scope, cv_scope_token = open_execution_scope(exec_id)
         try:
             for key in targets:
@@ -1015,10 +1024,6 @@ def make_placeholder_resolver(auth: AuthManager,
             # cleanup runs, so temp-file handling alone can never strip
             # redaction coverage before transform_tool_result ran.
             scope_owned_values.update(scope.retained_values())
-            # Exception tracker for the OUTER frame: an exception raised by
-            # the injection loop itself (before next_call) must also trigger
-            # the attributable-id fail-safe closure below.
-            outer_raised = False
             # SEC-01 (v0.5.4) handoff: publish the exact plaintext set that is
             # about to enter the shell into the ContextVar IMMEDIATELY BEFORE
             # the tool runs, so the authoritative transform_tool_result
