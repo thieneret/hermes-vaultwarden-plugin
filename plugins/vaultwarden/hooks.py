@@ -195,31 +195,34 @@ class ExecutionSecretScope:
             return (not self._closed) and value in self._values
 
     def release_value(self, value: str) -> None:
-        """Release THIS scope's PRIMARY execution reference for *value*.
+        """Release ALL of THIS scope's execution references for *value*.
 
         AUD-02 fail-safe release: called by the middleware when the
         execution cannot be attributed to a lifecycle id, or when the
         middleware frame unwinds via an exception before any later hook can
-        run. The scope drops its outstanding primary references for the
-        value (normally one — ``retain`` dedupes identical values inside a
-        single execution) but FLOORS at the number of temp-file ("path-ref")
-        references still owned by their entries: those are handed back only
-        by :func:`_release_path_retention`, so this call can never double-
-        decrement them and a second call is a silent no-op (release-once per
-        value). An early release can therefore never strip redaction
-        coverage from a value another active execution (or the process
-        baseline) still retains. Process-scoped baselines are untouched —
-        the redactor only removes the value from its state when BOTH the
-        execution refcount and the process baseline reach zero. Never logs
-        the value.
+        run. The scope drops EVERY outstanding reference it owns for the
+        value — its deduplicated primary reference AND every temp-file
+        ("path-ref") reference recorded through
+        :meth:`retain_path_reference` whose entry was already consumed by
+        the per-path cleanup loop (:func:`_release_path_retention` clears
+        the bookkeeping together with the entry it releases, so whatever
+        remains here is exactly what no other path will ever hand back).
+        A second call is a silent no-op (release-once per value), and an
+        early release can never strip redaction coverage from a value
+        another active execution (or the process baseline) still retains:
+        foreign holders keep their own counts in the shared refcount.
+        Process-scoped baselines are untouched — the redactor only removes
+        the value from its state when BOTH the execution refcount and the
+        process baseline reach zero. Never logs the value.
         """
         if not value:
             return
         with self._lock:
-            if self._closed or value not in self._values:
+            if self._closed or (value not in self._values
+                                and value not in self._path_owned):
                 return  # already released / never retained here: no-op
             self._values.discard(value)
-            n = self._outstanding.pop(value, 0)
+            n = self._outstanding.pop(value, 0) + self._path_owned.pop(value, 0)
         for _ in range(n):
             self._redactor.release_secret(value)
 
@@ -638,14 +641,17 @@ def _release_path_retention(path: str, exec_id: str = "") -> None:
     - ``("path-ref", value, owner_exec_id)`` — an EXTRA execution-scoped
       reference taken by :func:`_resolve_placeholder_token` alongside the
       owning scope's deduplicated primary reference. The ENTRY owns this
-      single reference: releasing it goes straight through
-      :meth:`RedactingFilter.release_secret` (one decrement), symmetric to
-      how it was taken. ``scope.release_value`` deliberately does NOT drop
-      path-owned references (it floors at the outstanding path-ref count),
-      so close() and this release can never double-decrement the same
-      reference; every other holder (an overlapping execution's primary or
-      path reference, a process baseline) keeps the value redactable until
-      its OWN release.
+      single reference: releasing it decrements the shared refcount once AND
+      clears the owning scope's ``_path_owned`` bookkeeping for the value
+      under one lock, so the scope's fail-safe paths (``release_value`` /
+      ``close``) know this reference was already handed back and can never
+      double-decrement it; conversely if the scope closes FIRST, its
+      stranding guard releases the path reference and clears the entry's
+      bookkeeping so a late per-path release here becomes a no-op decrement.
+      Every other holder (an overlapping execution's primary or path
+      reference, a process baseline) keeps the value redactable until its OWN
+      release — an early temp-file cleanup can therefore never strip
+      redaction coverage from a still-active execution.
     - ``("process", value, "")`` — fallback process baseline taken when NO
       execution scope was published at resolve time; dropped symmetrically
       here via :meth:`release_process_scoped_secret`. (If the same value is
@@ -1024,8 +1030,22 @@ def make_placeholder_resolver(auth: AuthManager,
             # touched here.
             for _value in {v for v, _p in scoped_retained}:
                 scope.release_value(_value)
-            close_execution_scope(cv_scope_token, exec_id)
-            _clear_execution_scope_slot()
+            # AUD-02 (v0.6.5) ownership rule: ALWAYS close OUR OWN scope by
+            # identity here. An id-less close_execution_scope() would fall
+            # back to whatever scope the ContextVar currently publishes --
+            # which may be ANOTHER execution's still-open deferred scope
+            # (attributable executions intentionally keep theirs open until
+            # post_tool_call closes them at the safe final lifecycle point).
+            # Force-closing that foreign scope would strip its redaction
+            # coverage prematurely and strand our own references. Resetting
+            # our token only ever un-publishes OUR slot (ValueError across
+            # contexts is ignored); a slot still pointing at our closed
+            # scope is adopted-and-cleared by the next open_execution_scope.
+            scope.close()
+            try:
+                _execution_secret_scope.reset(cv_scope_token)
+            except ValueError:  # token from a different context (asyncio)
+                pass
         elif scoped_retained:
             # Attributable id but the middleware frame is unwinding via an
             # exception (or a sync host that shares one context across the
