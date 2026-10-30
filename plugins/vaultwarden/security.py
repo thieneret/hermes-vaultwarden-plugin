@@ -153,6 +153,17 @@ class RedactingFilter(logging.Filter):
         if not value:
             return
         with self._lock:
+            # AUD-02 (v0.6.5): minimum-length policy IDENTICAL to the
+            # scoped/process registration APIs. Values shorter than 4 chars
+            # can never ENTER the registry (retain_secret /
+            # register_process_scoped_secret ignore them), so forget_secret
+            # must not be able to strip a legitimate short baseline that a
+            # legacy caller registered directly either — keeping the floors
+            # symmetric guarantees every registered value stays redactable
+            # until its owner releases it (fail-safe direction: prefer
+            # over-redaction over under-redaction).
+            if len(value) < 4:
+                return
             self._secrets.discard(value)
             self._secret_refcounts.pop(value, None)
             self._process_scoped.pop(value, None)
