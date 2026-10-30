@@ -34,6 +34,67 @@ log = get_logger("tools")
 Handler = Callable[..., str]
 
 
+def _current_execution_scope():
+    """Active execution scope via lazy import (AUD-02).
+
+    ``hooks`` imports ``tools`` at module level, so a top-level
+    ``from .hooks import ...`` here would be a circular import. The scope
+    lookup is only needed while handlers run, i.e. after both modules are
+    fully initialized. Returns None when no scope is active.
+    """
+    from .hooks import current_execution_scope
+    return current_execution_scope()
+
+
+# ---------------------------------------------------------------------------
+# AUD-02 (v0.6.5): scoped retention helpers for RUNTIME tool-handler secrets
+# ---------------------------------------------------------------------------
+# Generated passwords, resolved password channels and SSH passphrases are
+# runtime secrets: they must be redactable while the handler executes but
+# must NEVER accumulate unboundedly in the global RedactingFilter afterwards.
+#
+# - retain_runtime_secret(): if an execution scope is active (placeholder
+#   middleware path), the plaintext is retained THROUGH the scope so the
+#   deferred release at the safe final lifecycle point drops exactly one
+#   execution reference per value; otherwise it falls back to a scoped
+#   retain paired with the explicit release performed by the handler's
+#   finally block (legacy / direct-call paths). The old
+#   ``register_secret`` + ``forget_secret`` pair is not used here anymore:
+#   forget() would drop ALL retention layers, which could strip a baseline
+#   another owner (e.g. startup injection or bootstrap auth) still needs,
+#   while plain register() would leak the value globally when the paired
+#   forget is skipped on an abnormal path.
+# - release_runtime_secret(): symmetric release; goes through the scope when
+#   this handler runs inside one (closing the scope releases it later --
+#   double release is impossible because close() is release-once), else the
+#   handler's own finally performs the decrement.
+def retain_runtime_secret(value: str) -> None:
+    """Retain a runtime tool-secret for redaction (scoped, ref-counted)."""
+    if not value:
+        return
+    scope = _current_execution_scope()
+    if scope is not None:
+        scope.retain(value)
+    else:
+        get_redacting_filter().retain_secret(value)
+
+
+def release_runtime_secret(value: str) -> None:
+    """Release a runtime tool-secret retained via :func:`retain_runtime_secret`.
+
+    When the handler ran inside an execution scope, releasing is left to the
+    scope's single, release-once ``close()`` -- releasing here too would
+    double-decrement the shared refcount. Otherwise this is the handler's
+    own finally-block decrement. Never logs the value.
+    """
+    if not value:
+        return
+    scope = _current_execution_scope()
+    if scope is not None:
+        return  # the scope owns the release; close() is release-once
+    get_redacting_filter().release_secret(value)
+
+
 # --------------------------------------------------------------- helpers
 def _remove_quietly(path: str, label: str) -> None:
     """Delete *path*, never raising; log a sanitized WARNING on failure.
@@ -629,7 +690,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             # password_env channel — fires in generate AND non-generate mode.
             _reject_removed_env_channel(args, "password_env", "password_file",
                                         "vaultwarden_store")
-            redactor = get_redacting_filter()
+            # AUD-02 (v0.6.5): runtime tool secrets now go through the
+            # scoped retain/release helpers below; the raw redactor handle
+            # is no longer needed in this handler.
 
             generated_pw = None
             generate = bool(args.get("generate", False))
@@ -654,15 +717,15 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             if generate:
                 gen_opts = args.get("generate_options") or {}
                 generated_pw = _generate_password(auth, gen_opts)
-                redactor.register_secret(generated_pw)
+                retain_runtime_secret(generated_pw)
                 pw_warning = None
 
             tracked = _collect_secret_strings(args)
             if not generate and resolved_password:
                 tracked.append(resolved_password)
-                redactor.register_secret(resolved_password)
+                retain_runtime_secret(resolved_password)
             for t in tracked:
-                redactor.register_secret(t)
+                retain_runtime_secret(t)
 
             try:
                 item = _build_item(args)
@@ -702,9 +765,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 return result
             finally:
                 for t in tracked:
-                    redactor.forget_secret(t)
+                    release_runtime_secret(t)
                 if generated_pw is not None:
-                    redactor.forget_secret(generated_pw)
+                    release_runtime_secret(generated_pw)
         return _guard(run)
 
     _tools.append((schemas.VAULTWARDEN_STORE, h_store))
@@ -717,7 +780,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             # password_env channel — fires in generate AND non-generate mode.
             _reject_removed_env_channel(args, "password_env", "password_file",
                                         "vaultwarden_update")
-            redactor = get_redacting_filter()
+            # AUD-02 (v0.6.5): runtime tool secrets now go through the
+            # scoped retain/release helpers below; the raw redactor handle
+            # is no longer needed in this handler.
 
             generated_pw = None
             generate = bool(args.get("generate", False))
@@ -742,15 +807,15 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             if generate:
                 gen_opts = args.get("generate_options") or {}
                 generated_pw = _generate_password(auth, gen_opts)
-                redactor.register_secret(generated_pw)
+                retain_runtime_secret(generated_pw)
                 pw_warning = None
 
             tracked = _collect_secret_strings(args)
             if not generate and resolved_password:
                 tracked.append(resolved_password)
-                redactor.register_secret(resolved_password)
+                retain_runtime_secret(resolved_password)
             for t in tracked:
-                redactor.register_secret(t)
+                retain_runtime_secret(t)
 
             try:
                 item_id = str(args["item_id"])
@@ -790,9 +855,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 return result
             finally:
                 for t in tracked:
-                    redactor.forget_secret(t)
+                    release_runtime_secret(t)
                 if generated_pw is not None:
-                    redactor.forget_secret(generated_pw)
+                    release_runtime_secret(generated_pw)
         return _guard(run)
 
     _tools.append((schemas.VAULTWARDEN_UPDATE, h_update))
@@ -972,7 +1037,9 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                                     "vaultwarden_store_ssh")
         name = str(args["name"])
         generate = bool(args.get("generate", False))
-        redactor = get_redacting_filter()
+        # AUD-02 (v0.6.5): runtime tool secrets now go through the
+        # scoped retain/release helpers below; the raw redactor handle
+        # is no longer needed in this handler.
 
         if generate:
             # Generate mode: the plugin supplies pass + file itself.
@@ -996,7 +1063,7 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
             # Single secret-generation path (decision 1): bw generate, NOT a
             # stdlib generator. Register immediately with the RedactingFilter.
             passphrase = _generate_password(auth, {"mode": "password", "length": 32})
-            redactor.register_secret(passphrase)
+            retain_runtime_secret(passphrase)
             tmpdir = None
             try:
                 tmpdir, key_path, public_key, fingerprint = \
@@ -1005,7 +1072,7 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 try:
                     with open(key_path, "r", encoding="utf-8",
                               errors="replace") as f:
-                        redactor.register_secret(f.read())
+                        retain_runtime_secret(f.read())
                 except OSError:
                     pass
                 result = auth.create_ssh_item(name, user, passphrase, key_path)
@@ -1025,7 +1092,7 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 # v0.5.8 cleanup observability: sanitized WARNING on failure.
                 if tmpdir is not None:
                     _rmtree_quietly(tmpdir)
-                redactor.forget_secret(passphrase)
+                release_runtime_secret(passphrase)
 
         # Upload mode: resolve the passphrase from exactly one channel.
         passphrase, pw_warning = _resolve_secret_input(
@@ -1055,10 +1122,10 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
 
         _validate_ssh_key_file(file_path)
 
-        redactor.register_secret(passphrase)
+        retain_runtime_secret(passphrase)
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                redactor.register_secret(f.read())
+                retain_runtime_secret(f.read())
         except OSError:
             pass
 
@@ -1103,7 +1170,9 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                                     "vaultwarden_update_ssh")
         name = str(args["name"])
         generate = bool(args.get("generate", False))
-        redactor = get_redacting_filter()
+        # AUD-02 (v0.6.5): runtime tool secrets now go through the
+        # scoped retain/release helpers below; the raw redactor handle
+        # is no longer needed in this handler.
 
         matches = auth.search_items(name)
         exact = [m for m in matches if m.get("name") == name]
@@ -1144,7 +1213,7 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
             rsa_bits = int(args.get("rsa_bits") or 4096)
 
             passphrase = _generate_password(auth, {"mode": "password", "length": 32})
-            redactor.register_secret(passphrase)
+            retain_runtime_secret(passphrase)
             tmpdir = None
             try:
                 tmpdir, key_path, public_key, fingerprint = \
@@ -1153,7 +1222,7 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 try:
                     with open(key_path, "r", encoding="utf-8",
                               errors="replace") as f:
-                        redactor.register_secret(f.read())
+                        retain_runtime_secret(f.read())
                 except OSError:
                     pass
 
@@ -1186,7 +1255,7 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 # v0.5.8 cleanup observability: sanitized WARNING on failure.
                 if tmpdir is not None:
                     _rmtree_quietly(tmpdir)
-                redactor.forget_secret(passphrase)
+                release_runtime_secret(passphrase)
 
         # Non-generate update path (upload semantics).
         resolved_pass, pw_warning = _resolve_secret_input(
@@ -1198,7 +1267,7 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
             updates["username"] = str(args["user"])
         if resolved_pass is not None:
             updates["password"] = resolved_pass
-            redactor.register_secret(resolved_pass)
+            retain_runtime_secret(resolved_pass)
         if args.get("notes") is not None:
             updates["notes"] = str(args["notes"])
 
@@ -1304,12 +1373,14 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
             key_path, passphrase = auth.get_ssh_key(item_id, key_path)
             os.chmod(key_path, 0o600)
 
-            redactor = get_redacting_filter()
-            redactor.register_secret(passphrase)
+            # AUD-02 (v0.6.5): runtime tool secrets now go through the
+            # scoped retain/release helpers below; the raw redactor handle
+            # is no longer needed in this handler.
+            retain_runtime_secret(passphrase)
             try:
                 with open(key_path, "r", encoding="utf-8",
                           errors="replace") as f:
-                    redactor.register_secret(f.read())
+                    retain_runtime_secret(f.read())
             except OSError:
                 pass
 

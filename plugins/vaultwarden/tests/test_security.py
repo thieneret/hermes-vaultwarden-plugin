@@ -360,11 +360,15 @@ def test_store_and_update_register_all_string_args(write_tools_by_name):
     for s in ("api-user-leakme", "pw-leakme", "note-secret-leakme"):
         assert s not in redactor._secrets
     # ...and DURING the operation they were registered (spy proves it):
+    # AUD-02 (v0.6.5): runtime tool secrets now flow through the scoped
+    # retain/release helpers, which delegate to RedactingFilter.retain_secret
+    # / release_secret (reference-counted) instead of unbounded global
+    # register_secret/forget_secret.
     registered: list[str] = []
-    orig_reg = redactor.register_secret
-    orig_forget = redactor.forget_secret
-    redactor.register_secret = lambda v: (registered.append(v), orig_reg(v))[1]
-    redactor.forget_secret = lambda v: (orig_forget(v),)[0]
+    orig_retain = redactor.retain_secret
+    orig_release = redactor.release_secret
+    redactor.retain_secret = lambda v: (registered.append(v), orig_retain(v))[1]
+    redactor.release_secret = lambda v: (orig_release(v),)[0]
     try:
         res2 = write_tools_by_name["vaultwarden_update"]({
             "item_id": res["id"],
@@ -373,8 +377,8 @@ def test_store_and_update_register_all_string_args(write_tools_by_name):
         assert "upd-user-leakme" in registered
         assert "https://upd-leakme.example" in registered
     finally:
-        redactor.register_secret = orig_reg
-        redactor.forget_secret = orig_forget
+        redactor.retain_secret = orig_retain
+        redactor.release_secret = orig_release
     for s in registered:
         assert s not in redactor._secrets
 

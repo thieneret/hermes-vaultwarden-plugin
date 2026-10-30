@@ -1085,6 +1085,10 @@ def make_session_end_hook(auth: AuthManager,
         # v0.2.2 (BUGFIX): drop any leftover task-scoped pending errors.
         with _PENDING_LOCK:
             _PENDING_ERRORS.clear()
+        # AUD-02 (v0.6.5): close EVERY still-open execution scope as the
+        # final fail-safe (e.g. executions whose post_tool_call observer
+        # never ran). Process-scoped secrets are untouched by this release.
+        clear_execution_scopes()
         auth.shutdown(keep_appdata=True)
 
     return vaultwarden_on_session_end
