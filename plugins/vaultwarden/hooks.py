@@ -81,6 +81,197 @@ from .tools import _field_value
 
 log = get_logger("hooks")
 
+# ---------------------------------------------------------------------------
+# AUD-02 (v0.6.5): execution-scoped secret retention.
+#
+# Runtime secrets injected during ONE tool execution used to be registered
+# with the global RedactingFilter and retained indefinitely (unbounded
+# memory growth of plaintext values). They are now retained only while the
+# execution scope may still need redaction and released afterwards through
+# the thread-safe reference-counted APIs on RedactingFilter:
+#
+#   - one ExecutionSecretScope per tool execution, carried via a
+#     ContextVar (`_execution_secret_scope`) so overlapping / concurrent
+#     executions each own their own scope;
+#   - the middleware retains every injected plaintext in the scope (each
+#     value at most once per scope) BEFORE running the tool;
+#   - release is DEFERRED to the latest safe lifecycle point — after the
+#     authoritative transform_tool_result pass and after the observer-side
+#     post_tool_call cleanup/metrics have run (Hermes dispatch order:
+#     middleware wraps next_call; transform runs on the returned result;
+#     post_tool_call observes last). post_tool_call closes the scope when
+#     it can attribute the call to it (task_id or an execution-id kwarg);
+#   - the middleware's finally block is the FAIL-SAFE cleanup path for
+#     exceptional cases where no later lifecycle point will run (next_call
+#     raised, host never dispatched the observer). close() is release-once:
+#     double-close is a silent no-op and secrets can never leak across
+#     turns nor grow globally.
+#   - process-scoped secrets (bootstrap client secret / master password,
+#     live session key, startup-injection secrets) are NOT part of any
+#     execution scope; releasing a scope only ever drops the scope's OWN
+#     execution reference, never the process baseline.
+#
+# NEVER log secret values anywhere in this machinery — sanitized
+# diagnostics carry lengths/counts only.
+# ---------------------------------------------------------------------------
+
+
+class ExecutionSecretScope:
+    """Reference-counted, release-once secret scope for ONE tool execution.
+
+    Every plaintext runtime secret retained through this scope increments
+    the shared RedactingFilter's execution refcount exactly once per scope
+    (a value referenced by several placeholders in one command keeps a
+    single reference). :meth:`close` releases precisely those references —
+    idempotently, so closing twice (post_tool_call + middleware fail-safe)
+    never double-decrements and never removes a value another active
+    execution still retains.
+    """
+
+    def __init__(self, redactor: Any) -> None:
+        self._redactor = redactor
+        self._values: set[str] = set()
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def retain(self, value: str) -> None:
+        """Retain *value* for this execution scope (once per distinct value).
+
+        No-op after close (sanitized warning only — never the value).
+        """
+        if not value:
+            return
+        with self._lock:
+            if self._closed:
+                # Sanitized misuse diagnostic: length only, NEVER the value.
+                log.warning(
+                    "AUD-02: attempted to retain a runtime secret (len=%d) "
+                    "in an already-closed execution scope; ignored.",
+                    len(value))
+                return
+            if value in self._values:
+                return  # same secret within one execution: ONE reference
+            self._values.add(value)
+        self._redactor.retain_secret(value)
+
+    def close(self) -> None:
+        """Release every execution-scoped reference held by this scope.
+
+        Release-once: subsequent calls are a no-op. Process-scoped
+        baselines are untouched — the redactor only drops THIS scope's
+        execution reference (a value stays redactable while any other
+        active execution or the process baseline still holds it).
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            values = list(self._values)
+            self._values.clear()
+        for v in values:
+            self._redactor.release_secret(v)
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def retained_count(self) -> int:
+        """Number of distinct values this scope currently retains.
+
+        Observability helper for tests / sanitized diagnostics: returns a
+        bare count, never exposes or logs any secret value.
+        """
+        with self._lock:
+            return len(self._values)
+
+
+#: Active execution scope per context (one tool execution == one scope).
+_execution_secret_scope: contextvars.ContextVar["ExecutionSecretScope | None"] \
+    = contextvars.ContextVar("vaultwarden_execution_secret_scope", default=None)
+
+#: Fallback registry keyed by execution/task id — covers hosts that
+#: dispatch post_tool_call on a different context than the middleware
+#: (same belt-and-braces pattern as the task-keyed injected-secret store).
+_EXEC_SCOPES_BY_ID: dict[str, "ExecutionSecretScope"] = {}
+_EXEC_SCOPES_LOCK = threading.Lock()
+
+
+def _exec_id_for(task_id: str, kwargs: dict | None = None) -> str:
+    """Canonical execution id: explicit task_id first, then Hermes kwargs."""
+    if task_id:
+        return task_id
+    kw = kwargs or {}
+    for key in ("execution_id", "tool_call_id", "call_id", "turn_id"):
+        val = kw.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return ""
+
+
+def open_execution_scope(exec_id: str = "") -> tuple["ExecutionSecretScope", Any]:
+    """Create the scope for one execution and publish it (middleware entry).
+
+    Returns ``(scope, token)``; the caller MUST eventually
+    :func:`close_execution_scope` (fail-safe in its finally block).
+    """
+    scope = ExecutionSecretScope(get_redacting_filter())
+    token = _execution_secret_scope.set(scope)
+    if exec_id:
+        with _EXEC_SCOPES_LOCK:
+            _EXEC_SCOPES_BY_ID[exec_id] = scope
+    return scope, token
+
+
+def current_execution_scope() -> "ExecutionSecretScope | None":
+    """The active execution scope in this context, if any."""
+    return _execution_secret_scope.get()
+
+
+def close_execution_scope(token: Any = None, exec_id: str = "",
+                          kwargs: dict | None = None) -> bool:
+    """Close the execution scope at the safe final lifecycle point.
+
+    Resolution order: the task-keyed fallback registry (when *exec_id* is
+    known), then the ContextVar scope (closing it clears its registry
+    entry too). Closing is release-once and idempotent; a call with no
+    discoverable scope is a harmless no-op returning False. Never logs
+    secret values.
+    """
+    found = False
+    scoped: "ExecutionSecretScope | None" = None
+    lookup_id = exec_id or _exec_id_for("", kwargs or {})
+    if lookup_id:
+        with _EXEC_SCOPES_LOCK:
+            scoped = _EXEC_SCOPES_BY_ID.pop(lookup_id, None)
+    if scoped is None:
+        scoped = _execution_secret_scope.get()
+        if scoped is not None and lookup_id:
+            with _EXEC_SCOPES_LOCK:
+                _EXEC_SCOPES_BY_ID.pop(lookup_id, None)
+    if scoped is not None:
+        scoped.close()
+        found = True
+    if token is not None:
+        try:
+            _execution_secret_scope.reset(token)
+        except ValueError:  # token from a different context (asyncio)
+            pass
+    return found
+
+
+def clear_execution_scopes() -> None:
+    """Close EVERY open execution scope (session-end fail-safe)."""
+    with _EXEC_SCOPES_LOCK:
+        scopes = list(_EXEC_SCOPES_BY_ID.values())
+        _EXEC_SCOPES_BY_ID.clear()
+    for scope in scopes:
+        scope.close()
+    cur = _execution_secret_scope.get()
+    if cur is not None:
+        cur.close()
+        _execution_secret_scope.set(None)
+
 #: Kept for backward-compat with tests/consumers that still import it.
 #: VWP-04 does not inject sentinels anymore â€” unresolved references stay
 #: verbatim and rely on the fail-safe `$` shell-variable semantics.
