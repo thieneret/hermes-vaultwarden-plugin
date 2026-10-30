@@ -845,3 +845,138 @@ class TestDeleteItemPermanentSyncRetry:
             cli.delete_item("sess", "abc123", permanent=True)
         cmds = [c[1:] for c in calls]
         assert ["sync"] not in cmds         # sync only on NotFoundError
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.6.4 HOTFIX REGRESSION (CHANGE 4): BW_SESSION injection into the isolated
+# subprocess environment. v0.6.3 dropped the session key for vault read/write
+# commands, so bw ran against a LOCKED vault: `list` returned empty and
+# `create item` failed with exit 1. These tests pin the restored behavior at
+# the single env choke point (BwCli._ensure_session_env) AND the fallback path
+# (in-memory AuthManager registry).
+# ─────────────────────────────────────────────────────────────────────────────
+class TestSessionKeyInjectionV064:
+
+    def test_list_items_injects_bw_session(self, fake_bw, appdata, monkeypatch):
+        """Explicit session key must reach subprocess.run env as BW_SESSION."""
+        import subprocess as sp
+
+        from vaultwarden.bw_cli import register_auth_manager
+        register_auth_manager(None)  # no fallback manager -> explicit only
+        import json
+        items = [{"id": "abc", "name": "GitHub"}]
+        fake_run, calls = _mk_run(cmd_results=[{"rc": 0,
+                                                "out": json.dumps(items),
+                                                "err": ""}])
+        # capture the env kwarg of every subprocess.run call
+        envs = []
+        def spy(cmd, *a, **k):
+            envs.append(dict(k.get("env") or {}))
+            return fake_run(cmd, *a, **k)
+        monkeypatch.setattr(sp, "run", spy)
+        cli = BwCli(fake_bw, appdata)
+        result = cli.list_items("SESSIONKEY-V064")
+        assert result == items
+        list_call = next(c for c in calls if c[1:2] == ["list"])
+        idx = calls.index(list_call)
+        assert envs[idx].get("BW_SESSION") == "SESSIONKEY-V064"
+
+    def test_ensure_session_env_falls_back_to_auth_manager(self, fake_bw,
+                                                           appdata,
+                                                           monkeypatch):
+        """Regression: when callers pass NO env, the in-memory AuthManager's
+        session key is injected at the choke point (v0.6.3 dropped it)."""
+        from vaultwarden import bw_cli as mod
+
+        class DummyAuth:
+            def get_session_key(self):
+                return "DUMMY-SESSION-KEY"
+
+        mod.register_auth_manager(DummyAuth())
+        try:
+            cli = BwCli(fake_bw, appdata)
+            env = cli._ensure_session_env(["list", "items", "--pretty"], None)
+            assert env["BW_SESSION"] == "DUMMY-SESSION-KEY"
+            env2 = cli._ensure_session_env(["create", "item"], {})
+            assert env2["BW_SESSION"] == "DUMMY-SESSION-KEY"
+            # explicit env always wins over the fallback
+            env3 = cli._ensure_session_env(["get", "item", "x"],
+                                           {"BW_SESSION": "EXPLICIT"})
+            assert env3["BW_SESSION"] == "EXPLICIT"
+            # non-session commands are left alone
+            env4 = cli._ensure_session_env(["status"], None)
+            assert "BW_SESSION" not in env4
+        finally:
+            mod.register_auth_manager(None)
+
+    def test_parent_environment_not_inherited(self, fake_bw, appdata,
+                                              monkeypatch):
+        """Hard constraint: isolation must NOT be weakened by the hotfix —
+        the env is rebuilt from scratch (PATH/HOME/LC_ALL/APPDATA/BW_SESSION
+        only), even with junk in os.environ."""
+        import subprocess as sp
+
+        from vaultwarden import bw_cli as mod
+
+        class DummyAuth:
+            def get_session_key(self):
+                return "DUMMY-SESSION-KEY"
+
+        mod.register_auth_manager(DummyAuth())
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "leaked-parent-secret")
+        captured = []
+        def spy(cmd, *a, **k):
+            captured.append(dict(k.get("env") or {}))
+            m = _mk_run()
+            run, _calls = m
+            return run(cmd, *a, **k)
+        monkeypatch.setattr(sp, "run", spy)
+        try:
+            cli = BwCli(fake_bw, appdata)
+            cli.run(["list", "items"])   # NO explicit env -> fallback injects
+            assert captured, "subprocess.run was never called"
+            env = captured[-1]
+            assert env["BW_SESSION"] == "DUMMY-SESSION-KEY"
+            assert "AWS_SECRET_ACCESS_KEY" not in env
+            assert set(env) <= {"PATH", "HOME", "LC_ALL",
+                                "BITWARDENCLI_APPDATA_DIR", "BW_SESSION"}
+        finally:
+            mod.register_auth_manager(None)
+
+    def test_locked_stderr_surfaces_session_suggestion(self, fake_bw, appdata,
+                                                       monkeypatch):
+        """CHANGE 3: 'locked' stderr => SESSION_ERROR code + actionable
+        suggestion; the raw session key must never appear in the message."""
+        import subprocess as sp
+
+        from vaultwarden import bw_cli as mod
+        mod.register_auth_manager(None)
+        fake_run, _calls = _mk_run(cmd_results=[
+            {"rc": 1, "out": "", "err": "Vault is locked."}])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+        with pytest.raises(errors.SessionError) as exc_info:
+            cli.run(["list", "items"], env={"BW_SESSION": "SUPERSECRETKEY"})
+        err = exc_info.value
+        resp = err.to_dict()
+        assert resp["error_code"] == "SESSION_ERROR"
+        assert "Unlock" in resp.get("suggestion", "") or "unlock" in resp.get("suggestion", "")
+        assert "SUPERSECRETKEY" not in str(resp)
+
+    def test_expired_stderr_yields_session_expired_code(self, fake_bw, appdata,
+                                                        monkeypatch):
+        """CHANGE 3: expired/not-logged-in markers => SESSION_EXPIRED code."""
+        import subprocess as sp
+
+        from vaultwarden import bw_cli as mod
+        mod.register_auth_manager(None)
+        fake_run, _calls = _mk_run(cmd_results=[
+            {"rc": 1, "out": "", "err": "You are not logged in."}])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+        with pytest.raises(errors.SessionError) as exc_info:
+            cli.run(["create", "item"], env={"BW_SESSION": "K9"})
+        resp = exc_info.value.to_dict()
+        assert resp["error_code"] == "SESSION_EXPIRED"
+        assert "Try unlocking" in resp.get("suggestion", "")
+        assert "K9" not in resp.get("suggestion", "")

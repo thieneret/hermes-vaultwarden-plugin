@@ -5,6 +5,14 @@ Author: **thieneret**
 
 ---
 
+## v0.6.4
+
+- fix(bw-cli): restore `BW_SESSION` environment variable injection for vault read/write operations
+- fixes regression where `vaultwarden_list` returned empty and `vaultwarden_store` failed with exit 1 due to missing session key in subprocess environment
+- improve `bw` subprocess error reporting for locked/expired session states
+- add regression tests pinning: `BW_SESSION` injection (explicit + AuthManager fallback at the `_ensure_session_env()` choke point), non-inheritance of the parent environment, and absence of the session key from errors/logs (`SESSION_EXPIRED` / `SESSION_ERROR` classification)
+- security properties unchanged: session key remains memory-only (never on disk, never in argv/logs), subprocess env isolation preserved; documented in SECURITY.md ("Session key in memory only", Error Classification VWP-09, Audit Status HOTFIX-01)
+
 ## v0.6.3
 
 - feat(security): fail-closed lifecycle hook registration for critical lifecycle hooks (AUD-06)

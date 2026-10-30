@@ -27,6 +27,46 @@ from .security import audit_subprocess_env, get_logger
 
 log = get_logger("bw_cli")
 
+# v0.6.4 (HOTFIX): in-memory AuthManager registry used as a DEFENSE-IN-DEPTH
+# fallback for BW_SESSION injection at the subprocess-env choke point
+# (BwCli._ensure_session_env). The session key lives in plugin memory only —
+# it is never written to disk and never logged. auth.AuthManager registers
+# itself here on construction; no strong reference cycle is created (the
+# manager holds the BwCli, the registry holds the manager weakly).
+import weakref  # noqa: E402
+
+_AUTH_MANAGER_HOLDER: list = []  # single-slot holder: [weakref.ref(AuthManager)]
+# v0.6.4: keep a strong ref to the *dummy* objects registered by tests only.
+# Production AuthManagers are held weakly (no reference cycle); CPython can
+# garbage-collect an inline-constructed test double between the registration
+# call and its use, so non-AuthManager registrations are pinned strongly.
+_AUTH_MANAGER_STRONG_HOLDER: list = []
+
+
+def register_auth_manager(auth) -> None:
+    """Register the live AuthManager (weakly) for session-key fallback.
+
+    Called from ``AuthManager.__init__``. Safe to call more than once: the
+    most recently constructed manager wins (tests construct throwaway
+    managers frequently).
+    """
+    _AUTH_MANAGER_HOLDER.clear()
+    _AUTH_MANAGER_STRONG_HOLDER.clear()
+    if auth is None:
+        return
+    _AUTH_MANAGER_HOLDER.append(weakref.ref(auth))
+    if type(auth).__name__ != "AuthManager":
+        # test double (duck-typed stub): pin it so GC cannot collect it
+        # before the assertion that exercises the fallback path.
+        _AUTH_MANAGER_STRONG_HOLDER.append(auth)
+
+
+def get_auth_manager():
+    """Return the registered AuthManager, or None if absent/garbage-collected."""
+    if not _AUTH_MANAGER_HOLDER:
+        return None
+    return _AUTH_MANAGER_HOLDER[0]()
+
 # VWP-11: minimum supported bw CLI version (hardcoded — NOT configurable).
 # The plugin was developed and tested against bw 2026.9.1. Versions below
 # this are unsupported: the marker-based error classification cannot be
@@ -156,6 +196,32 @@ def find_bw_binary(explicit: str = "") -> str | None:
     except errors.VaultwardenError as exc:
         log.warning("bw_cli_path validation failed (%s): %s", exc.code, exc.message)
         return None
+
+
+_SESSION_LOCKED_MARKERS = ("vault is locked", "locked")
+
+# v0.6.4 (CHANGE 3): markers that specifically indicate the session key is
+# no longer usable (expired / timed out / absent) rather than merely locked.
+_SESSION_EXPIRED_MARKERS = (
+    "session has timed out", "session timed out", "session expired",
+    "not logged in", "you are not currently logged in", "you must log in",
+    "please log in first",
+)
+
+
+def _sanitize_bw_stderr(err: str, *secret_values: str | None) -> str:
+    """Redact secrets and truncate bw stderr for safe logging/diagnostics.
+
+    v0.6.4 (CHANGE 3): stderr fragments may contain payload material or even
+    the session key itself — every known secret value is replaced with a
+    ``[REDACTED]`` marker before the (short) excerpt is ever surfaced in a
+    log line or an error response.
+    """
+    text = " ".join((err or "").split())
+    for secret in secret_values:
+        if secret:
+            text = text.replace(str(secret), "[REDACTED]")
+    return text[:200]
 
 
 class BwCli:
@@ -323,6 +389,72 @@ class BwCli:
         delay = self._backoff_base * (2 ** attempt) + random.uniform(0, 1)
         return min(delay, self._max_delay)
 
+    # ------------------------------------------- session injection (v0.6.4)
+    #: bw commands that operate on vault data and therefore REQUIRE a live
+    #: session key (BW_SESSION) in the subprocess environment.
+    _SESSION_REQUIRED_COMMANDS = frozenset({
+        "list", "get", "create", "edit", "delete", "sync", "generate",
+        "encode", "lock",
+    })
+
+    def _ensure_session_env(self, args: list[str],
+                            env: Mapping[str, str] | None) -> dict:
+        """Build the isolated subprocess env, guaranteeing BW_SESSION (v0.6.4).
+
+        HOTFIX (v0.6.4): vault read/write operations (``list``, ``get``,
+        ``create``, ``edit``, ``delete``, ...) require the session key in the
+        ``bw`` subprocess environment. A missing ``BW_SESSION`` makes ``bw``
+        run against a LOCKED vault — empty lists from ``list`` and exit-1
+        failures from ``create`` — exactly the v0.6.3 regression this restores.
+
+        Injection is defense-in-depth at the single env choke point:
+          * explicit callers (the AuthManager-wrapped command methods below)
+            already pass ``env={"BW_SESSION": session_key}`` — preserved;
+          * if no session is supplied for a session-requiring command, the
+            current in-memory session key is injected here so the isolation
+            choke point can never silently drop it.
+
+        The session key lives in plugin memory ONLY: it is never written to
+        disk and never logged (base_env() still builds the env from scratch —
+        the parent environment is NOT inherited).
+        """
+        merged: dict[str, str] = dict(env or {})
+        verb = args[0] if args else ""
+        if verb in self._SESSION_REQUIRED_COMMANDS:
+            if not merged.get("BW_SESSION"):
+                auth = get_auth_manager()
+                key = auth.get_session_key() if auth is not None else None
+                if key:
+                    merged["BW_SESSION"] = key
+        return self.base_env(merged)
+
+    def _session_error(self, verb: str, err: str,
+                       session_key: str | None = None) -> errors.VaultwardenError:
+        """Build a precise error for locked/expired bw sessions (v0.6.4).
+
+        CHANGE 3: ``SESSION_EXPIRED`` when stderr carries an explicit
+        expired/timed-out/not-logged-in marker; otherwise the classic
+        ``SESSION_ERROR`` (the plugin's run_with_recovery auto re-unlock path
+        keys off SESSION_ERROR and must keep working). The sanitized stderr
+        excerpt is logged at debug level — never the raw session key or any
+        vault payload.
+        """
+        err_lower = (err or "").lower()
+        safe_err = _sanitize_bw_stderr(err, session_key)
+        log.debug("bw %s session failure rc context: stderr=%.200s",
+                  verb, safe_err)
+        if any(m in err_lower for m in _SESSION_EXPIRED_MARKERS):
+            return errors.SessionError(
+                f"bw session expired or invalid ({verb}).",
+                code="SESSION_EXPIRED",
+                suggestion="Vault session may have expired. Try unlocking "
+                           "again (vaultwarden_status / re-auth). "
+                           f"bw stderr: {safe_err}")
+        return errors.SessionError(
+            f"bw session invalid or vault locked ({verb}).",
+            suggestion=f"Vault appears locked for '{verb}'. Unlock the vault "
+                       f"and retry. bw stderr: {safe_err}")
+
     # ------------------------------------------------------------- run core
     def run(self, args: list[str], *, env: Mapping[str, str] | None = None,
             raw: bool = False, timeout: int | None = None,
@@ -333,8 +465,11 @@ class BwCli:
         VWP-10: network errors on idempotent ops retried with bounded
         exponential backoff + jitter. Non-idempotent callers pass
         retryable=False. Never includes argv/env contents in raised messages.
+
+        v0.6.4: BW_SESSION is guaranteed for session-requiring commands via
+        :meth:`_ensure_session_env` (see the hotfix docstring there).
         """
-        full_env = self.base_env(env)
+        full_env = self._ensure_session_env(args, env)
         cmd = [self.bw_path, *args]
         try:
             # v0.1.4 (FAIL-5): look up subprocess.run via the module attribute so
@@ -395,19 +530,26 @@ class BwCli:
                 raise errors.NetworkError(
                     "Vaultwarden server appears unreachable.")
             if category == "session":
-                raise errors.SessionError(
-                    f"bw session invalid or vault locked ({args[0]}).")
+                # v0.6.4 (CHANGE 3): precise SESSION_EXPIRED vs SESSION_ERROR
+                # classification + sanitized stderr excerpt in the suggestion.
+                raise self._session_error(args[0], err,
+                                          (env or {}).get("BW_SESSION"))
             if category == "not_found":
                 raise errors.NotFoundError(
                     f"No matching item for query '{args[-1]}'.")
 
-            log.debug(
-                "bw %s failed rc=%d category=unknown stderr(redacted)=%.200s",
-                args[0], proc.returncode, err,
+            safe_err = _sanitize_bw_stderr(
+                err, (env or {}).get("BW_SESSION"), out)
+            log.error(
+                "bw %s failed rc=%d category=unknown; sanitized stderr: %s",
+                args[0], proc.returncode, safe_err or "<empty>",
             )
+            suggestion = "Run 'vaultwarden_status' for details."
+            if safe_err:
+                suggestion += f" bw stderr: {safe_err}"
             raise errors.VaultwardenError(
                 f"bw {args[0]} failed (exit {proc.returncode}).",
-                suggestion="Run 'vaultwarden_status' for details.")
+                suggestion=suggestion)
 
         if raw:
             return out
