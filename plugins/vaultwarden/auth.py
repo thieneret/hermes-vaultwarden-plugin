@@ -84,6 +84,10 @@ class AuthManager:
         self._client_secret = client_secret
         self._master_password = master_password
         self._session_key: str | None = None
+        # v0.6.4 (HOTFIX): register with bw_cli's weak in-memory registry so
+        # the subprocess-env choke point can always re-inject BW_SESSION for
+        # session-requiring commands (defense-in-depth against a dropped key).
+        bw.register_auth_manager(self)
         # Plan §5 state machine: the manager starts UNINITIALIZED and only
         # becomes CONFIGURED once configure_server_if_needed() has run (the
         # register(ctx) bootstrap flow). is_available()/check_fn therefore
@@ -104,6 +108,19 @@ class AuthManager:
     def session_key(self) -> str | None:
         with self._lock:
             return self._session_key
+
+    def get_session_key(self) -> str | None:
+        """Return the current in-memory session key, or None when locked.
+
+        v0.6.4 (HOTFIX): used by ``bw_cli.BwCli._ensure_session_env`` as a
+        defense-in-depth fallback so BW_SESSION can never be silently dropped
+        from a session-requiring subprocess environment. NEVER logs the value
+        and NEVER writes it to disk — memory-only handoff to the child env.
+        """
+        with self._lock:
+            if self._state is AuthState.UNLOCKED and self._session_key:
+                return self._session_key
+            return None
 
     @property
     def last_sync(self) -> float:
