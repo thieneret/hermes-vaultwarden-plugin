@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,9 +42,18 @@ def _current_execution_scope():
     ``from .hooks import ...`` here would be a circular import. The scope
     lookup is only needed while handlers run, i.e. after both modules are
     fully initialized. Returns None when no scope is active.
+
+    Robustness: an already-CLOSED scope must never capture new secrets --
+    a stale ContextVar reference (e.g. a handler invoked later on the same
+    thread) would otherwise hand values to a scope whose release already
+    ran, leaking them in the redactor forever. Treat closed scopes as
+    "no scope" so the fallback retain/release pairing owns the value.
     """
     from .hooks import current_execution_scope
-    return current_execution_scope()
+    scope = current_execution_scope()
+    if scope is not None and getattr(scope, "closed", False):
+        return None
+    return scope
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +78,25 @@ def _current_execution_scope():
 #   this handler runs inside one (closing the scope releases it later --
 #   double release is impossible because close() is release-once), else the
 #   handler's own finally performs the decrement.
+#: AUD-02 (v0.6.5): per-handler bookkeeping of values that were retained in
+#: FALLBACK mode (no active execution scope -- legacy/direct-call paths and
+#: tests invoking handlers without the middleware). The handler's finally
+#: block releases exactly these references, so nothing accumulates globally.
+#: Keyed by execution id (ContextVar task identity); thread-safe.
+_FALLBACK_RETAINED: dict[str, list[str]] = {}
+_FALLBACK_LOCK = threading.Lock()
+
+
+def _fallback_key() -> str:
+    """Stable per-execution key for fallback retention bookkeeping.
+
+    Handlers run synchronously on one thread from retain to the paired
+    release / _guard finally, so the worker-thread identity is a safe
+    per-execution bucket; concurrent executions live on different threads.
+    """
+    return f"t{threading.get_ident()}"
+
+
 def retain_runtime_secret(value: str) -> None:
     """Retain a runtime tool-secret for redaction (scoped, ref-counted)."""
     if not value:
@@ -76,7 +105,12 @@ def retain_runtime_secret(value: str) -> None:
     if scope is not None:
         scope.retain(value)
     else:
-        get_redacting_filter().retain_secret(value)
+        redactor = get_redacting_filter()
+        redactor.retain_secret(value)
+        # Fallback path: remember it so THIS handler's finally releases the
+        # reference even when no execution scope owns the lifecycle.
+        with _FALLBACK_LOCK:
+            _FALLBACK_RETAINED.setdefault(_fallback_key(), []).append(value)
 
 
 def release_runtime_secret(value: str) -> None:
@@ -85,14 +119,38 @@ def release_runtime_secret(value: str) -> None:
     When the handler ran inside an execution scope, releasing is left to the
     scope's single, release-once ``close()`` -- releasing here too would
     double-decrement the shared refcount. Otherwise this is the handler's
-    own finally-block decrement. Never logs the value.
+    own finally-block decrement of a FALLBACK retention recorded at retain
+    time (unknown values are ignored by the redactor with a sanitized
+    warning, so a mismatched release can never corrupt another owner's
+    count or go negative). Never logs the value.
     """
     if not value:
         return
     scope = _current_execution_scope()
     if scope is not None:
         return  # the scope owns the release; close() is release-once
+    with _FALLBACK_LOCK:
+        pending = _FALLBACK_RETAINED.get(_fallback_key()) or []
+        if value in pending:
+            pending.remove(value)
     get_redacting_filter().release_secret(value)
+
+
+def release_all_fallback_retained() -> None:
+    """Fail-safe sweep: release every fallback retention for this execution.
+
+    Handlers call this in their outermost finally so secrets retained on
+    early-exit paths (validation errors raised BEFORE an inner try/finally
+    was established) are still released. Values retained through an active
+    execution scope are NOT touched here -- the scope's release-once
+    ``close()`` owns those references.
+    """
+    key = _fallback_key()
+    with _FALLBACK_LOCK:
+        pending = _FALLBACK_RETAINED.pop(key, [])
+    redactor = get_redacting_filter()
+    for v in pending:
+        redactor.release_secret(v)
 
 
 # --------------------------------------------------------------- helpers
@@ -542,6 +600,12 @@ def _guard(fn: Callable[[], dict]) -> str:
     except Exception as exc:  # pragma: no cover - defensive
         log.exception("unexpected tool failure")
         return json.dumps(errors.error_response(exc), ensure_ascii=False, default=str)
+    finally:
+        # AUD-02 (v0.6.5) fail-safe: release every FALLBACK retention this
+        # handler recorded (no active execution scope). Covers early-exit
+        # paths where an inner finally never got established. Scope-owned
+        # references are untouched -- their release-once close() owns them.
+        release_all_fallback_retained()
 
 
 def _vault_error(message: str, *, code: str,
