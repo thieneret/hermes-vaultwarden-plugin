@@ -136,6 +136,13 @@ class ExecutionSecretScope:
         # yet returned via release_value/close). Normally 0/1 per value;
         # counted so a double bookkeeping call can never double-decrement.
         self._outstanding: dict[str, int] = {}
+        #: AUD-02: per-value count of temp-file ("path-ref") references this
+        #: scope took IN ADDITION to its deduplicated primary reference.
+        #: ``release_value`` floors at this count: the entries themselves
+        #: own those references and hand them back via
+        #: :func:`_release_path_retention`, so neither an early per-path
+        #: release nor close() can ever double-decrement or strand one.
+        self._path_owned: dict[str, int] = {}
         self._closed = False
         self._lock = threading.Lock()
 
@@ -160,6 +167,24 @@ class ExecutionSecretScope:
             self._outstanding[value] = self._outstanding.get(value, 0) + 1
         self._redactor.retain_secret(value)
 
+    def retain_path_reference(self, value: str) -> None:
+        """Bookkeeping-only registration of one temp-file ("path-ref") reference.
+
+        AUD-02: called by :func:`_resolve_placeholder_token` AFTER it took an
+        EXTRA shared-refcount reference for the resolved temp file. The
+        reference itself is OWNED BY THE ENTRY — releasing it goes through
+        :func:`_release_path_retention`, never through this scope. The scope
+        only records the count so its fail-safe release paths (``release_value``
+        / ``close``) know how many references must survive them and can never
+        double-decrement or strand one. Never logs the value.
+        """
+        if not value:
+            return
+        with self._lock:
+            if self._closed:
+                return  # stale handle after close: entry release still owns it
+            self._path_owned[value] = self._path_owned.get(value, 0) + 1
+
     def has_value(self, value: str) -> bool:
         """Whether this OPEN scope already retains *value*.
 
@@ -170,18 +195,23 @@ class ExecutionSecretScope:
             return (not self._closed) and value in self._values
 
     def release_value(self, value: str) -> None:
-        """Release THIS scope's execution reference for *value* exactly once.
+        """Release THIS scope's PRIMARY execution reference for *value*.
 
-        AUD-02 per-placeholder release: called when the temp file carrying
-        the plaintext is removed during middleware cleanup. The scope drops
-        its ownership of the value and performs precisely ONE shared
-        refcount decrement; a second call for the same value is a silent
-        no-op (release-once per value), so close() can never double-release
-        it and an early release can never strip redaction coverage from a
-        value another active execution (or the process baseline) still
-        retains. Process-scoped baselines are untouched — the redactor only
-        removes the value from its state when BOTH the execution refcount
-        and the process baseline reach zero. Never logs the value.
+        AUD-02 fail-safe release: called by the middleware when the
+        execution cannot be attributed to a lifecycle id, or when the
+        middleware frame unwinds via an exception before any later hook can
+        run. The scope drops its outstanding primary references for the
+        value (normally one — ``retain`` dedupes identical values inside a
+        single execution) but FLOORS at the number of temp-file ("path-ref")
+        references still owned by their entries: those are handed back only
+        by :func:`_release_path_retention`, so this call can never double-
+        decrement them and a second call is a silent no-op (release-once per
+        value). An early release can therefore never strip redaction
+        coverage from a value another active execution (or the process
+        baseline) still retains. Process-scoped baselines are untouched —
+        the redactor only removes the value from its state when BOTH the
+        execution refcount and the process baseline reach zero. Never logs
+        the value.
         """
         if not value:
             return
@@ -189,8 +219,9 @@ class ExecutionSecretScope:
             if self._closed or value not in self._values:
                 return  # already released / never retained here: no-op
             self._values.discard(value)
-            self._outstanding.pop(value, None)
-        self._redactor.release_secret(value)
+            n = self._outstanding.pop(value, 0)
+        for _ in range(n):
+            self._redactor.release_secret(value)
 
     def close(self) -> None:
         """Release every execution-scoped reference held by this scope.
@@ -210,6 +241,7 @@ class ExecutionSecretScope:
             outstanding = list(self._outstanding.items())
             self._values.clear()
             self._outstanding.clear()
+            self._path_owned.clear()
         for v, n in outstanding:
             for _ in range(n):
                 self._redactor.release_secret(v)
@@ -707,39 +739,42 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
     scope = current_execution_scope()
     redactor = get_redacting_filter()
     if scope is not None:
-        # Execution-scoped retention, ONE reference per (scope, value):
-        # the scope's retain() dedupes identical values inside a single
-        # execution, and the symmetric close()-time release drops exactly
-        # that one reference when the execution reaches its safe final
-        # lifecycle point (post_tool_call -- AFTER transform_tool_result
-        # authoritative redaction and observer cleanup consumed the
-        # plaintexts). Temp-file cleanup must NOT release this reference:
-        # the middleware finally block runs BEFORE transform_tool_result,
-        # and releasing there would strip the redaction state while the
-        # result is still being scrubbed (AUD-02 release-timing rule).
+        # Execution-scoped retention, ONE deduplicated PRIMARY reference
+        # per (scope, value): the scope's retain() collapses identical
+        # values inside one execution, and the symmetric close()-time
+        # release drops exactly that one primary reference when the
+        # execution reaches its safe final lifecycle point
+        # (post_tool_call -- AFTER transform_tool_result authoritative
+        # redaction and observer cleanup consumed the plaintexts).
         # Overlapping executions sharing this secret each hold their own
         # reference in the shared refcount, so no owner's close can remove
         # the value while another active execution still needs it.
         scope.retain(value)
+        # AUD-02 (v0.6.5): take ONE EXTRA execution reference PER RESOLVED
+        # TEMP FILE, owned by the _PENDING_PATH_RETENTIONS entry itself --
+        # released symmetrically by _release_path_retention once the file
+        # carrying the plaintext is removed. This guarantees coverage for
+        # every later consumer even on hosts where the middleware finally
+        # block unwinds BEFORE transform_tool_result runs (the deferred
+        # post_tool_call close may then never find an open scope): the
+        # value leaves the redaction state only when the LAST holder --
+        # primary reference, path reference, overlapping execution or
+        # process baseline -- releases. The scope records the count via
+        # retain_path_reference() so its fail-safe release paths can never
+        # double-decrement an entry-owned reference. NOTE: the plaintext is
+        # deliberately NOT mirrored into the task-keyed injected store --
+        # the middleware finally block consumes that store before
+        # transform_tool_result runs on async hosts; the transformer reads
+        # the still-open scope directly instead (see make_result_redactor).
+        redactor.retain_secret(value)
+        scope.retain_path_reference(value)
+        with _PATH_RETENTION_LOCK:
+            _PENDING_PATH_RETENTIONS[path] = ("path-ref", value, exec_id)
         # AUD-02 (v0.6.5): report the scoped retention back to the calling
         # middleware execution so its fail-safe closure can release exactly
-        # this reference if no later lifecycle point runs. NOTE: no
-        # _PENDING_PATH_RETENTIONS entry for scoped retains -- the owning
-        # scope releases exactly this reference at close(), which is
-        # dispatched to the safe final lifecycle point (post_tool_call),
-        # AFTER transform_tool_result authoritative redaction has run.
+        # this reference if no later lifecycle point runs.
         if scoped_retained_out is not None:
             scoped_retained_out.append(value)
-        # AUD-02 belt-and-braces: mirror the plaintext into the task-keyed
-        # injected-secret store when a task id attributes this execution.
-        # The store is dropped by take_task_secrets() in the middleware
-        # finally block, so this never grows unboundedly; it keeps the
-        # authoritative transform_tool_result exact-value scrubbing working
-        # even when the host dispatches hooks on a different context than
-        # the middleware (ContextVar blind spot). Never logged.
-        if task_id:
-            with _INJECTED_LOCK:
-                _INJECTED_SECRETS.setdefault(task_id, []).append(value)
     else:
         # No active execution scope (legacy/direct callers): fall back to
         # PROCESS-scoped retention so the value stays redactable; the
@@ -1256,6 +1291,18 @@ def make_result_redactor(auth: AuthManager,
         #    block owns forgetting the values.
         cv_values = _CURRENT_INJECTED_SECRETS.get()
         values = list(cv_values) if cv_values else peek_task_secrets(exec_id)
+        # AUD-02 (v0.6.5): belt-and-braces — when both handoff stores are
+        # blind for this dispatch (cross-context/thread host), the still-
+        # OPEN execution scope itself knows exactly which plaintexts it
+        # retains. A closed scope contributes nothing, so this can never
+        # re-introduce stale values after release.
+        if not values:
+            scoped = _execution_secret_scope.get()
+            if scoped is None and exec_id:
+                with _EXEC_SCOPES_LOCK:
+                    scoped = _EXEC_SCOPES_BY_ID.get(exec_id)
+            if scoped is not None:
+                values = scoped.retained_values()
         # 2) exact plaintext replacement of every injected value with the
         #    literal [REDACTED] (shared building block; in-place for
         #    containers / writable .output objects, returned copy for plain
