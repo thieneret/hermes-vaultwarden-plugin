@@ -65,6 +65,7 @@ import contextvars
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -937,14 +938,24 @@ def make_placeholder_resolver(auth: AuthManager,
             _clear_execution_scope_slot()
         elif scoped_retained:
             # Attributable id but the middleware frame is unwinding via an
-            # exception: no later lifecycle hook may run for this call, so
-            # the scope's own references must not strand. Releasing them
-            # here keeps the refcount exact; the scope object itself stays
-            # registered under its id so a post_tool_call that DOES arrive
-            # still closes it as a harmless no-op (release-once).
+            # exception (or a sync host that shares one context across the
+            # whole call stack, where the ContextVar token cannot be reset):
+            # no later lifecycle hook may reliably run for this call, so the
+            # scope's own references must not strand. Release precisely this
+            # execution's outstanding references through the id-keyed registry
+            # entry -- close() is release-once and decrements EXACTLY the
+            # references this scope retained, so overlapping executions
+            # sharing the same secret keep their own coverage and a late
+            # post_tool_call close for the same id is a harmless no-op.
+            # On the NORMAL path this branch never runs: the scope stays open
+            # for the deferred release at post_tool_call (after
+            # transform_tool_result consumed the plaintexts). Never logs
+            # secret values.
             if sys.exc_info()[0] is not None:
-                for _value in scoped_retained:
-                    scope.release_value(_value)
+                closed = close_execution_scope(None, exec_id)
+                if not closed:  # pragma: no cover - defensive fallback
+                    for _value in scoped_retained:
+                        scope.release_value(_value)
 
     return vaultwarden_inject_secrets
 
