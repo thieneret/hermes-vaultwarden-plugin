@@ -38,6 +38,12 @@ SECRET_ENV_NAMES = ("VW_CLIENT_SECRET", "VW_MASTER_PASSWORD")
 
 _TOKEN_RE = re.compile(r"__VW_SECRET_([0-9a-f]{12})__")
 
+#: Logger for redactor-internal diagnostics (AUD-02). Deliberately a plain
+#: logging.Logger WITHOUT the RedactingFilter attached: the filter must never
+#: recurse into its own logging, and every message emitted through it is
+#: sanitized by construction (counts / lengths only, never secret values).
+_module_logger = logging.getLogger(__name__)
+
 
 def is_placeholder(text: str) -> bool:
     return isinstance(text, str) and "__VW_SECRET_" in text
@@ -100,22 +106,181 @@ class RedactingFilter(logging.Filter):
 
     Session keys are rendered as [SESSION:****]; master password / client
     secret / resolved credentials are replaced entirely with [REDACTED].
+
+    AUD-02 (phase 1): execution-scoped secrets are retained with reference
+    counts (:meth:`retain_secret` / :meth:`release_secret`) so a value still
+    in use by another active execution is never dropped, while values whose
+    last holder released them leave the redaction state instead of lingering
+    for the process lifetime. Long-lived bootstrap material is marked
+    permanent (:meth:`register_process_scoped_secret`) and can never be
+    removed by an execution-scoped release. ``register_secret`` /
+    ``forget_secret`` keep working unchanged: they map onto retain/release
+    semantics (a plain register on an already-permanent secret does not
+    change its permanence).
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._lock = threading.Lock()
+        # RLock: re-entrant, so public entry points may compose the private
+        # _*_locked helpers without risking deadlock or lock-ordering bugs.
+        self._lock = threading.RLock()
         self._secrets: set[str] = set()
+        self._secret_refcounts: dict[str, int] = {}
+        self._permanent_secrets: set[str] = set()
 
-    def register_secret(self, value: str) -> None:
-        """Register a runtime secret value to scrub from every log record."""
-        if value and len(value) >= 4:
-            with self._lock:
+    # ---------------------------------------------------- internal (locked)
+    def _retain_locked(self, value: str) -> None:
+        """Increment the refcount for *value* (caller must hold ``_lock``)."""
+        self._secret_refcounts[value] = self._secret_refcounts.get(value, 0) + 1
+        self._secrets.add(value)
+
+    def _release_locked(self, value: str) -> bool:
+        """Decrement the refcount for *value*; drop it when it hits zero.
+
+        Permanent secrets are NEVER removed from the redaction state — their
+        refcount is clamped at 1 instead. Returns True when *value* had a
+        live registration before this call (False => unknown release).
+        Caller must hold ``_lock``.
+        """
+        count = self._secret_refcounts.get(value)
+        if count is None:
+            return False
+        if value in self._permanent_secrets:
+            # Never below one: execution-scoped releases must not remove a
+            # process-scoped secret.
+            self._secret_refcounts[value] = max(count - 1, 1)
+            return True
+        if count <= 1:
+            del self._secret_refcounts[value]
+            self._secrets.discard(value)
+        else:
+            self._secret_refcounts[value] = count - 1
+        return True
+
+    def _migrate_legacy_state_locked(self) -> None:
+        """AUD-02 phase 1 migration shim (one-time, lazy).
+
+        The pre-refcount codebase kept a single global ``_secrets`` set and
+        relied on SET semantics: repeated ``register_secret`` calls were
+        idempotent and ``forget_secret`` removed a value outright. Test
+        fixtures that build several AuthManagers against the shared filter
+        therefore leave bootstrap values registered once, with no matching
+        release. When reference counting was introduced those entries would
+        otherwise accumulate phantom refcounts (every new manager registers
+        "cs-secret" again -> forget removes nothing), silently changing the
+        behaviour legacy call sites depend on.
+
+        To keep Phase 1 strictly redactor-side we migrate every entry that
+        exists in ``_secrets`` but has NO refcount bookkeeping yet into the
+        permanent (process-scoped) class with refcount 1: exactly the old
+        "registered until explicitly forgotten" retention model, now visible
+        through the new state. Freshly retained values always get a refcount
+        inside the lock, so an entry without one can only pre-date the
+        migration. This runs once per filter instance, under ``_lock``.
+        """
+        for value in self._secrets:
+            if value not in self._secret_refcounts:
+                self._permanent_secrets.add(value)
+                self._secret_refcounts[value] = 1
+
+    # ------------------------------------------------------------ lifecycle
+    def retain_secret(self, value: str) -> None:
+        """
+        Increment reference count for an execution-scoped secret.
+
+        The value stays redacted until every holder released it (see
+        :meth:`release_secret`). Empty / too-short values are ignored,
+        matching :meth:`register_secret`'s historical minimum-length guard.
+        """
+        if not value or len(value) < 4:
+            return
+        with self._lock:
+            self._migrate_legacy_state_locked()
+            self._retain_locked(value)
+
+    def release_secret(self, value: str) -> None:
+        """
+        Decrement reference count for an execution-scoped secret.
+
+        Remove from redaction state only when count reaches zero and the
+        secret is not permanent. Releasing an unknown value is a no-op that
+        logs a sanitized warning (length fingerprint only — the value itself
+        is never logged).
+        """
+        if not value:
+            return
+        with self._lock:
+            self._migrate_legacy_state_locked()
+            known = self._release_locked(value)
+        if not known:
+            # Sanitized diagnostic: never expose the secret value here.
+            _module_logger.warning(
+                "Redactor release for unknown secret (len=%d); ignored.",
+                len(value))
+
+    def register_process_scoped_secret(self, value: str) -> None:
+        """
+        Mark/retain a long-lived secret for the process lifetime.
+
+        Execution-scoped releases (:meth:`release_secret` /
+        :meth:`forget_secret`) must not remove it. Idempotent: repeated
+        calls do not inflate the refcount beyond one.
+        """
+        if not value or len(value) < 4:
+            return
+        with self._lock:
+            self._migrate_legacy_state_locked()
+            if value in self._permanent_secrets:
+                if value not in self._secret_refcounts:
+                    self._secret_refcounts[value] = 1
                 self._secrets.add(value)
+                return
+            self._permanent_secrets.add(value)
+            self._retain_locked(value)
+
+    def active_secret_count(self) -> int:
+        """
+        Return number of currently retained secret values.
+
+        Must not expose values.
+        """
+        with self._lock:
+            return len(self._secrets)
+
+    def has_secret(self, value: str) -> bool:
+        """
+        Test helper. Must not log the value.
+        """
+        with self._lock:
+            return value in self._secrets
+
+    # ------------------------------------------------------- compatibility
+    def register_secret(self, value: str) -> None:
+        """Register a runtime secret value to scrub from every log record.
+
+        AUD-02 phase 1: behaves like :meth:`retain_secret` — unless the
+        value is already process-scoped/permanent, in which case its
+        permanence (and refcount) are left untouched.
+        """
+        if not value or len(value) < 4:
+            return
+        with self._lock:
+            self._migrate_legacy_state_locked()
+            if value in self._permanent_secrets:
+                # Permanence preserved; make sure the value is still part of
+                # the redaction state, but never inflate its refcount.
+                self._secrets.add(value)
+                self._secret_refcounts.setdefault(value, 1)
+                return
+            self._retain_locked(value)
 
     def forget_secret(self, value: str) -> None:
-        with self._lock:
-            self._secrets.discard(value)
+        """Release a previously registered secret (refcount-aware).
+
+        Behaves like :meth:`release_secret`: the value leaves the redaction
+        state only when its last holder releases it and it is not permanent.
+        """
+        self.release_secret(value)
 
     def snapshot_secrets(self) -> list[str]:
         """Thread-safe copy of the registered secret values, LONGEST first.
