@@ -503,50 +503,60 @@ def _write_secret_file(token: str, value: str, secrets_dir: str,
     return path
 
 
-#: AUD-02 (v0.6.5): resolved temp-file path -> (retention kind, plaintext),
-#: where kind is "scope" (execution-scoped reference held by the active
-#: ExecutionSecretScope) or "process" (fallback process baseline when no
-#: scope was active). :func:`_resolve_placeholder_token` records the entry;
-#: the middleware cleanup loop releases EXACTLY ONE matching reference per
-#: resolved temp file once the file has been removed — i.e. after next_call
-#: returned and the SEC-01 ContextVar handoff was restored, which is a safe
-#: lifecycle point for the placeholder path (the authoritative
-#: transform_tool_result redaction consumes its own ContextVar/task-store
-#: copies, not this registry). Thread-safe; entries are popped on release so
-#: nothing accumulates across executions. NEVER logged — values stay in
-#: memory only.
-_PENDING_PATH_RETENTIONS: dict[str, tuple[str, str]] = {}
+#: AUD-02 (v0.6.5): resolved temp-file path -> (retention kind, plaintext,
+#: owning execution id), where kind is "scope" (a PRIVATE execution-scoped
+#: reference held by the ExecutionSecretScope identified by the third field)
+#: or "process" (fallback process baseline when no scope was active).
+#: :func:`_resolve_placeholder_token` records the entry; the middleware
+#: cleanup loop releases EXACTLY ONE matching reference per resolved temp
+#: file once the file has been removed — i.e. after next_call returned and
+#: the SEC-01 ContextVar handoff was restored, which is a safe lifecycle
+#: point for the placeholder path (the authoritative transform_tool_result
+#: redaction consumes its own ContextVar/task-store copies, not this
+#: registry). The scope's OWN primary reference per distinct value is
+#: released exactly once at close() (release-once); these per-path private
+#: references are dropped here, symmetric to how they were taken.
+#: Thread-safe; entries are popped on release so nothing accumulates across
+#: executions. NEVER logged — values stay in memory only.
+_PENDING_PATH_RETENTIONS: dict[str, tuple[str, str, str]] = {}
 _PATH_RETENTION_LOCK = threading.Lock()
 
 
-def _release_path_retention(path: str) -> None:
+def _release_path_retention(path: str, exec_id: str = "") -> None:
     """Release the AUD-02 retention attached to one resolved temp file.
 
     Sanitized diagnostics only (temp filename + error class); never the
     value. Missing entries are a harmless no-op (e.g. legacy/direct callers
     that built their own cleanup loop).
+
+    Ownership rule: a ("scope", ...) entry marks a placeholder whose value
+    was retained THROUGH the owning :class:`ExecutionSecretScope` — the
+    scope holds exactly ONE reference per distinct value and releases it at
+    close() (the safe final lifecycle point, AFTER this cleanup ran inside
+    the middleware finally while the scope is still open). We therefore do
+    NOT decrement here: an early decrement would strip redaction coverage
+    from the result echoes that transform_tool_result/post_tool_call still
+    have to scrub. Only the "process" fallback entries (no active scope at
+    resolve time) are released symmetrically here via
+    :meth:`release_process_scoped_secret`.
     """
     with _PATH_RETENTION_LOCK:
         entry = _PENDING_PATH_RETENTIONS.pop(path, None)
     if entry is None:
         return
-    kind, value = entry
+    kind, value = entry[0], entry[1]
     try:
         redactor = get_redacting_filter()
-        if kind == "scope":
-            # The scope's bookkeeping must forget the value ONLY once the
-            # decrement actually lands: if the shared refcount says the
-            # value is unknown (a direct retain_secret call for a too-short
-            # value never incremented anything), keeping the ownership lets
-            # the release-once close() stay consistent and prevents any
-            # mismatch against another owner's count.
-            if redactor.has_secret(value):
-                redactor.release_secret(value)
-                scope = current_execution_scope()
-                if scope is not None and scope.has_value(value):
-                    scope.forget_value(value)
-        else:
+        if kind != "scope":
+            # Fallback process baseline taken when NO execution scope was
+            # published at resolve time: drop precisely that one baseline
+            # reference now that the temp file carrying the plaintext is
+            # gone. (If the same value is ALSO a genuine process-scoped
+            # secret, its own baseline count keeps it redactable.)
             redactor.release_process_scoped_secret(value)
+        # kind == "scope": nothing to do here — the OWNING scope performs
+        # the single, release-once decrement when the execution's deferred
+        # close runs at the safe final lifecycle point.
     except Exception as exc:  # pragma: no cover - defensive
         log.warning("AUD-02: retention release failed for temp file %s (%s)",
                     os.path.basename(path), type(exc).__name__)
@@ -557,6 +567,7 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
                                temp_files: list[str], task_id: str = "",
                                injected_values_out: list[str] | None = None,
                                task_errors: list[dict] | None = None,
+                               exec_id: str = "",
                                ) -> str | None:
     """SEC-02 (v0.5.7): atomically consume one unique token and create its
     single temp file; return the file path or ``None`` (fail-safe).
@@ -641,14 +652,14 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
             # refcount — nothing here can remove a value another active
             # execution still retains.
             redactor.retain_secret(value)
-        _PENDING_PATH_RETENTIONS[path] = ("scope", value)
+        _PENDING_PATH_RETENTIONS[path] = ("scope", value, exec_id or task_id)
     else:
         # No active execution scope (legacy/direct callers): fall back to
         # PROCESS-scoped retention so the value stays redactable; the
         # symmetric baseline release happens in the middleware finally after
         # temp-file cleanup.
         redactor.register_process_scoped_secret(value)
-        _PENDING_PATH_RETENTIONS[path] = ("process", value)
+        _PENDING_PATH_RETENTIONS[path] = ("process", value, "")
     # v0.1.4 (FAIL-6): also record the plaintext per-task so the redaction
     # layer can scrub it from this specific tool call's output even when the
     # global filter state was reset by another component in between.
@@ -774,7 +785,7 @@ def make_placeholder_resolver(auth: AuthManager,
                 for suffix in unique_suffixes:
                     path = _resolve_placeholder_token(
                         suffix, auth, registry, secrets_dir, temp_files,
-                        task_id, injected_values, task_errors)
+                        task_id, injected_values, task_errors, exec_id)
                     if path is None:
                         continue  # unknown/expired/used -> leave verbatim
                     replacements[f"$__VW_SECRET_{suffix}__"] = f"$(< {path})"
@@ -825,6 +836,12 @@ def make_placeholder_resolver(auth: AuthManager,
                     os.unlink(path)
                 except OSError as exc:
                     log.warning("Failed to remove temp file %s: %s", path, exc)
+                # AUD-02 (v0.6.5): release EXACTLY the retention attached to
+                # this resolved temp file once the file is gone — symmetric
+                # to the retain done at resolve time. The scope's primary
+                # per-value reference stays until close(); only this path's
+                # private reference (or process-fallback baseline) drops.
+                _release_path_retention(path, exec_id)
             # SEC-01 (v0.5.4): forget this execution's per-task plaintext set
             # too (the ContextVar was already restored above). The middleware
             # is the single OWNER that forgets injected values — neither the
