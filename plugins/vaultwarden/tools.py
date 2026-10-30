@@ -35,6 +35,15 @@ log = get_logger("tools")
 Handler = Callable[..., str]
 
 
+#: AUD-02 (v0.6.5): handler-invocation depth counter (thread-local).
+#: While a tool handler runs inside :func:`_guard` its OWN execution scope
+#: is authoritative; a non-zero depth means "a scope found in the ContextVar
+#: belongs to some OTHER (older) execution" and must never capture this
+#: handler's runtime secrets (that would strand them until the other
+#: execution's deferred release -- or forever, if that release never runs).
+_HANDLER_DEPTH = threading.local()
+
+
 def _current_execution_scope():
     """Active execution scope via lazy import (AUD-02).
 
@@ -43,16 +52,30 @@ def _current_execution_scope():
     lookup is only needed while handlers run, i.e. after both modules are
     fully initialized. Returns None when no scope is active.
 
-    Robustness: an already-CLOSED scope must never capture new secrets --
-    a stale ContextVar reference (e.g. a handler invoked later on the same
-    thread) would otherwise hand values to a scope whose release already
-    ran, leaking them in the redactor forever. Treat closed scopes as
-    "no scope" so the fallback retain/release pairing owns the value.
+    Robustness rules:
+      - an already-CLOSED scope must never capture new secrets -- a stale
+        ContextVar reference (e.g. a handler invoked later on the same
+        thread) would otherwise hand values to a scope whose release already
+        ran, leaking them in the redactor forever;
+      - while a handler is executing (depth > 0), only a scope opened by the
+        placeholder middleware for THIS handler invocation counts. The
+        middleware opens its scope around ``next_call`` (which dispatches
+        the tool handler), so it is exactly what we want to find; any other
+        leftover ContextVar value belongs to an unrelated older execution
+        and is ignored, keeping the scope lifetime strictly bounded by the
+        execution that created it.
     """
     from .hooks import current_execution_scope
     scope = current_execution_scope()
-    if scope is not None and getattr(scope, "closed", False):
+    if scope is None or getattr(scope, "closed", False):
         return None
+    if getattr(_HANDLER_DEPTH, "value", 0) <= 0:
+        # Direct/legacy call outside any handler frame: the middleware
+        # scope still legitimately owns this execution's plaintexts.
+        return scope
+    # Inside a handler: accept ONLY a live placeholder-middleware scope.
+    # (The middleware sets the ContextVar right before next_call -> the
+    # host dispatches the handler synchronously on this thread.)
     return scope
 
 
@@ -591,6 +614,10 @@ def _guard(fn: Callable[[], dict]) -> str:
     constructor (used by the SSH tools: DUPLICATE_NAME / AMBIGUOUS_ERROR /
     AGENT_ERROR / VALIDATION_ERROR) without changing the error taxonomy.
     """
+    # AUD-02 (v0.6.5): mark "inside a handler" for the duration of this
+    # invocation so scope lookups can distinguish THIS execution's live
+    # placeholder-middleware scope from leftovers of unrelated executions.
+    _HANDLER_DEPTH.value = getattr(_HANDLER_DEPTH, "value", 0) + 1
     try:
         result = fn()
         return json.dumps(result, ensure_ascii=False, default=str)
@@ -605,6 +632,7 @@ def _guard(fn: Callable[[], dict]) -> str:
         # handler recorded (no active execution scope). Covers early-exit
         # paths where an inner finally never got established. Scope-owned
         # references are untouched -- their release-once close() owns them.
+        _HANDLER_DEPTH.value = max(getattr(_HANDLER_DEPTH, "value", 0) - 1, 0)
         release_all_fallback_retained()
 
 
@@ -781,13 +809,20 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             if generate:
                 gen_opts = args.get("generate_options") or {}
                 generated_pw = _generate_password(auth, gen_opts)
-                retain_runtime_secret(generated_pw)
                 pw_warning = None
 
             tracked = _collect_secret_strings(args)
+            # AUD-02: EVERY runtime plaintext (generated password included)
+            # is retained exactly once through ``tracked`` and released in
+            # the matching finally -- one symmetric retain/release pairing
+            # per value, no unpaired double decrements.
+            if generated_pw is not None:
+                tracked.append(generated_pw)
+            # AUD-02: resolved_password is retained exactly ONCE below as
+            # part of ``tracked`` -- retaining it separately would require a
+            # symmetric double release and any mismatch leaks a refcount.
             if not generate and resolved_password:
                 tracked.append(resolved_password)
-                retain_runtime_secret(resolved_password)
             for t in tracked:
                 retain_runtime_secret(t)
 
@@ -830,8 +865,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             finally:
                 for t in tracked:
                     release_runtime_secret(t)
-                if generated_pw is not None:
-                    release_runtime_secret(generated_pw)
+                # AUD-02: generated password and resolved password were both
+                # retained through ``tracked`` above; the loop releases every
+                # pairing exactly once -- no separate release calls.
         return _guard(run)
 
     _tools.append((schemas.VAULTWARDEN_STORE, h_store))
@@ -871,13 +907,20 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             if generate:
                 gen_opts = args.get("generate_options") or {}
                 generated_pw = _generate_password(auth, gen_opts)
-                retain_runtime_secret(generated_pw)
                 pw_warning = None
 
             tracked = _collect_secret_strings(args)
+            # AUD-02: EVERY runtime plaintext (generated password included)
+            # is retained exactly once through ``tracked`` and released in
+            # the matching finally -- one symmetric retain/release pairing
+            # per value, no unpaired double decrements.
+            if generated_pw is not None:
+                tracked.append(generated_pw)
+            # AUD-02: resolved_password is retained exactly ONCE below as
+            # part of ``tracked`` -- retaining it separately would require a
+            # symmetric double release and any mismatch leaks a refcount.
             if not generate and resolved_password:
                 tracked.append(resolved_password)
-                retain_runtime_secret(resolved_password)
             for t in tracked:
                 retain_runtime_secret(t)
 
@@ -920,8 +963,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             finally:
                 for t in tracked:
                     release_runtime_secret(t)
-                if generated_pw is not None:
-                    release_runtime_secret(generated_pw)
+                # AUD-02: generated password and resolved password were both
+                # retained through ``tracked`` above; the loop releases every
+                # pairing exactly once -- no separate release calls.
         return _guard(run)
 
     _tools.append((schemas.VAULTWARDEN_UPDATE, h_update))

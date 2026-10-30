@@ -215,12 +215,35 @@ def open_execution_scope(exec_id: str = "") -> tuple["ExecutionSecretScope", Any
     Returns ``(scope, token)``; the caller MUST eventually
     :func:`close_execution_scope` (fail-safe in its finally block).
     """
+    # AUD-02 adoption rule: if a previous execution left its scope slot
+    # published (attributable executions defer their release to
+    # post_tool_call, which may run on another context), that leftover
+    # scope was already closed by the owner's fail-safe path OR is still
+    # legitimately open under its OWN registry id. Never overwrite an
+    # OPEN scope entry for the same id; adopt-and-clear the slot only for
+    # a fresh execution so a stale reference can never capture new secrets
+    # (tools._current_execution_scope additionally ignores closed scopes).
+    stale = _execution_secret_scope.get()
+    if stale is not None and stale.closed:
+        _execution_secret_scope.set(None)
     scope = ExecutionSecretScope(get_redacting_filter())
     token = _execution_secret_scope.set(scope)
     if exec_id:
         with _EXEC_SCOPES_LOCK:
+            prev = _EXEC_SCOPES_BY_ID.get(exec_id)
+            if prev is not None and not prev.closed:
+                # Same id re-used while still open: keep the ORIGINAL live
+                # scope so its pending deferred release stays authoritative;
+                # the new execution retains THROUGH it as well.
+                _execution_secret_scope.reset(token)
+                return prev, token
             _EXEC_SCOPES_BY_ID[exec_id] = scope
     return scope, token
+
+
+def _clear_execution_scope_slot() -> None:
+    """Clear the published ContextVar slot (host-side turn completion)."""
+    _execution_secret_scope.set(None)
 
 
 def current_execution_scope() -> "ExecutionSecretScope | None":
@@ -252,6 +275,11 @@ def close_execution_scope(token: Any = None, exec_id: str = "",
     if scoped is not None:
         scoped.close()
         found = True
+        # If the published slot still points at exactly this scope, the
+        # execution just completed its deferred release: clear the slot so
+        # no stale reference can capture another execution's secrets.
+        if _execution_secret_scope.get() is scoped:
+            _execution_secret_scope.set(None)
     if token is not None:
         try:
             _execution_secret_scope.reset(token)
@@ -716,13 +744,11 @@ def make_placeholder_resolver(auth: AuthManager,
         # the guaranteed release point (fail-safe for exceptional paths where
         # no later lifecycle hook will run). close() is release-once: double
         # release can never occur and secrets can never leak across turns.
-        if exec_id:
-            try:
-                _execution_secret_scope.reset(cv_scope_token)
-            except ValueError:  # token from a different context (asyncio)
-                pass
-        else:
+        if not exec_id:
+            # No attributable id: this finally block IS the guaranteed
+            # release point -- close now and clear the published slot.
             close_execution_scope(cv_scope_token, exec_id)
+            _clear_execution_scope_slot()
 
     return vaultwarden_inject_secrets
 
@@ -1037,6 +1063,7 @@ def make_post_cleanup_hook(auth: AuthManager,
 
     def vaultwarden_post_cleanup(tool_name: str = "", args: dict | None = None,
                                  result: Any = None, task_id: str = "",
+                                 _vw_scope_token: Any = None,
                                  **kwargs: Any) -> None:
         # SEC-01 (v0.5.4): redaction moved to transform_tool_result. This
         # hook is now observer-only for cleanup/metrics and must not mutate
@@ -1058,7 +1085,14 @@ def make_post_cleanup_hook(auth: AuthManager,
         # be attributed (no task_id / exec kwarg), leave the scope open: the
         # middleware's finally fail-safe (or on_session_end) closes it  never
         # guess and never release another execution's scope prematurely.
-        close_execution_scope(exec_id=_exec_id_for(task_id, kwargs))
+        # The middleware hands its ContextVar token through the dispatch
+        # kwargs when the host forwards them; passing it here lets the SAME
+        # call perform the deferred release AND the context cleanup. Without
+        # the token the scope still closes via the id-keyed registry; the
+        # stale published slot is then adopted by the NEXT execution's
+        # open (see open_execution_scope) so it can never leak a reference.
+        close_execution_scope(_vw_scope_token,
+                              exec_id=_exec_id_for(task_id, kwargs))
         # Surface fail-closed resolution errors to the agent (secret-free).
         # v0.2.2 (BUGFIX): pop only THIS task's errors — other in-flight
         # tasks keep their pending errors until their own post_tool_call.
