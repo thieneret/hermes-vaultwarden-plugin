@@ -678,6 +678,12 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
     # (legacy/direct callers), fall back to process-scoped retention so the
     # value stays redactable  a runtime secret must never go unredacted.
     scope = current_execution_scope()
+    # A CLOSED published slot (e.g. a previous execution's fail-safe closed
+    # it and the host never cleared the ContextVar) must never swallow new
+    # retains: scope.retain() on a closed scope only warns, which would leave
+    # this freshly injected runtime secret UNREDACTED for its whole execution.
+    if scope is not None and scope.closed:
+        scope = None
     redactor = get_redacting_filter()
     if scope is not None:
         # Execution-scoped retention, ONE reference per (scope, value):
