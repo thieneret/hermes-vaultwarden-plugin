@@ -73,8 +73,7 @@ def test_release_unknown_value_warns_sanitized_no_crash():
         lg.removeHandler(handler)
         lg.setLevel(old_level)
     assert records, "expected a sanitized warning for unknown release"
-    joined = " ".join(r.getMessage() % r.args if r.args else r.getMessage()
-                      for r in records)
+    joined = " ".join(r.getMessage() for r in records)
     # Sanitized: length only, NEVER the value.
     assert "never-retained-value" not in joined
     assert "len=" in joined
