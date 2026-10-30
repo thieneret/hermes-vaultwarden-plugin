@@ -185,6 +185,29 @@ class ExecutionSecretScope:
                 return  # stale handle after close: entry release still owns it
             self._path_owned[value] = self._path_owned.get(value, 0) + 1
 
+    def forget_path_reference(self, value: str) -> None:
+        """Hand back ONE entry-owned temp-file bookkeeping count (no-op if closed).
+
+        AUD-02 (v0.6.5): called by :func:`_release_path_retention` when the
+        temp file carrying the plaintext is removed. The shared refcount is
+        NOT touched — the scope's deduplicated primary reference already
+        owns the coverage for this path; only the ``_path_owned`` floor
+        bookkeeping decreases so ``release_value`` / ``close`` never strand
+        or double-decrement a reference. A closed scope already consumed
+        its whole bookkeeping at close time (stranding guard): silent no-op.
+        Never logs the value.
+        """
+        if not value:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            n = self._path_owned.get(value, 0)
+            if n <= 1:
+                self._path_owned.pop(value, None)
+            else:
+                self._path_owned[value] = n - 1
+
     def has_value(self, value: str) -> bool:
         """Whether this OPEN scope already retains *value*.
 
@@ -638,19 +661,23 @@ def _release_path_retention(path: str, exec_id: str = "") -> None:
 
     Ownership rules per retention kind:
 
-    - ``("path-ref", value, owner_exec_id)`` — an EXTRA execution-scoped
-      reference taken by :func:`_resolve_placeholder_token` alongside the
-      owning scope's deduplicated primary reference. The ENTRY owns this
-      single reference: releasing it decrements the shared refcount once AND
-      clears the owning scope's ``_path_owned`` bookkeeping for the value
-      under one lock, so the scope's fail-safe paths (``release_value`` /
-      ``close``) know this reference was already handed back and can never
-      double-decrement it; conversely if the scope closes FIRST, its
-      stranding guard releases the path reference and clears the entry's
-      bookkeeping so a late per-path release here becomes a no-op decrement.
-      Every other holder (an overlapping execution's primary or path
-      reference, a process baseline) keeps the value redactable until its OWN
-      release — an early temp-file cleanup can therefore never strip
+    - ``("path-ref", value, owner_exec_id)`` — BOOKKEEPING-ONLY entry for a
+      temp file resolved through an execution scope. The extra reference is
+      NOT owned by the entry: :func:`_resolve_placeholder_token` records it
+      via :meth:`ExecutionSecretScope.retain_path_reference` WITHOUT taking
+      an additional shared-refcount increment, because the owning scope's
+      deduplicated PRIMARY reference already covers every temp file of the
+      execution until the scope's safe final lifecycle point. Releasing the
+      entry therefore only hands the bookkeeping count back to the owning
+      scope (clearing its ``_path_owned`` entry under one lock with the
+      scope's own state lock held) so the scope's fail-safe paths
+      (``release_value`` / ``close``) floor correctly and can never strand
+      or double-decrement a reference. If the scope closed FIRST, its
+      stranding guard already consumed the bookkeeping and released the
+      primary reference — a late per-path release here becomes a silent
+      no-op. Every other holder (an overlapping execution's primary
+      reference, a process baseline) keeps the value redactable until its
+      OWN release — an early temp-file cleanup can therefore never strip
       redaction coverage from a still-active execution.
     - ``("process", value, "")`` — fallback process baseline taken when NO
       execution scope was published at resolve time; dropped symmetrically
@@ -666,12 +693,20 @@ def _release_path_retention(path: str, exec_id: str = "") -> None:
     try:
         redactor = get_redacting_filter()
         if kind == "path-ref":
-            # Drop precisely the ONE extra execution reference this temp
-            # file's resolution took. Refcount protection still guards any
-            # other live holder (overlapping executions, baselines) — the
-            # value leaves the redaction state only when the LAST holder
-            # releases. Never logs the value.
-            redactor.release_secret(value)
+            # AUD-02 (v0.6.5): bookkeeping-only hand-back. The shared
+            # refcount is NOT touched here — the owning scope's deduplicated
+            # primary reference already covers this temp file until the
+            # scope's safe final lifecycle point. Clear the owning scope's
+            # ``_path_owned`` count for the value (under the scope's own
+            # lock) so its fail-safe paths floor correctly; a closed /
+            # missing scope means its stranding guard already consumed the
+            # bookkeeping at close time — silent no-op. Never logs values.
+            with _EXEC_SCOPES_LOCK:
+                owner = _EXEC_SCOPES_BY_ID.get(owner_id) if owner_id else None
+            if owner is None:
+                owner = current_execution_scope()
+            if owner is not None:
+                owner.forget_path_reference(value)
         else:
             # Fallback process baseline taken when NO execution scope was
             # published at resolve time: drop precisely that one baseline
@@ -690,7 +725,6 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
                                injected_values_out: list[str] | None = None,
                                task_errors: list[dict] | None = None,
                                exec_id: str = "",
-                               scoped_retained_out: list[str] | None = None,
                                ) -> str | None:
     """SEC-02 (v0.5.7): atomically consume one unique token and create its
     single temp file; return the file path or ``None`` (fail-safe).
@@ -772,33 +806,29 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
         # reference in the shared refcount, so no owner's close can remove
         # the value while another active execution still needs it.
         scope.retain(value)
-        # AUD-02 (v0.6.5): take ONE EXTRA execution reference PER RESOLVED
-        # TEMP FILE, owned by the _PENDING_PATH_RETENTIONS entry itself --
-        # released symmetrically by _release_path_retention once the file
-        # carrying the plaintext is removed. This guarantees coverage for
-        # every later consumer even on hosts where the middleware finally
-        # block unwinds BEFORE transform_tool_result runs (the deferred
-        # post_tool_call close may then never find an open scope): the
-        # value leaves the redaction state only when the LAST holder --
-        # primary reference, path reference, overlapping execution or
-        # process baseline -- releases. The scope records the count via
-        # retain_path_reference() so its fail-safe release paths can never
-        # double-decrement an entry-owned reference. NOTE: the plaintext is
-        # deliberately NOT mirrored into the task-keyed injected store --
-        # the middleware finally block consumes that store before
-        # transform_tool_result runs on async hosts; the transformer reads
-        # the still-open scope directly instead (see make_result_redactor).
-        redactor.retain_secret(value)
+        # AUD-02 (v0.6.5): bookkeeping-only registration of one temp-file
+        # ("path-ref") reference for THIS resolved placeholder. The
+        # reference is OWNED BY THE SCOPE ITSELF (its deduplicated primary
+        # reference already covers the whole execution lifetime, including
+        # every temp file it produced): _resolve_placeholder_token does NOT
+        # take an extra shared-refcount increment here, so neither the
+        # per-path cleanup loop (:func:`_release_path_retention`, which
+        # hands this entry's decrement back to the scope WITHOUT touching
+        # the shared refcount) nor the scope's fail-safe release paths
+        # (``release_value`` / ``close``, which floor at this count) can
+        # ever double-decrement or strand a reference. Coverage therefore
+        # stays continuous from injection until the scope's safe final
+        # lifecycle point (post_tool_call -- AFTER transform_tool_result
+        # authoritative redaction and observer cleanup consumed the
+        # plaintexts); an early temp-file cleanup can never strip redaction
+        # from a still-active execution. NOTE: the plaintext is deliberately
+        # NOT mirrored into the task-keyed injected store -- the middleware
+        # finally block consumes that store before transform_tool_result
+        # runs on async hosts; the transformer reads the still-open scope
+        # directly instead (see make_result_redactor).
         scope.retain_path_reference(value)
         with _PATH_RETENTION_LOCK:
             _PENDING_PATH_RETENTIONS[path] = ("path-ref", value, exec_id)
-        # AUD-02 (v0.6.5): report the scoped retention back to the calling
-        # middleware execution so its fail-safe closure can release exactly
-        # this reference (primary + entry-owned path ref) if no later
-        # lifecycle point runs. The pair carries BOTH the plaintext and the
-        # resolved temp-file path for precise per-token bookkeeping.
-        if scoped_retained_out is not None:
-            scoped_retained_out.append((value, path))
     else:
         # No active execution scope (legacy/direct callers): fall back to
         # PROCESS-scoped retention so the value stays redactable; the
@@ -903,15 +933,15 @@ def make_placeholder_resolver(auth: AuthManager,
                     "validation; injection blocked (fail-closed).").to_dict())
             return next_call(args)
         temp_files: list[str] = []
-        #: AUD-02 (v0.6.5): per-token resolution bookkeeping for THIS
-        #: execution — ``(value, path)`` for every successfully resolved
-        #: placeholder. The fail-safe closure below releases exactly these
-        #: references when the execution cannot be attributed to a lifecycle
-        #: id (or dies on an exceptional path); scoped retains deliberately
-        #: have NO _PENDING_PATH_RETENTIONS entry until cleanup runs so
-        #: temp-file handling alone can never strip redaction coverage
-        #: before transform_tool_result ran.
-        scoped_retained: list[tuple[str, str]] = []
+        #: AUD-02 (v0.6.5): plaintexts this execution retained THROUGH its
+        #: own scope (deduplicated, live-state snapshot). The exceptional-
+        #: path fail-safe closure below releases precisely these — never
+        #: anything a foreign holder happens to share — so refcount
+        #: bookkeeping stays symmetric on every path. Scoped retains
+        #: deliberately have NO _PENDING_PATH_RETENTIONS decrement until
+        #: cleanup runs so temp-file handling alone can never strip redaction
+        #: coverage before transform_tool_result ran.
+        scope_owned_values: set[str] = set()
         injected_values: list[str] = []
         new_args = dict(args)
         resolved_any = False
@@ -940,8 +970,7 @@ def make_placeholder_resolver(auth: AuthManager,
                 for suffix in unique_suffixes:
                     path = _resolve_placeholder_token(
                         suffix, auth, registry, secrets_dir, temp_files,
-                        task_id, injected_values, task_errors, exec_id,
-                        scoped_retained_out=scoped_retained)
+                        task_id, injected_values, task_errors, exec_id)
                     if path is None:
                         continue  # unknown/expired/used -> leave verbatim
                     replacements[f"$__VW_SECRET_{suffix}__"] = f"$(< {path})"
@@ -954,6 +983,12 @@ def make_placeholder_resolver(auth: AuthManager,
                     resolved_any = True
             if not resolved_any:
                 return next_call(args)
+            # AUD-02 (v0.6.5): snapshot exactly which plaintexts THIS
+            # execution's scope still owns (deduplicated, live state). The
+            # exceptional-path fail-safe closure below releases precisely
+            # these — never anything a foreign holder happens to share —
+            # so refcount bookkeeping stays symmetric on every path.
+            scope_owned_values.update(scope.retained_values())
             log.debug("Injected %d secret temp file(s) for %s.",
                       len(temp_files), tool_name)
             # SEC-01 (v0.5.4) handoff: publish the exact plaintext set that is
@@ -1019,17 +1054,15 @@ def make_placeholder_resolver(auth: AuthManager,
         if not exec_id:
             # No attributable id: this finally block IS the guaranteed
             # release point. The per-path cleanup loop above already popped
-            # every "path-ref" entry of THIS execution and handed back its
-            # one owned decrement; close() now drops exactly the scope's
-            # remaining primary references (release-once, so a double close
-            # is a silent no-op). Both paths floor at the scope's _path_owned
-            # bookkeeping, so neither can ever double-decrement or strand a
-            # reference, and an overlapping execution sharing the same
-            # secret keeps its OWN primary + path references untouched until
-            # its own lifecycle completes. Process baselines are never
-            # touched here.
-            for _value in {v for v, _p in scoped_retained}:
-                scope.release_value(_value)
+            # every "path-ref" entry of THIS execution and handed its
+            # bookkeeping back to the scope; close() now drops exactly the
+            # scope's remaining primary references (release-once, so a
+            # double close is a silent no-op). Both paths floor at the
+            # scope's _path_owned bookkeeping, so neither can ever
+            # double-decrement or strand a reference, and an overlapping
+            # execution sharing the same secret keeps its OWN primary
+            # references untouched until its own lifecycle completes.
+            # Process baselines are never touched here.
             # AUD-02 (v0.6.5) ownership rule: ALWAYS close OUR OWN scope by
             # identity here. An id-less close_execution_scope() would fall
             # back to whatever scope the ContextVar currently publishes --
@@ -1046,7 +1079,7 @@ def make_placeholder_resolver(auth: AuthManager,
                 _execution_secret_scope.reset(cv_scope_token)
             except ValueError:  # token from a different context (asyncio)
                 pass
-        elif scoped_retained:
+        elif scope_owned_values:
             # Attributable id but the middleware frame is unwinding via an
             # exception (or a sync host that shares one context across the
             # whole call stack, where the ContextVar token cannot be reset):
@@ -1064,13 +1097,15 @@ def make_placeholder_resolver(auth: AuthManager,
             if sys.exc_info()[0] is not None:
                 # Fail-safe for the exceptional path with an attributable
                 # id: the per-path cleanup loop above already handed back
-                # every entry-owned "path-ref" decrement of THIS execution,
-                # so first release exactly this scope's remaining PRIMARY
-                # references (per distinct value), then close (release-once;
-                # a late post_tool_call close for the same id is a harmless
+                # every entry-owned "path-ref" bookkeeping decrement of
+                # THIS execution, so first release exactly this scope's
+                # remaining PRIMARY references (per distinct value it
+                # actually owns — derived from the live scope state, never
+                # from foreign holders), then close (release-once; a late
+                # post_tool_call close for the same id is a harmless
                 # no-op). Symmetric with the normal path — never
                 # double-decrements, never strands.
-                for _value in {v for v, _p in scoped_retained}:
+                for _value in sorted(scope_owned_values):
                     scope.release_value(_value)
                 closed = close_execution_scope(None, exec_id)
                 if not closed:  # pragma: no cover - defensive fallback
