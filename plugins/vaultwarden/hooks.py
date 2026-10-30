@@ -243,8 +243,19 @@ class ExecutionSecretScope:
             if self._closed or (value not in self._values
                                 and value not in self._path_owned):
                 return  # already released / never retained here: no-op
+            # AUD-02 (v0.6.5) ownership floor: the shared refcount holds
+            # EXACTLY ONE primary reference per (scope, distinct value).
+            # The ``_path_owned`` temp-file ("path-ref") counts are
+            # BOOKKEEPING-ONLY mirrors of that same primary reference —
+            # they own NO extra increment (see retain_path_reference), so
+            # decrementing them here would DOUBLE-RELEASE the value and
+            # strip redaction coverage from an overlapping execution that
+            # still retains it. Only the outstanding PRIMARY count is
+            # decremented; the path bookkeeping is consumed by whichever
+            # cleanup runs second (forget_path_reference after the entry
+            # release, or close()'s stranding guard) as a silent no-op.
             self._values.discard(value)
-            n = self._outstanding.pop(value, 0) + self._path_owned.pop(value, 0)
+            n = self._outstanding.pop(value, 0)
         for _ in range(n):
             self._redactor.release_secret(value)
 
@@ -388,10 +399,15 @@ def close_execution_scope(token: Any = None, exec_id: str = "",
     """Close the execution scope at the safe final lifecycle point.
 
     Resolution order: the task-keyed fallback registry (when *exec_id* is
-    known), then the ContextVar scope (closing it clears its registry
-    entry too). Closing is release-once and idempotent; a call with no
-    discoverable scope is a harmless no-op returning False. Never logs
-    secret values.
+    known), then — ONLY when no id is available — the ContextVar scope.
+    With an attributable *exec_id* whose registry entry is already gone
+    (e.g. the middleware fail-safe closed and consumed it on an
+    exceptional path) this function must NOT fall back to whatever scope
+    another execution still has published in the ContextVar: force-closing
+    that FOREIGN scope would strip its redaction coverage prematurely and
+    strand its references. Closing is release-once and idempotent; a call
+    with no discoverable scope is a harmless no-op returning False. Never
+    logs secret values.
     """
     found = False
     scoped: "ExecutionSecretScope | None" = None
@@ -399,11 +415,20 @@ def close_execution_scope(token: Any = None, exec_id: str = "",
     if lookup_id:
         with _EXEC_SCOPES_LOCK:
             scoped = _EXEC_SCOPES_BY_ID.pop(lookup_id, None)
-    if scoped is None:
+        if scoped is None:
+            # Registry miss for an attributable id: the owner's fail-safe
+            # already released this execution (or it never opened a scope).
+            # Do NOT touch the ContextVar-published scope — it may belong
+            # to a DIFFERENT, still-active execution. Only reset our own
+            # token below if it happens to point at exactly this slot.
+            if token is not None:
+                try:
+                    _execution_secret_scope.reset(token)
+                except ValueError:  # token from a different context
+                    pass
+            return False
+    else:
         scoped = _execution_secret_scope.get()
-        if scoped is not None and lookup_id:
-            with _EXEC_SCOPES_LOCK:
-                _EXEC_SCOPES_BY_ID.pop(lookup_id, None)
     if scoped is not None:
         scoped.close()
         found = True
@@ -1148,9 +1173,14 @@ def make_placeholder_resolver(auth: AuthManager,
             # double-decrements, never strands.
             for _value in sorted(scope_owned_values):
                 scope.release_value(_value)
-            closed = close_execution_scope(None, exec_id)
-            if not closed:  # pragma: no cover - defensive fallback
-                scope.close()
+            # AUD-02 (v0.6.5): release-once via the scope object itself.
+            # Do NOT route through close_execution_scope(): with an empty
+            # registry/ContextVar state it would fall back to whatever
+            # FOREIGN scope another execution still has published and
+            # force-close it, stripping that execution's redaction
+            # coverage prematurely. close() is idempotent, so a late
+            # post_tool_call close for this id remains a harmless no-op.
+            scope.close()
 
     return vaultwarden_inject_secrets
 
