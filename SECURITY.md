@@ -101,7 +101,7 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 | Subprocess env isolation | All `bw` calls run with a minimal, explicitly constructed environment. The parent environment is NEVER inherited. |
 | SSH environment isolation | All SSH subprocess calls (`ssh-add`, `ssh-agent`, `ssh-keygen`) run via `_ssh_base_env()` — a minimal, explicitly allowlisted environment. The parent environment is NEVER inherited. (VWP-08) |
 | Password generation | `vaultwarden_store` / `vaultwarden_update` with `generate=true` generate a password and store it directly in the vault. The generated value is never returned to the LLM — only a placeholder is. (VWP-12) |
-| Session key in memory only | The Bitwarden session key is never written to disk. |
+| Session key in memory only | The Bitwarden session key is never written to disk. It lives exclusively in `AuthManager` (plugin memory) and an in-process weak-reference registry, and reaches the `bw` CLI ONLY as the `BW_SESSION` variable of the isolated subprocess environment — never via argv (which would leak to `ps`), never via file. Since v0.6.4 the injection is guaranteed at the single subprocess-env choke point (`BwCli._ensure_session_env()`): every session-requiring command (`list`, `get`, `create`, `edit`, `delete`, `sync`, …) receives `BW_SESSION` from the AuthManager when the vault is unlocked, so a caller that forgets to pass it can no longer silently run `bw` in a locked state (the v0.6.3 regression: empty lists / exit 1). The parent environment remains non-inherited; explicit caller-provided env values take precedence; non-session commands are unaffected. Regression tests pin all four properties (injection, fallback, no inheritance, no key in errors/logs). |
 | SSH passphrase via env | The SSH passphrase is delivered via `SSH_ASKPASS` + environment variable, never written to a file. |
 | Temp file cleanup | SSH key temp files are created with `mkstemp()` (0600 perms) and deleted in a `finally` block. |
 | Secret input channels | Passwords/passphrases for write tools can be supplied via an owner-only file (chmod 600, permission-validated before reading), keeping them out of the LLM context. Conflicting sources are rejected (`ConfigError`). Raw direct input is permitted but emits a warning in BOTH the log and the tool response. The `*_env` channel was REMOVED in v0.4.9 (see threat vector 12). |
@@ -158,6 +158,15 @@ version-dependent; reliability is anchored by the startup version check.
 4. **Server API errors** (`cannot find`, `does not exist`) — least stable,
 server-version-dependent; used only as fallback.
 
+Since v0.6.4, session-state failures are reported precisely instead of as a
+generic `bw <cmd> failed (exit 1)`: stderr is sanitized (session-key-looking
+tokens scrubbed, length-capped) before classification. Explicit expiry markers
+(`not logged in`, `invalid session key`, …) surface `SESSION_EXPIRED` with an
+operator suggestion to re-unlock; generic lock markers surface `SESSION_ERROR`
+(the code the plugin's run_with_recovery auto re-unlock path keys off, kept
+backwards-compatible). The raw session key never appears in the tool response,
+stderr excerpt, or logs.
+
 ### Retry Safety (VWP-10)
 
 Network-error retries use bounded exponential backoff with additive jitter
@@ -213,6 +222,7 @@ The plugin's security controls are validated by dedicated test suites:
 | Crash recovery tests | Startup cleanup of stale temp files after SIGKILL/SIGTERM | VWP-20 |
 | Filesystem hardening tests | Symlink rejection, ownership enforcement, permission enforcement, plugin load failure, `.bw-data` blocking, insecure `secrets.yaml` rejection | AUD-03 / AUD-04 / AUD-08 |
 | Lifecycle hook registration tests | Missing or failing required lifecycle hook registration refuses plugin load; successful registration loads the plugin | AUD-06 |
+| Session key injection regression tests | `BW_SESSION` reaches the isolated subprocess env (explicit + AuthManager fallback at the choke point), parent env still never inherited, session key never appears in error messages (locked → `SESSION_ERROR`, expired → `SESSION_EXPIRED`) | HOTFIX-01 (v0.6.4) |
 
 All CI checks (pytest, ruff) are **blocking** — a failing check prevents merge.
 
@@ -279,7 +289,7 @@ try/except that swallows failures. Fail-closed is mandatory.
 - All CI checks (pytest, ruff) are **blocking** — a failing check prevents
 merge. (VWP-15)
 
-## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-03 + AUD-04 + AUD-06 + AUD-08 implemented)
+## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-03 + AUD-04 + AUD-06 + AUD-08 + HOTFIX-01 implemented)
 
 | ID | Description | Implemented |
 | --- | --- | --- |
@@ -290,6 +300,7 @@ merge. (VWP-15)
 | AUD-03 | Secrets directory fail-closed validation at plugin load — `register()` runs `secure_fs.ensure_hardened_directory()` before any tool/hook registration; symlink / wrong owner / mode ≠ 0700 aborts activation (no partial state, no silent chmod repair) | v0.6.2 |
 | AUD-04 | `.bw-data` fail-closed validation before any `bw` invocation — shared hardened-directory validator gates `BITWARDENCLI_APPDATA_DIR` export and every `bw` subprocess call; insecure appdata dir blocks `bw` execution | v0.6.2 |
 | AUD-06 | Fail-closed lifecycle hook registration — required `post_tool_call` and session-end lifecycle hooks are validated and registered before tools are exposed; plugin refuses to load if a required lifecycle hook cannot be registered | v0.6.3 |
+| HOTFIX-01 | `BW_SESSION` injection regression fix — session key guaranteed at the subprocess-env choke point (`BwCli._ensure_session_env()`) for all session-requiring `bw` commands (v0.6.3 regression: empty `list`, exit 1 on `create`); sanitized stderr classification adds `SESSION_EXPIRED` vs `SESSION_ERROR`; env isolation and memory-only key handling unchanged; pinned by regression tests | v0.6.4 |
 | AUD-08 | `secrets.yaml` fail-closed filesystem validation before YAML parsing — `secure_fs.ensure_hardened_secret_file()` requires absolute path, regular non-symlink file, euid ownership, no group/other access; insecure file is NEVER parsed | v0.6.2 |
 | VWP-01 | Binary path pinning (hash verification = operator responsibility) | v0.4.7 |
 | VWP-02 | SSH socket path restriction (dev-controlled env vars) | v0.4.6 |

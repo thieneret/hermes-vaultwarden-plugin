@@ -315,7 +315,7 @@ mkdir -m 700 /path/to/real-dir
 | --- | --- |
 | Placeholder injection | Secrets never enter the context window |
 | Subprocess env isolation | All `bw` calls run with a minimal, controlled environment |
-| Session key in memory only | Bitwarden session key is never written to disk |
+| Session key in memory only | Bitwarden session key is never written to disk. Since v0.6.4 the `BW_SESSION` environment variable is guaranteed at the single subprocess-env choke point for all session-requiring `bw` commands (list/get/create/edit/delete), so vault operations can no longer silently run against a locked vault (v0.6.3 regression: empty `vaultwarden_list`, exit 1 on `vaultwarden_store`). Locked/expired sessions now surface as `SESSION_ERROR` / `SESSION_EXPIRED` with sanitized stderr and a re-unlock suggestion — never the raw session key. |
 | RedactingFilter | All secrets registered; redacted from logs and errors |
 | SSH passphrase delivery | Via the `SSH_ASKPASS` mechanism (env var only, never stdin/argv). Helper script removed in `finally` block. |
 | SSH key temp file | `tempfile.mkstemp()` (atomic), `0600` perms, deleted in `finally` |
