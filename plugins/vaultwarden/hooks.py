@@ -228,6 +228,22 @@ class ExecutionSecretScope:
         with self._lock:
             return len(self._values)
 
+    def retained_values(self) -> list[str]:
+        """Snapshot copy of the plaintexts this OPEN scope still retains.
+
+        AUD-02 (v0.6.5): consumed by the authoritative
+        ``transform_tool_result`` redactor so exact-value scrubbing keeps
+        working even when the host dispatches the transformer on a
+        different context/thread than the middleware (ContextVar/task-store
+        blind spot). A closed scope returns an empty list — released
+        references must never re-enter redaction through a stale handle.
+        Never logs the values.
+        """
+        with self._lock:
+            if self._closed:
+                return []
+            return list(self._values)
+
 
 #: Active execution scope per context (one tool execution == one scope).
 _execution_secret_scope: contextvars.ContextVar["ExecutionSecretScope | None"] \
@@ -715,6 +731,16 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
         # AFTER transform_tool_result authoritative redaction has run.
         if scoped_retained_out is not None:
             scoped_retained_out.append(value)
+        # AUD-02 belt-and-braces: mirror the plaintext into the task-keyed
+        # injected-secret store when a task id attributes this execution.
+        # The store is dropped by take_task_secrets() in the middleware
+        # finally block, so this never grows unboundedly; it keeps the
+        # authoritative transform_tool_result exact-value scrubbing working
+        # even when the host dispatches hooks on a different context than
+        # the middleware (ContextVar blind spot). Never logged.
+        if task_id:
+            with _INJECTED_LOCK:
+                _INJECTED_SECRETS.setdefault(task_id, []).append(value)
     else:
         # No active execution scope (legacy/direct callers): fall back to
         # PROCESS-scoped retention so the value stays redactable; the
