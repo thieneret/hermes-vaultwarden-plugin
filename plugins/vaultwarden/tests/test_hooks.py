@@ -7,6 +7,7 @@ through to next_call with byte-identical args.
 from __future__ import annotations
 
 import os
+import re
 import threading
 
 import pytest
@@ -115,9 +116,14 @@ def test_full_lifecycle_file_injection(mw, post, registry):
     assert t[1:] not in registry.snapshot()   # post_tool_call purged it
 
 
+#: AUD-05 phase 2: the middleware emits $(< '/quoted/path'); the bare form
+#: is still matched for robustness.
+_INJECTED_PATH_RE = re.compile(
+    r"\$\(<\s*(?:'([^']+)'|\"([^\"]+)\"|(/[^)\s]+))\)")
+
+
 def _injected_paths(command: str) -> list[str]:
-    import re
-    return re.findall(r"\$\(\< (/[^)]+)", command)
+    return [g[0] or g[1] or g[2] for g in _INJECTED_PATH_RE.findall(command)]
 
 
 def test_single_use_second_pass_left_verbatim(mw, registry):
