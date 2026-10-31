@@ -5,6 +5,14 @@ Author: **thieneret**
 
 ---
 
+## v0.6.5
+
+- feat(security): scoped redaction lifecycle for runtime secrets (AUD-02)
+- RedactingFilter now uses thread-safe reference counting so runtime secrets are released after their execution scope concludes
+- overlapping executions using the same secret no longer cause premature redaction-state removal
+- startup-injection and process-scoped secrets remain retained for the process lifetime
+- add scoped-redaction unit, concurrency, and integration tests
+
 ## v0.6.4
 
 - fix(bw-cli): restore `BW_SESSION` environment variable injection for vault read/write operations
