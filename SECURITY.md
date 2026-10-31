@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.6.5
+**Applies to:** v0.6.6
 
 ## Threat Model
 
@@ -123,6 +123,7 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 | `secrets.yaml` pre-parse validation | Before bootstrap secret parsing, `secrets.yaml` is validated as an absolute path, regular file, non-symlink, owned by the current effective UID, with no group/other access bits. An existing but insecure `secrets.yaml` is never parsed. |
 | Lifecycle hook fail-closed registration | Critical lifecycle hooks required for cleanup and session termination are validated and registered before tools are exposed. If a required lifecycle hook cannot be registered, plugin initialization aborts. Existing `transform_tool_result` and `tool_execution` fail-closed behavior remains unchanged. |
 | Scoped redaction lifecycle | Runtime secrets registered with the RedactingFilter are retained only for active execution scopes using thread-safe reference counting. Overlapping executions sharing a secret do not cause premature removal. Process-scoped secrets remain retained for the process lifetime. |
+| Shell-safe secret file injection | Injected temporary secret-file paths are shell-quoted (shlex.quote) before command substitution to prevent command injection from unsafe runtime directory paths. Control-character paths fail closed. SEC-02 single-temp-file and $-prefix fail-safe semantics preserved. |
 
 ### File-injected Placeholder Injection (VWP-04) — Crash Recovery (VWP-20)
 
@@ -223,6 +224,7 @@ The plugin's security controls are validated by dedicated test suites:
 | Filesystem hardening tests | Symlink rejection, ownership enforcement, permission enforcement, plugin load failure, `.bw-data` blocking, insecure `secrets.yaml` rejection | AUD-03 / AUD-04 / AUD-08 |
 | Lifecycle hook registration tests | Missing or failing required lifecycle hook registration refuses plugin load; successful registration loads the plugin | AUD-06 |
 | Scoped redaction tests | Execution-scoped retain/release lifecycle, overlapping same-secret executions, process-scoped secret retention, and redactor baseline restoration | AUD-02 |
+| Shell-escape injection tests | Malicious runtime-directory names (spaces, ;, $, backticks, quotes, newlines) produce safe quoted substitutions; control-character paths fail closed; SEC-02 and fail-safe preserved | AUD-05 |
 | Session key injection regression tests | `BW_SESSION` reaches the isolated subprocess env (explicit + AuthManager fallback at the choke point), parent env still never inherited, session key never appears in error messages (locked → `SESSION_ERROR`, expired → `SESSION_EXPIRED`) | HOTFIX-01 (v0.6.4) |
 
 All CI checks (pytest, ruff) are **blocking** — a failing check prevents merge.
@@ -244,6 +246,9 @@ bare `__VW_SECRET_x__` internally) and must always be documented as
 double-quote-only (or unquoted) references. The middleware must inject
 secrets via a temp file ONLY (`$(< path)` rewrite); it must NEVER rewrite
 the command string with the raw secret value.
+- Injected secret-file paths must always be shell-quoted via the shared
+quoting helper (`quote_injected_path`) before command substitution; never
+interpolate a raw path into a shell command.
 - Never pass a raw secret in a tool call when `*_file` is available;
 the plugin warns (log + response `warning` field) on raw input. The response
 `warning` is an imperative instruction directing the agent to warn the user;
@@ -294,7 +299,7 @@ try/except that swallows failures. Fail-closed is mandatory.
 - All CI checks (pytest, ruff) are **blocking** — a failing check prevents
 merge. (VWP-15)
 
-## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-02 + AUD-03 + AUD-04 + AUD-06 + AUD-08 + HOTFIX-01 implemented)
+## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-02 + AUD-03 + AUD-04 + AUD-05 + AUD-06 + AUD-08 + HOTFIX-01 implemented)
 
 | ID | Description | Implemented |
 | --- | --- | --- |
@@ -305,6 +310,7 @@ merge. (VWP-15)
 | AUD-02 | Scoped redaction lifecycle — runtime secrets registered with the RedactingFilter are retained only for active execution scopes using thread-safe reference counting; overlapping executions sharing a secret are protected from premature removal; process-scoped secrets remain retained for the process lifetime | v0.6.5 |
 | AUD-03 | Secrets directory fail-closed validation at plugin load — `register()` runs `secure_fs.ensure_hardened_directory()` before any tool/hook registration; symlink / wrong owner / mode ≠ 0700 aborts activation (no partial state, no silent chmod repair) | v0.6.2 |
 | AUD-04 | `.bw-data` fail-closed validation before any `bw` invocation — shared hardened-directory validator gates `BITWARDENCLI_APPDATA_DIR` export and every `bw` subprocess call; insecure appdata dir blocks `bw` execution | v0.6.2 |
+| AUD-05 | Shell-escape injected file paths — injected secret temp-file paths are shell-quoted before command substitution; control-character runtime paths fail closed; SEC-02 and $-prefix fail-safe behavior preserved | v0.6.6 |
 | AUD-06 | Fail-closed lifecycle hook registration — required `post_tool_call` and session-end lifecycle hooks are validated and registered before tools are exposed; plugin refuses to load if a required lifecycle hook cannot be registered | v0.6.3 |
 | HOTFIX-01 | `BW_SESSION` injection regression fix — session key guaranteed at the subprocess-env choke point (`BwCli._ensure_session_env()`) for all session-requiring `bw` commands (v0.6.3 regression: empty `list`, exit 1 on `create`); sanitized stderr classification adds `SESSION_EXPIRED` vs `SESSION_ERROR`; env isolation and memory-only key handling unchanged; pinned by regression tests | v0.6.4 |
 | AUD-08 | `secrets.yaml` fail-closed filesystem validation before YAML parsing — `secure_fs.ensure_hardened_secret_file()` requires absolute path, regular non-symlink file, euid ownership, no group/other access; insecure file is NEVER parsed | v0.6.2 |

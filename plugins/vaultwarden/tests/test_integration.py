@@ -598,8 +598,19 @@ def _seed_item_password(monkeypatch, item_id: str, value: str) -> None:
 PG_ID = "aaaa1111-0000-0000-0000-000000000001"   # "Postgres prod"
 GF_ID = "aaaa1111-0000-0000-0000-000000000002"   # "Grafana" (conftest vault)
 
-#: ``$(< /abs/path)`` shell substitution produced by the middleware rewrite.
-_AUD02_SUBST_RE = _re_mod.compile(r"\$\(<\s*(/\S+)\)")
+#: ``$(< '/abs/path')`` shell substitution produced by the middleware
+#: rewrite (AUD-05 phase 2: the path is shlex-quoted; the bare form is still
+#: accepted for robustness).
+_AUD02_SUBST_RE = _re_mod.compile(
+    r"\$\(<\s*(?:'([^']+)'|\"([^\"]+)\"|(/[^)\s]+))\)")
+
+
+def _subst_path(command: str) -> str | None:
+    """Extract the temp-file path from a $(< '...') substitution fragment."""
+    m = _AUD02_SUBST_RE.search(command)
+    if m is None:
+        return None
+    return m.group(1) or m.group(2) or m.group(3)
 
 
 def _run_execution(middleware, transform, registry, item_id, secret, task_id,
@@ -609,9 +620,8 @@ def _run_execution(middleware, transform, registry, item_id, secret, task_id,
     cmd_ref = f"${entry.token}"
 
     def terminal(args: dict) -> dict:
-        m = _AUD02_SUBST_RE.search(args["command"])
-        assert m is not None, f"no $(< path) substitution: {args['command']!r}"
-        path = m.group(1)
+        path = _subst_path(args["command"])
+        assert path is not None, f"no $(< path) substitution: {args['command']!r}"
         with open(path, encoding="utf-8") as fh:
             raw = fh.read() + "\n"
         return {"output": raw} if echo_plaintext else {"output": "ok\n"}
@@ -659,7 +669,8 @@ def test_multiple_secrets_all_released_after_execution(auth_manager, registry,
 
     def terminal(args: dict) -> dict:
         outs = []
-        for p in _AUD02_SUBST_RE.findall(args["command"]):
+        for p in (x[0] or x[1] or x[2]
+                  for x in _AUD02_SUBST_RE.findall(args["command"])):
             with open(p, encoding="utf-8") as fh:
                 outs.append(fh.read())
         return {"output": "".join(outs)}
@@ -724,9 +735,8 @@ def test_overlapping_executions_same_secret_not_removed_prematurely(
         # While ANY execution is in flight, the shared secret must be active.
         active_mid = filt.has_secret(secret)
         barrier.wait()                     # force overlap of both scopes
-        m = _AUD02_SUBST_RE.search(args["command"])
-        assert m is not None, f"no $(< path) substitution: {args['command']!r}"
-        path = m.group(1)
+        path = _subst_path(args["command"])
+        assert path is not None, f"no $(< path) substitution: {args['command']!r}"
         with open(path, encoding="utf-8") as fh:
             raw = fh.read()
         outcomes[f"mid_{threading.get_ident()}"] = active_mid
@@ -773,9 +783,8 @@ def test_three_overlapping_executions_refcount_tracks_holders_exactly(
         with lock:
             order.append(f"in-{tid}")
         ready.wait()                      # all three scopes are live here
-        m = _AUD02_SUBST_RE.search(args["command"])
-        assert m is not None, f"no $(< path) substitution: {args['command']!r}"
-        path = m.group(1)
+        path = _subst_path(args["command"])
+        assert path is not None, f"no $(< path) substitution: {args['command']!r}"
         with open(path, encoding="utf-8") as fh:
             assert fh.read() == secret
         return {"output": "ok\n"}
@@ -865,9 +874,8 @@ def test_transform_redacts_when_dispatched_after_middleware_frame(
     entry = registry.create(PG_ID, "password")
 
     def terminal(args: dict) -> dict:
-        m = _AUD02_SUBST_RE.search(args["command"])
-        assert m is not None, f"no $(< path) substitution: {args['command']!r}"
-        path = m.group(1)
+        path = _subst_path(args["command"])
+        assert path is not None, f"no $(< path) substitution: {args['command']!r}"
         with open(path, encoding="utf-8") as fh:
             return {"output": fh.read() + "\n"}
 

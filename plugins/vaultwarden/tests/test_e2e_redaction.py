@@ -60,9 +60,18 @@ FAKE_ITEM_ID = "aaaa1111-0000-0000-0000-000000000001"
 #: scans for inside terminal commands).
 CMD_REF_RE = re.compile(r"\$(__VW_SECRET_[0-9a-f]{12}__)")
 
-#: ``$(< /abs/path/to/temp/file)`` shell substitution produced by the
-#: middleware rewrite.
-SUBST_RE = re.compile(r"\$\(<\s*(/\S+)\)")
+#: ``$(< '/abs/path/to/temp/file')`` shell substitution produced by the
+#: middleware rewrite (AUD-05 phase 2: the path is shlex-quoted; the bare
+#: form is still accepted for robustness).
+SUBST_RE = re.compile(r"\$\(<\s*(?:'([^']+)'|\"([^\"]+)\"|(/[^)\s]+))\)")
+
+
+def _subst_path(command: str) -> str | None:
+    """Extract the temp-file path from a $(< '...') substitution fragment."""
+    m = SUBST_RE.search(command)
+    if m is None:
+        return None
+    return m.group(1) or m.group(2) or m.group(3)
 
 
 class _RaisingTransformCtx(RecordingCtx):
@@ -163,9 +172,8 @@ def test_e2e_leaky_cat_redaction(auth_manager: AuthManager, registry: Placeholde
         reads the injected temp file (what ``cat``/shell substitution would
         do) and returns the raw stdout."""
         command = args["command"]
-        m = SUBST_RE.search(command)
-        assert m is not None, f"no $(< path) substitution in rewritten command: {command!r}"
-        path = m.group(1)
+        path = _subst_path(command)
+        assert path is not None, f"no $(< path) substitution in rewritten command: {command!r}"
         captured["rewritten_command"] = command
         captured["temp_file_path"] = path
         assert os.path.exists(path), "middleware must create the temp file before next_call"

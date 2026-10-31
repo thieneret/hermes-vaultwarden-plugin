@@ -76,7 +76,7 @@ from . import errors
 from .auth import AuthManager
 from .placeholders import PlaceholderRegistry
 from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
-from .security import get_logger, get_redacting_filter
+from .security import get_logger, get_redacting_filter, quote_injected_path
 from .tools import _field_value
 
 log = get_logger("hooks")
@@ -842,14 +842,47 @@ def make_placeholder_resolver(auth: AuthManager,
                 if not unique_suffixes:
                     continue
                 # 2. Atomic resolution loop: one consume + one temp file each.
+                # AUD-05 (phase 2): the resolved path is embedded through the
+                # shell-safe quoting helper -- exactly ONCE per UNIQUE token --
+                # producing a $(< '/quoted/path') fragment. The same fragment
+                # string is reused for EVERY occurrence of that token in step
+                # 3 below, so SEC-02 single-temp-file semantics are unchanged.
                 replacements: dict[str, str] = {}
+                unsafe_path = False
                 for suffix in unique_suffixes:
                     path = _resolve_placeholder_token(
                         suffix, auth, registry, secrets_dir, temp_files,
                         task_id, injected_values, task_errors, scope=_scope)
                     if path is None:
                         continue  # unknown/expired/used -> leave verbatim
-                    replacements[f"$__VW_SECRET_{suffix}__"] = f"$(< {path})"
+                    try:
+                        fragment = quote_injected_path(path)
+                    except ValueError as exc:
+                        # AUD-05 fail-closed: a control-character runtime dir
+                        # is misconfigured or adversarial. NEVER fall back to
+                        # an unquoted interpolation; abort the injection for
+                        # this command instead. Sanitized error only: the
+                        # exception message carries the character class, and
+                        # we log just the directory STRUCTURE (never any
+                        # secret value or temp-file content).
+                        unsafe_path = True
+                        log.error("fail-closed: refusing to inject secret "
+                                  "path for %s (%s); secrets directory "
+                                  "structure rejected: %r", tool_name, exc,
+                                  secrets_dir)
+                        task_errors.append(
+                            errors.PlaceholderError(
+                                "Secret injection blocked: the runtime "
+                                "secrets directory path failed shell-safety "
+                                "validation (fail-closed).").to_dict())
+                        break
+                    replacements[f"$__VW_SECRET_{suffix}__"] = fragment
+                if unsafe_path:
+                    # Leave every token verbatim ($__VW_SECRET_x__ expands to
+                    # an empty string in the shell -- fail-safe, no leak) and
+                    # run the untouched command. The finally block still
+                    # unlinks any temp files created before the abort.
+                    return next_call(args)
                 # 3. Global replacement: ALL occurrences map to the same file.
                 new_command = command
                 for ref, sub in replacements.items():

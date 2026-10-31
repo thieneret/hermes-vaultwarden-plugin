@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.6.5**
+**Current version: v0.6.6**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -328,6 +328,7 @@ mkdir -m 700 /path/to/real-dir
 | Filesystem hardening | Secrets dir, `.bw-data`, and `secrets.yaml` validated via `secure_fs.py` before use. Symlinks, wrong owners, and loose permissions abort execution. |
 | Lifecycle hook fail-closed registration | Critical lifecycle hooks are validated before tools are exposed; plugin refuses to load if required hook registration fails. |
 | Scoped log-redaction lifecycle | Runtime secrets are retained only for active execution scopes and released afterward using reference-counted redaction. Process-scoped secrets remain protected for the process lifetime. |
+| Shell-safe secret file injection | Injected temporary secret-file paths are shell-quoted before command substitution to prevent command injection from unsafe runtime directory paths. |
 
 See SECURITY.md for the full threat model and all security controls.
 
