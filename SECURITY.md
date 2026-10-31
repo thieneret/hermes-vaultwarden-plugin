@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.6.6
+**Applies to:** v0.6.7
 
 ## Threat Model
 
@@ -299,7 +299,7 @@ try/except that swallows failures. Fail-closed is mandatory.
 - All CI checks (pytest, ruff) are **blocking** — a failing check prevents
 merge. (VWP-15)
 
-## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-02 + AUD-03 + AUD-04 + AUD-05 + AUD-06 + AUD-08 + HOTFIX-01 implemented)
+## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-02 + AUD-03 + AUD-04 + AUD-05 + AUD-06 + AUD-07 + AUD-08 + HOTFIX-01 implemented/rejected)
 
 | ID | Description | Implemented |
 | --- | --- | --- |
@@ -312,6 +312,7 @@ merge. (VWP-15)
 | AUD-04 | `.bw-data` fail-closed validation before any `bw` invocation — shared hardened-directory validator gates `BITWARDENCLI_APPDATA_DIR` export and every `bw` subprocess call; insecure appdata dir blocks `bw` execution | v0.6.2 |
 | AUD-05 | Shell-escape injected file paths — injected secret temp-file paths are shell-quoted before command substitution; control-character runtime paths fail closed; SEC-02 and $-prefix fail-safe behavior preserved | v0.6.6 |
 | AUD-06 | Fail-closed lifecycle hook registration — required `post_tool_call` and session-end lifecycle hooks are validated and registered before tools are exposed; plugin refuses to load if a required lifecycle hook cannot be registered | v0.6.3 |
+| AUD-07 | Runtime version disclosure — investigated and **rejected as false positive**. The `bw` CLI version log (`bw_cli.py`) is intentional for operational diagnostics and audit traceability. Erroneous coding-agent rules prohibiting version/audit codes in runtime logs were removed from `hooks.py` docstring. | v0.6.7 (rejected) |
 | HOTFIX-01 | `BW_SESSION` injection regression fix — session key guaranteed at the subprocess-env choke point (`BwCli._ensure_session_env()`) for all session-requiring `bw` commands (v0.6.3 regression: empty `list`, exit 1 on `create`); sanitized stderr classification adds `SESSION_EXPIRED` vs `SESSION_ERROR`; env isolation and memory-only key handling unchanged; pinned by regression tests | v0.6.4 |
 | AUD-08 | `secrets.yaml` fail-closed filesystem validation before YAML parsing — `secure_fs.ensure_hardened_secret_file()` requires absolute path, regular non-symlink file, euid ownership, no group/other access; insecure file is NEVER parsed | v0.6.2 |
 | VWP-01 | Binary path pinning (hash verification = operator responsibility) | v0.4.7 |
