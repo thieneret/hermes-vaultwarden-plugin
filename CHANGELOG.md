@@ -5,6 +5,14 @@ Author: **thieneret**
 
 ---
 
+## v0.6.8
+
+- fix(status): close root-cause status reporting bugs in `vaultwarden_status`
+- Capability fields (`session_key_available`, `operational`, `session_active`) now use the authoritative `UNLOCKED ∧ key ∧ expiry` predicate — no longer over-report capability when a stale key lingers
+- `h_status` now triggers recovery-on-read (`ensure_authenticated()` / `get_session()`) before snapshotting, so status reflects post-recovery state
+- Preserve additive fields (`session_key_available`, `operational`, `bw_profile_state`) and full backward compatibility
+- Add regression tests for stale-key, expired-session, recovery-on-read, and graceful-recovery-failure scenarios
+
 ## v0.6.7
 
 - chore(security): AUD-07 resolved as false positive — `bw` CLI version logging is intentional and remains

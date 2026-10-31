@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.6.7**
+**Current version: v0.6.8**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -220,7 +220,7 @@ The plugin exposes 12 tools to the Hermes agent. The LLM constructs the exact to
 
 | Tool | Purpose | Requires `allow_write` |
 | --- | --- | :-: |
-| `vaultwarden_status` | Plugin health: auth state, session, server config, plugin version | ❌ |
+| `vaultwarden_status` | Plugin health: auth state, session, server config, plugin version. Distinguishes the plugin's actual operational capability (`operational`, `session_key_available`) from the Bitwarden CLI persistent-profile state (`bw_profile_state`, which normally reads `locked` by design) | ❌ |
 | `vaultwarden_sync` | Sync vault (`force=true` bypasses auto-sync interval) | ❌ |
 | `vaultwarden_list` | List items — metadata only | ❌ |
 | `vaultwarden_search` | Search items by name/username/uri — metadata only | ❌ |
