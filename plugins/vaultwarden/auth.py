@@ -76,8 +76,13 @@ class AuthManager:
         # RedactingFilter FIRST — before any attribute assignment or log call
         # can possibly echo them. Everything below is scrubbed from here on.
         redactor = get_redacting_filter()
-        redactor.register_secret(client_secret)
-        redactor.register_secret(master_password)
+        # AUD-02 (phase 2): bootstrap credentials are PROCESS-SCOPED — they
+        # live for the whole process and must never be dropped by an
+        # execution-scoped release. register_process_scoped_secret is
+        # idempotent (permanent marking never inflates refcounts), so Auth
+        # Manager constructions across a test suite / session can no longer
+        # accumulate phantom references on these values.        redactor.register_process_scoped_secret(client_secret)
+        redactor.register_process_scoped_secret(master_password)
         self._bw = bw
         self._config = config
         self._client_id = config.client_id

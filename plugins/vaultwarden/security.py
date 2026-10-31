@@ -332,15 +332,27 @@ class RedactingFilter(logging.Filter):
 
 
 #: shared filter instance used by all plugin modules.
-#: AUD-02 (phase 2): resolved LAZILY through :func:`get_redacting_filter`
-#: only. Module-level singletons must NOT eagerly capture the shared
-#: instance, because tests isolate suites by swapping
-#: ``vaultwarden.security._shared_filter`` — an eager module global would
-#: pin a stale instance and silently break that isolation.
+#: AUD-02 (phase 2): created EAGERLY at import (exactly one instance per
+#: process for production code) but always resolved through
+#: :func:`get_redacting_filter`. Tests isolate suites by swapping
+#: ``vaultwarden.security._shared_filter`` via monkeypatch — consumers must
+#: therefore never cache the instance in their own module globals.
+#:
+#: AUD-02 (phase 2): bootstrap credentials are registered PROCESS-SCOPED
+#: exactly ONCE, at the single production entry point
+#: (``vaultwarden.register()``, see __init__.py), right after
+#: ``load_secrets()`` returns them — BEFORE any ``AuthManager`` exists, so
+#: even a failing bootstrap cannot echo them. ``AuthManager.__init__`` keeps
+#: calling :meth:`RedactingFilter.register_process_scoped_secret` with the
+#: same values afterwards; that call is IDEMPOTENT (permanent marking never
+#: inflates refcounts) which prevents the phantom-refcount / unbounded
+#: retention accumulation plain ``register_secret`` would cause across many
+#: manager constructions.
 _shared_filter = RedactingFilter()
 
 
 def get_redacting_filter() -> RedactingFilter:
+    """Return the process-wide RedactingFilter singleton."""
     return _shared_filter
 
 

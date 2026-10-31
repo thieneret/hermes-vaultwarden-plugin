@@ -35,7 +35,7 @@ from .hooks import (
 )
 from .placeholders import PlaceholderRegistry
 from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
-from .security import get_logger
+from .security import get_logger, get_redacting_filter
 from .tools import get_tools
 
 log = get_logger("init")
@@ -137,6 +137,15 @@ def register(ctx: Any) -> bool:
     except Exception as exc:
         log.warning("Vaultwarden plugin load FAILED: bootstrap secrets missing: %s", exc)
         return False
+    # AUD-02 (phase 2): register the bootstrap credentials PROCESS-SCOPED
+    # exactly once, at the single production entry point, BEFORE anything
+    # else can echo them. Permanent marking is idempotent — AuthManager's
+    # own registration of the same values stays a no-op on refcounts, so
+    # repeated manager constructions can never accumulate phantom
+    # references (no unbounded global retention).
+    _redactor = get_redacting_filter()
+    _redactor.register_process_scoped_secret(client_secret)
+    _redactor.register_process_scoped_secret(master_password)
     log.info("Bootstrap secrets loaded from %s (never entered OS env)",
              f"{hermes_home}/plugins/vaultwarden/secrets.yaml")
 
