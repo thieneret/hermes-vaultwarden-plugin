@@ -142,7 +142,13 @@ class ExecutionSecretScope:
 
     def __init__(self, redactor: Any,
                  values: "frozenset[str] | list[str] | None" = None) -> None:
-        self._redactor = redactor
+        # AUD-02 (phase 2): the redactor is resolved LAZILY on every use —
+        # never cached as an instance attribute. Tests isolate suites by
+        # swapping vaultwarden.security._shared_filter after the scope was
+        # constructed; a captured reference would retain the stale instance
+        # and register secrets into a filter nobody consults any more.
+        # Production behaviour is unchanged (the singleton is stable).
+        self._default_redactor = redactor
         self._values: set[str] = set(values or ())
         self._closed = False
         self._lock = threading.Lock()
@@ -155,6 +161,20 @@ class ExecutionSecretScope:
         # retention: the set lives only for the duration of this scope and
         # is cleared exactly once when close() runs.
         self._injected: frozenset[str] = frozenset(self._values)
+
+    # -------------------------------------------------------- redactor pin
+    def _get_redactor(self) -> Any:
+        """Resolve the shared RedactingFilter at USE time (never cached).
+
+        Falls back to the constructor-supplied instance only if the module
+        import of ``get_redacting_filter`` is unavailable (defensive; tests
+        monkeypatch it to a fresh isolated filter and expect the scope to
+        follow that swap instead of writing into a stale singleton).
+        """
+        try:
+            return get_redacting_filter()
+        except Exception:  # pragma: no cover - defensive
+            return self._default_redactor
 
     # ------------------------------------------------------------- retain
     def retain(self, value: str) -> None:
