@@ -20,7 +20,7 @@ key storage and ssh-agent integration.
 ## Features
 
 - **12 registered tools** covering vault read/write, secret references, and SSH key management
-- **Placeholder injection** — raw secrets never enter the agent's context window
+- **Placeholder injection** — on the READ path (vault → agent), raw secrets never enter the agent's context window; only opaque placeholder tokens are returned
 - **SSH key management** — store private keys as vault attachments, load them into ssh-agent on demand
 - **Bitwarden CLI integration** — all vault operations go through the audited `bw` binary
 - **Session isolation** — the Bitwarden session key lives only in plugin memory, never on disk
@@ -50,11 +50,11 @@ key storage and ssh-agent integration.
 Copy the plugin directory into your Hermes plugins folder:
 
 ```bash
-cp -r plugins/vaultwarden ~/.hermes/plugins/vaultwarden
+cp -r plugins/vaultwarden $HERMES_HOME/plugins/vaultwarden
 ```
 
-Then configure `~/.hermes/config.yaml` (see Configuration section)
-and restart Hermes.
+Then configure `$HERMES_HOME/config.yaml` (see Configuration section)
+and restart Hermes. `$HERMES_HOME` defaults to `~/.hermes`.
 
 ### Development & Testing
 
@@ -124,9 +124,9 @@ Setup: copy the shipped template, fill in the values, and lock down
 permissions:
 
 ```bash
-mkdir -p ~/.hermes/plugins/vaultwarden
-cp plugins/vaultwarden/secret.yaml.template ~/.hermes/plugins/vaultwarden/secrets.yaml
-chmod 600 ~/.hermes/plugins/vaultwarden/secrets.yaml
+mkdir -p $HERMES_HOME/plugins/vaultwarden
+cp plugins/vaultwarden/secret.yaml.template $HERMES_HOME/plugins/vaultwarden/secrets.yaml
+chmod 600 $HERMES_HOME/plugins/vaultwarden/secrets.yaml
 # then edit secrets.yaml:
 #   client_secret: "your-client-secret"
 #   master_password: "your-master-password"
@@ -240,7 +240,7 @@ The plugin exposes 12 tools to the Hermes agent. The LLM constructs the exact to
 
 ## Placeholder Injection (security model)
 
-Raw secrets are never exposed to the agent's context window or terminal history. Instead, the plugin uses a file-based injection architecture:
+On the **READ path** (vault → agent), raw secrets are never exposed to the agent's context window or terminal history. Instead, the plugin uses a file-based injection architecture:
 
 1. The LLM requests a single-use placeholder token (e.g., `$__VW_SECRET_xxxx__`) via `vaultwarden_get_secret_ref`.
 2. The LLM embeds this token inside a terminal command (e.g., `curl -H "Bearer $__VW_SECRET_xxxx__"`).
@@ -251,6 +251,8 @@ Raw secrets are never exposed to the agent's context window or terminal history.
 - Placeholders are **single-use** and expire after `placeholder_ttl_seconds`.
 - The placeholder reference MUST be double-quoted (or unquoted) — never single quotes — so the shell expands the `$(< path)` substitution.
 - If a command references the same placeholder multiple times, the middleware resolves it exactly once and creates a single temp file.
+
+> **EXCEPTION — WRITE path (agent → vault):** when the LLM supplies a raw secret directly to `vaultwarden_store` / `vaultwarden_update` (or their SSH variants) via the `password` / `pass` parameters, that secret DOES enter the LLM context and chat history. See [Secret input channels](#secret-input-channels) below for the secure alternatives.
 
 ## SSH Key Management
 
@@ -266,6 +268,8 @@ When creating or updating secrets (passwords or SSH passphrases), the LLM can su
 
 1. **Owner-only file (Secure):** A path to a file holding the secret (`password_file` / `pass_file`). The file must be readable only by the owner (`chmod 600`). The secret is read directly from disk and never enters the LLM context or chat history.
 2. **Raw value (Insecure):** The secret is passed directly as a string. The plugin accepts it but emits a strict security warning in both the logs and the tool response, instructing the agent to warn the user.
+
+> **Note:** This is the only path where a secret can enter the LLM context. On the READ path (vault → agent), secrets never enter the context window — see [Placeholder Injection](#placeholder-injection-security-model) above.
 
 ## Filesystem Security Requirements
 
