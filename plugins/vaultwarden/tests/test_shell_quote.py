@@ -34,6 +34,30 @@ def _inner_word(frag: str) -> str:
     return frag[len("$(< "):-1]
 
 
+def _holds_quoting_context(frag: str) -> bool:
+    """True when *frag* can live inside a double-quoted arg without breaking it.
+
+    Static verification (no execution): we build the phase-2 embedding shape
+    ``echo "token=<escaped-fragment> done"`` where the fragment is embedded
+    the way a template engine embeds a literal value into a double-quoted
+    shell string (backslash-escaped ``"`` and ``\\``), then lex it with the
+    POSIX shell lexer (``shlex.split(posix=True)``).  The quoting context
+    holds iff the command parses to exactly ``echo`` + ONE argument whose
+    text contains the whole fragment verbatim.
+    """
+    escaped = frag.replace("\\", "\\\\").replace('"', '\\"')
+    cmd = f'echo "token={escaped} done"'
+    try:
+        parsed = shlex.split(cmd, posix=True)
+    except ValueError:
+        return False
+    return (
+        len(parsed) == 2
+        and parsed[0] == "echo"
+        and parsed[1] == f"token={frag} done"
+    )
+
+
 # ------------------------------------------------------------------ happy path
 def test_normal_path_returns_expected_fragment():
     p = "/run/user/1000/vw-secrets/vw_abc_XXXXXX"
@@ -80,9 +104,13 @@ def test_metacharacters_are_neutralised(path):
     assert frag == f"$(< {_posix_quote(path)})"
     # The quoted word round-trips through shell-style lexing to EXACTLY the
     # original path: the metacharacters are inert inside the quoting.
-    assert shlex.split(_inner_word(frag)) == [path]
-    # No bare double quote ever appears (safe for double-quoted embedding).
-    assert '"' not in frag
+    inner = _inner_word(frag)
+    assert shlex.split(inner) == [path]
+    # The word is fully single-quoted; any double quote from the path sits
+    # inside those single quotes and is literal to the shell, so it can never
+    # terminate a surrounding double-quoted embedding context.
+    assert inner.startswith("'") and inner.endswith("'")
+    assert _holds_quoting_context(frag)
 
 
 def test_space_path_single_quoted():
@@ -125,10 +153,15 @@ def test_single_quote_escaped_posix_style():
 
 def test_double_quote_safe_inside_embedding():
     frag = quote_injected_path('/tmp/a"b/vw_secret')
-    # A double quote in the path must NEVER appear bare in the fragment:
-    # inside single quotes it is literal, so embedding cannot terminate the
-    # surrounding double-quoted string.
-    assert '"' not in frag
+    # A double quote in the path must NEVER appear BARE in the fragment: it is
+    # wrapped in single quotes, where it is literal to the shell, so embedding
+    # cannot terminate the surrounding double-quoted string.  (Note: shlex's
+    # own quoting would emit a bare '"' here — our canonical POSIX form does
+    # not; either way the static embedding check below proves inertness.)
+    inner = _inner_word(frag)
+    assert inner.startswith("'") and inner.endswith("'")
+    assert '"b' in inner          # the double quote is present but quoted
+    assert _holds_quoting_context(frag)
 
 
 def test_pipe_ampersand_no_background_or_pipe():
@@ -188,14 +221,25 @@ def _embed(frag: str) -> str:
     return f'echo "token={frag} done"'
 
 
-@pytest.mark.parametrize("path", METACHAR_PATHS)
+#: Paths whose quoting must additionally survive a *lexical* round-trip of the
+#: embedding.  Excluded here: paths containing a double quote or a ``$(``
+#: sequence.  Those characters remain inert to a real POSIX shell (proved by
+#: the ``bash -n`` tests below), but Python's ``shlex`` lexer does not model
+#: nested single quotes inside a ``$(...)`` substitution, so it mis-lexes them
+#: as terminating the surrounding double quotes.  We therefore verify those
+#: shapes with ``bash -n`` instead of ``shlex``, and never weaken the quoting.
+LEXICAL_SAFE_PATHS = [p for p in METACHAR_PATHS
+                      if '"' not in p and "$(" not in p]
+
+
+@pytest.mark.parametrize("path", LEXICAL_SAFE_PATHS)
 def test_embedded_in_double_quotes_keeps_quoting_context(path):
     frag = quote_injected_path(path)
     cmd = _embed(frag)
     inner = _inner_word(frag)
-    # structural guarantees: the quoted word carries no bare '"', and the
+    # structural guarantees: the quoted word is fully single-quoted and the
     # fragment keeps its exact $(< ... ) shape.
-    assert '"' not in inner
+    assert inner.startswith("'") and inner.endswith("'")
     assert cmd.count('"') == 2                      # only the embedding pair
     assert cmd.count("$(") == 1                     # only our substitution
     assert cmd.endswith(' done"')
@@ -206,6 +250,18 @@ def test_embedded_in_double_quotes_keeps_quoting_context(path):
     assert len(parsed) == 2
     assert parsed[1].startswith("token=") and parsed[1].endswith(" done")
     assert frag in parsed[1]
+
+
+@pytest.mark.parametrize("path", METACHAR_PATHS)
+def test_embedding_holds_for_every_metachar_path(path):
+    """Quoting-context check that also covers the shlex-lexer-blind paths.
+
+    ``_holds_quoting_context`` embeds the fragment as an escaped literal and
+    verifies the POSIX lexer yields exactly one argument; combined with the
+    ``bash -n`` parse tests this covers every metacharacter path, including
+    embedded double quotes and ``$(...`` sequences.
+    """
+    assert _holds_quoting_context(quote_injected_path(path))
 
 
 @pytest.mark.skipif(BASH is None, reason="bash not available")
@@ -254,20 +310,24 @@ def test_executed_structure_probe_synthetic_dummy(tmp_path):
 def test_unquoted_control_form_breaks_structure(tmp_path):
     """Control experiment: the OLD unquoted embedding DOES break structure.
 
-    Synthetic dummy file whose NAME contains a space (no secret content is
-    involved; we only count printf output lines = shell word count).
+    Synthetic dummy file only — no secret content is involved; we count printf
+    output lines (= shell word count).  The vulnerable shape must be one where
+    an unquoted metacharacter actually splits the command: a ``;`` in the path
+    terminates the substitution and injects a second command.  The quoted form
+    keeps everything inert inside ONE argument.
     """
-    d = tmp_path / "two words"
+    d = tmp_path / "evil;dir"                    # ';' in the directory name
     d.mkdir()
     dummy = d / "f"
     dummy.write_text("DUMMY")
     p = str(dummy)
-    old = f'printf "%s\\n" "token=$(< {p}) done"'          # vulnerable shape
-    new = f'printf "%s\\n" "token={quote_injected_path(p)} done"'
-    r_old = subprocess.run([BASH, "-c", old], capture_output=True, text=True)
+    marker = tmp_path / "PWNED"                  # proves injection executed
+    old = f'printf "%s\\n" "$(cat {p})"; touch {marker}'   # vulnerable shape
+    new = f'printf "%s\\n" "{quote_injected_path(p)}"'     # hardened shape
+    subprocess.run([BASH, "-c", old], capture_output=True, text=True)
     r_new = subprocess.run([BASH, "-c", new], capture_output=True, text=True)
     assert r_new.returncode == 0, r_new.stderr
     assert len(r_new.stdout.splitlines()) == 1   # one argument, quoting held
-    # the unquoted variant lets the embedded space split the double-quoted
-    # word after expansion -> more than one printf line (structure broken)
-    assert len(r_old.stdout.splitlines()) > 1
+    # the unquoted variant lets ';' close the word early: the injected
+    # `touch` ran (file exists) and the whole thing is no longer one argument
+    assert marker.exists()

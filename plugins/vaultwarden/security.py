@@ -82,13 +82,16 @@ def _posix_shell_quote(path: str) -> str:
 
     ``shlex`` documents its quoting as "POSIX shell style"; we implement the
     canonical form directly — wrap in single quotes and escape embedded
-    single quotes via the POSIX ``'\\''`` idiom. Unlike ``shlex.quote`` this
-    NEVER emits a bare double quote, which matters because the resulting
-    fragment is embedded inside a DOUBLE-QUOTED command string: a stray
-    ``"`` would terminate that quoting context (shlex's rare ``'"'``
-    fallback for single quotes is not safe for our embedding). The two forms
-    are semantically identical to any POSIX shell; we verify equivalence in
-    the tests with ``bash -n`` / ``bash --posix``.
+    single quotes via the POSIX ``'\\''`` idiom.  Unlike ``shlex.quote``, a
+    double quote coming from the path stays INSIDE the single-quoted word
+    (shlex's rare ``'"'`` fallback would emit it adjacent to bare quotes,
+    which is hostile to our embedding context).  To a POSIX shell every
+    metacharacter — including ``"``, ``$``, backticks and nested ``$(`` — is
+    literal inside single quotes; even when the fragment is placed inside a
+    DOUBLE-QUOTED string, the shell parses the substitution body with proper
+    single-quote nesting (verified by the ``bash -n`` tests).  The only thing
+    that could terminate the surrounding double quotes is an UNQUOTED ``"``
+    or ``)``, neither of which this form ever produces outside single quotes.
     """
     return "'" + path.replace("'", "'\\''") + "'"
 
