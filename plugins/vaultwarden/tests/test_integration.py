@@ -551,3 +551,331 @@ def test_register_succeeds_when_middleware_registration_works(monkeypatch, tmp_p
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     assert ok is True
     assert [k for k, _ in ctx.middleware] == ["tool_execution"]
+
+
+# ===========================================================================
+# AUD-02 (phase 2): execution-scoped secret retention through the FULL
+# middleware -> transform_tool_result lifecycle. Assertions use the direct
+# redactor observability API (active_secret_count / has_secret) — never
+# process-memory measurements, never secret values in logs.
+# ===========================================================================
+
+import threading  # noqa: E402
+
+from vaultwarden.hooks import (  # noqa: E402
+    make_placeholder_resolver,
+    make_result_redactor,
+)
+from vaultwarden.security import RedactingFilter, get_redacting_filter  # noqa: E402
+
+
+def _isolated_filter(monkeypatch) -> RedactingFilter:
+    """Swap the shared filter for a fresh instance (restored by monkeypatch)."""
+    filt = RedactingFilter()
+    monkeypatch.setattr("vaultwarden.security._shared_filter", filt,
+                        raising=True)
+    monkeypatch.setattr("vaultwarden.hooks.get_redacting_filter",
+                        lambda: filt, raising=True)
+    return filt
+
+
+def _seed_item_password(monkeypatch, item_id: str, value: str) -> None:
+    """Make fake-bw item *item_id* carry *value* as its login password."""
+    from vaultwarden.auth import AuthManager
+    real_get_item = AuthManager.get_item
+
+    def patched_get_item(self, query: str) -> dict:
+        item = dict(real_get_item(self, query))
+        if item.get("id") == item_id:
+            login = dict(item.get("login") or {})
+            login["password"] = value
+            item["login"] = login
+        return item
+
+    monkeypatch.setattr(AuthManager, "get_item", patched_get_item)
+
+
+PG_ID = "aaaa1111-0000-0000-0000-000000000001"   # "Postgres prod"
+GF_ID = "aaaa1111-0000-0000-0000-000000000002"   # "Grafana" (conftest vault)
+
+
+def _run_execution(middleware, transform, registry, item_id, secret, task_id,
+                   echo_plaintext=True):
+    """One full pipeline pass; returns (transformed_output, seen_command)."""
+    entry = registry.create(item_id, "password")
+    cmd_ref = f"${entry.token}"
+
+    def terminal(args: dict) -> dict:
+        path = args["command"].split("$(< ")[1].rstrip(")")
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read() + "\n"
+        return {"output": raw} if echo_plaintext else {"output": "ok\n"}
+
+    result = middleware("terminal", {"command": f'cat "{cmd_ref}"'}, None,
+                        terminal, task_id=task_id)
+    transformed = transform("terminal", result, task_id=task_id)
+    return transformed["output"]
+
+
+def test_single_execution_returns_redactor_to_baseline(auth_manager, registry,
+                                                       plugin_config,
+                                                       monkeypatch, tmp_path):
+    filt = _isolated_filter(monkeypatch)
+    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    secret = "AUD02-ONE-EXEC-SECRET"
+    _seed_item_password(monkeypatch, PG_ID, secret)
+    mw = make_placeholder_resolver(auth_manager, registry, plugin_config)
+    tf = make_result_redactor(auth_manager, registry, plugin_config)
+
+    baseline = filt.active_secret_count()
+    out = _run_execution(mw, tf, registry, PG_ID, secret, "aud02-single")
+    assert out == "[REDACTED]\n"                       # SEC-01 unchanged
+    assert filt.active_secret_count() == baseline      # released after scope
+
+
+def test_multiple_secrets_all_released_after_execution(auth_manager, registry,
+                                                       plugin_config,
+                                                       monkeypatch, tmp_path):
+    filt = _isolated_filter(monkeypatch)
+    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    s1, s2 = "AUD02-MULTI-SECRET-A", "AUD02-MULTI-SECRET-B"
+    _seed_item_password(monkeypatch, PG_ID, s1)
+    _seed_item_password(monkeypatch, GF_ID, s2)
+    mw = make_placeholder_resolver(auth_manager, registry, plugin_config)
+    tf = make_result_redactor(auth_manager, registry, plugin_config)
+
+    baseline = filt.active_secret_count()
+    e1 = registry.create(PG_ID, "password")
+    e2 = registry.create(GF_ID, "password")
+
+    def terminal(args: dict) -> dict:
+        outs = []
+        import re as _re
+        for p in _re.findall(r"\$\(< (/\\S+)", args["command"]):
+            with open(p, encoding="utf-8") as fh:
+                outs.append(fh.read())
+        return {"output": "".join(outs)}
+
+    result = mw("terminal",
+                {"command": f'cat "$%{e1.token[:]}$" "$%{e2.token}$"'},
+                None, terminal, task_id="aud02-multi")
+    # Both plaintexts retained DURING the execution:
+    assert filt.has_secret(s1) and filt.has_secret(s2)
+    transformed = tf("terminal", result, task_id="aud02-multi")
+    assert s1 not in transformed["output"]
+    assert s2 not in transformed["output"]
+    assert filt.active_secret_count() == baseline      # all released after
+
+
+def test_two_executions_different_scopes_release_independently(
+        auth_manager, registry, plugin_config, monkeypatch, tmp_path):
+    filt = _isolated_filter(monkeypatch)
+    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    s1, s2 = "AUD02-DIFF-SECRET-A", "AUD02-DIFF-SECRET-B"
+    _seed_item_password(monkeypatch, PG_ID, s1)
+    _seed_item_password(monkeypatch, GF_ID, s2)
+    mw = make_placeholder_resolver(auth_manager, registry, plugin_config)
+    tf = make_result_redactor(auth_manager, registry, plugin_config)
+    baseline = filt.active_secret_count()
+
+    _run_execution(mw, tf, registry, PG_ID, s1, "aud02-diff-1")
+    _run_execution(mw, tf, registry, GF_ID, s2, "aud02-diff-2")
+    # Each scope released ONLY its own secret; both gone, back to baseline.
+    assert not filt.has_secret(s1) and not filt.has_secret(s2)
+    assert filt.active_secret_count() == baseline
+
+
+def test_overlapping_executions_same_secret_not_removed_prematurely(
+        auth_manager, registry, plugin_config, monkeypatch, tmp_path):
+    """Two concurrent executions inject the SAME plaintext; the first scope
+    closing must not drop the secret while the second still holds it."""
+    filt = _isolated_filter(monkeypatch)
+    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    secret = "AUD02-OVERLAP-SHARED-SECRET"
+    _seed_item_password(monkeypatch, PG_ID, secret)
+    mw = make_placeholder_resolver(auth_manager, registry, plugin_config)
+
+    barrier = threading.Barrier(2, timeout=10)
+    outcomes: dict[str, bool] = {}
+
+    def terminal(args: dict) -> dict:
+        # While ANY execution is in flight, the shared secret must be active.
+        active_mid = filt.has_secret(secret)
+        barrier.wait()                     # force overlap of both scopes
+        path = args["command"].split("$(< ")[1].rstrip(")")
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+        outcomes[f"mid_{threading.get_ident()}"] = active_mid
+        assert raw == secret               # injection itself works
+        return {"output": "done\n"}
+
+    threads = [
+        threading.Thread(
+            target=mw,
+            args=("terminal",
+                  {"command": f'cat "$(%%s)"' % f"$" + registry.create(PG_ID, "password").token[1:]},
+                  None, terminal),
+            kwargs={"task_id": f"aud02-overlap-{i}"})
+        for i in range(2)
+    ]
+    # Build commands INSIDE each thread's args correctly instead: simpler to
+    # pre-create tokens here (registry is thread-safe).
+    tokens = [registry.create(PG_ID, "password").token for _ in range(2)]
+    threads = [
+        threading.Thread(target=mw,
+                         args=("terminal", {"command": f'cat "${t}"'},
+                               None, terminal),
+                         kwargs={"task_id": f"aud02-overlap-{i}"})
+        for i, t in enumerate(tokens)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert not any(t.is_alive() for t in threads)
+    # Both executions observed the secret active mid-flight...
+    assert len(outcomes) == 2 and all(outcomes.values())
+    # ...and after BOTH scopes closed, refcount hit zero exactly.
+    assert not filt.has_secret(secret)
+
+
+def test_three_overlapping_executions_refcount_tracks_holders_exactly(
+        auth_manager, registry, plugin_config, monkeypatch, tmp_path):
+    filt = _isolated_filter(monkeypatch)
+    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    secret = "AUD02-THREE-HOLDER-SECRET"
+    _seed_item_password(monkeypatch, PG_ID, secret)
+    mw = make_placeholder_resolver(auth_manager, registry, plugin_config)
+
+    order: list[str] = []
+    lock = threading.Lock()
+    ready = threading.Barrier(3, timeout=10)
+
+    def terminal(args: dict) -> dict:
+        tid = threading.get_ident()
+        with lock:
+            order.append(f"in-{tid}")
+        ready.wait()
+        path = args["command"].split("$(< ")[1].rstrip(")")
+        with open(path, encoding="utf-8") as fh:
+            assert fh.read() == secret
+        return {"output": "ok\n"}
+
+    tokens = [registry.create(PG_ID, "password").token for _ in range(3)]
+    threads = [threading.Thread(target=mw,
+                                 args=("terminal", {"command": f'cat "${t}"'},
+                                       None, terminal),
+                                 kwargs={"task_id": f"aud02-three-{i}"})
+               for i, t in enumerate(tokens)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert len(order) == 6 - 3            # three "in-" markers only (scopes
+    # closed after join); every holder entered while all were active
+    assert filt.has_secret.__self__ is filt
+    # After ALL three scopes closed the secret is gone — refcount tracked the
+    # three holders exactly (no premature removal happened: each terminal()
+    # read the plaintext from its temp file while every scope was live).
+    assert not filt.has_secret(secret)
+
+
+def test_exception_during_execution_still_releases_secrets(
+        auth_manager, registry, plugin_config, monkeypatch, tmp_path):
+    filt = _isolated_filter(monkeypatch)
+    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    secret = "AUD02-EXCEPTION-SECRET"
+    _seed_item_password(monkeypatch, PG_ID, secret)
+    mw = make_placeholder_resolver(auth_manager, registry, plugin_config)
+    baseline = filt.active_secret_count()
+
+    entry = registry.create(PG_ID, "password")
+
+    def boom(args: dict) -> dict:
+        assert filt.has_secret(secret)     # retained during the execution
+        raise RuntimeError("command timed out")
+
+    with pytest.raises(RuntimeError):
+        mw("terminal", {"command": f'cat "${entry.token}"'}, None, boom,
+           task_id="aud02-exc")
+    # Fail-safe release: exception path closed the scope anyway.
+    assert filt.active_secret_count() == baseline
+    assert not filt.has_secret(secret)
+
+
+def test_process_scoped_secret_survives_execution_cleanup(
+        auth_manager, registry, plugin_config, monkeypatch, tmp_path):
+    filt = _isolated_filter(monkeypatch)
+    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    startup_secret = "AUD02-PROCESS-SCOPED-VALUE"
+    filt.register_process_scoped_secret(startup_secret)
+    baseline = filt.active_secret_count()
+
+    # An execution that happens to inject the SAME value must not be able to
+    # remove the process-scoped pin when its scope closes.
+    _seed_item_password(monkeypatch, PG_ID, startup_secret)
+    mw = make_placeholder_resolver(auth_manager, registry, plugin_config)
+    tf = make_result_redactor(auth_manager, registry, plugin_config)
+    out = _run_execution(mw, tf, registry, PG_ID, startup_secret,
+                         "aud02-procscope")
+    assert out == "[REDACTED]\n"
+    assert filt.has_secret(startup_secret)          # permanence preserved
+    assert filt.active_secret_count() == baseline   # no refcount inflation
+    assert filt.redact(f"x={startup_secret}") == "x=[REDACTED]"
+
+
+def test_transform_redacts_when_dispatched_after_middleware_frame(
+        auth_manager, registry, plugin_config, monkeypatch, tmp_path):
+    """Deferred host ordering (transform AFTER frame return) keeps SEC-01."""
+    filt = _isolated_filter(monkeypatch)
+    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    secret = "AUD02-DEFERRED-TRANSFORM"
+    _seed_item_password(monkeypatch, PG_ID, secret)
+    mw = make_placeholder_resolver(auth_manager, registry, plugin_config)
+    tf = make_result_redactor(auth_manager, registry, plugin_config)
+    baseline = filt.active_secret_count()
+
+    entry = registry.create(PG_ID, "password")
+
+    def terminal(args: dict) -> dict:
+        path = args["command"].split("$(< ")[1].rstrip(")")
+        with open(path, encoding="utf-8") as fh:
+            return {"output": fh.read() + "\n"}
+
+    # Middleware call RETURNS first (scope closed)...
+    result = mw("terminal", {"command": f'cat "${entry.token}"'}, None,
+                terminal, task_id="aud02-deferred")
+    assert filt.active_secret_count() == baseline
+    # ...and only THEN does this host dispatch the authoritative transformer.
+    transformed = tf("terminal", result, task_id="aud02-deferred")
+    assert transformed["output"] == "[REDACTED]\n"
+    assert secret not in str(transformed)
+
+
+def test_no_secret_values_appear_in_logs(auth_manager, registry,
+                                         plugin_config, monkeypatch, tmp_path,
+                                         caplog):
+    filt = _isolated_filter(monkeypatch)
+    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    secret = "AUD02-LOGSAFE-SECRET"
+    _seed_item_password(monkeypatch, PG_ID, secret)
+    mw = make_placeholder_resolver(auth_manager, registry, plugin_config)
+    tf = make_result_redactor(auth_manager, registry, plugin_config)
+
+    with caplog.at_level("DEBUG"):
+        _run_execution(mw, tf, registry, PG_ID, secret, "aud02-logsafe")
+        # Trigger the missing-parent-scope fallback too (sanitized warning).
+        from vaultwarden.hooks import retain_in_execution_scope
+        retain_in_execution_scope("AUD02-ORPHAN-FALLBACK-VALUE", filt)
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert secret not in joined
+    assert "AUD02-ORPHAN-FALLBACK-VALUE" not in joined

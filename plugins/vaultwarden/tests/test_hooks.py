@@ -7,6 +7,7 @@ through to next_call with byte-identical args.
 from __future__ import annotations
 
 import os
+import threading
 
 import pytest
 
@@ -172,11 +173,32 @@ def test_secret_never_in_command_multiple_tokens(mw, registry):
 
 
 def test_redacting_filter_registered(mw, registry):
+    """AUD-02 (phase 2): the injected secret is redaction-active *during*
+    the execution scope and released once the scope closes — assert both
+    halves instead of the old post-execution global retention."""
     from vaultwarden.security import get_redacting_filter
+    redactor = get_redacting_filter()
     t = token_for(registry)
-    run_mw(mw, "terminal", {"command": f"curl -H \"X-Token: {t}\" https://api"})
-    assert get_redacting_filter().redact("leak: sup3r-s3cret-pg!") \
-        != "leak: sup3r-s3cret-pg!"
+    baseline = redactor.active_secret_count()
+
+    in_scope: list[bool] = []
+
+    def next_call(a):
+        # Authoritative SEC-01 window: while the tool body runs, the
+        # runtime secret must scrub plaintext log lines.
+        in_scope.append(
+            redactor.redact("leak: sup3r-s3cret-pg!") != "leak: sup3r-s3cret-pg!"
+        )
+        return {"output": "ran"}
+
+    mw("terminal", {"command": f"curl -H \"X-Token: {t}\" https://api"},
+       None, next_call)
+
+    assert in_scope == [True]
+    # Execution-scoped release: back to baseline after the scope closes.
+    assert redactor.active_secret_count() == baseline
+    assert redactor.redact("leak: sup3r-s3cret-pg!") \
+        == "leak: sup3r-s3cret-pg!"
 
 
 def test_other_arg_keys_supported(mw, registry):
@@ -376,3 +398,167 @@ def test_reuse_rejection_logs_warning(mw, registry, caplog):
     errs = _PENDING_ERRORS.get("sec02-reuse", [])
     assert any(e.get("error_code") == "PLACEHOLDER_ERROR" for e in errs)
     _PENDING_ERRORS.clear()
+
+
+# ------------------------------------------------- AUD-02 phase 2: scope unit
+from vaultwarden.hooks import (  # noqa: E402
+    _DEFERRED_MAX_ENTRIES,
+    ExecutionSecretScope,
+    _stash_deferred_injected,
+    clear_deferred_injected,
+    consume_deferred_injected,
+    current_execution_scope,
+    retain_in_execution_scope,
+)
+
+
+def _fresh_filter():
+    from vaultwarden.security import RedactingFilter
+    return RedactingFilter()
+
+
+def test_scope_retain_once_per_unique_value(monkeypatch):
+    from vaultwarden import security as sec_mod
+    filt = _fresh_filter()
+    monkeypatch.setattr(sec_mod, "_shared_filter", filt)
+    scope = ExecutionSecretScope(filt)
+    try:
+        scope.retain("aaaa-unique-value")
+        scope.retain("aaaa-unique-value")   # duplicate within one scope
+        assert scope.retained_count() == 1
+        assert filt.active_secret_count() == 1
+        # refcount must be exactly 1: a single release removes it.
+    finally:
+        scope.close()
+    assert filt.active_secret_count() == 0
+
+
+def test_scope_release_once_removes_after_single_retain():
+    filt = _fresh_filter()
+    scope = ExecutionSecretScope(filt)
+    scope.retain("bbbb-secret-value")
+    scope.close()
+    assert not filt.has_secret("bbbb-secret-value")
+
+
+def test_scope_two_retains_one_close_keeps_until_second_release(monkeypatch):
+    """Overlapping holders: two scopes, same secret -> removed only after both."""
+    from vaultwarden import security as sec_mod
+    filt = _fresh_filter()
+    monkeypatch.setattr(sec_mod, "_shared_filter", filt)
+    s1 = ExecutionSecretScope(filt)
+    s2 = ExecutionSecretScope(filt)
+    s1.retain("cccc-shared-secret")
+    s2.retain("cccc-shared-secret")
+    s1.close()
+    assert filt.has_secret("cccc-shared-secret")   # s2 still holds it
+    s2.close()
+    assert not filt.has_secret("cccc-shared-secret")
+
+
+def test_scope_close_is_idempotent_and_never_raises():
+    filt = _fresh_filter()
+    scope = ExecutionSecretScope(filt)
+    scope.retain("dddd-secret-value")
+    scope.close()
+    scope.close()                                   # second close: no-op
+    assert filt.active_secret_count() == 0
+
+
+def test_scope_close_releases_each_value_exactly_once(caplog):
+    filt = _fresh_filter()
+    scope = ExecutionSecretScope(filt)
+    scope.retain("eeee-secret-one")
+    scope.retain("ffff-secret-two")
+    with caplog.at_level("WARNING"):
+        scope.close()
+    # Exactly-once release => zero "unknown secret" sanitized warnings.
+    assert not [r for r in caplog.records
+                if "unknown secret" in r.getMessage()]
+    assert filt.active_secret_count() == 0
+
+
+def test_scope_early_release_no_double_release_on_close():
+    filt = _fresh_filter()
+    scope = ExecutionSecretScope(filt)
+    scope.retain("gggg-secret-value")
+    scope.early_release("gggg-secret-value")
+    assert not filt.has_secret("gggg-secret-value")
+    scope.close()                                    # must NOT double-release
+    assert filt.active_secret_count() == 0
+
+
+def test_scope_concurrent_retain_close_final_state_consistent():
+    filt = _fresh_filter()
+    values = [f"h{i:03d}-concurrent-secret" for i in range(50)]
+    scopes = [ExecutionSecretScope(filt) for _ in range(4)]
+
+    def worker(scope, chunk):
+        for v in chunk:
+            scope.retain(v)
+        scope.close()
+
+    threads = [threading.Thread(target=worker,
+                                args=(scopes[i], values[i::4]))
+               for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    # Every value retained by exactly one scope; all scopes closed.
+    assert filt.active_secret_count() == 0
+    assert not any(sc.retained_count() for sc in scopes)
+
+
+def test_scope_retain_after_close_does_not_leak():
+    filt = _fresh_filter()
+    scope = ExecutionSecretScope(filt)
+    scope.close()
+    scope.retain("iiii-late-secret")                 # fail-safe immediate release
+    assert filt.active_secret_count() == 0
+
+
+def test_scope_close_stashes_deferred_snapshot_for_transform():
+    """Hosts dispatching transform AFTER the frame still get the snapshot."""
+    filt = _fresh_filter()
+    scope = ExecutionSecretScope(filt)
+    scope._task_id = "exec-deferred-1"
+    scope.retain("jjjj-deferred-secret")
+    scope.close()
+    got = consume_deferred_injected("exec-deferred-1")
+    assert got == ["jjjj-deferred-secret"]
+    # One-shot: consumed exactly once, then gone.
+    assert consume_deferred_injected("exec-deferred-1") == []
+    # Refcounts were already released at close — no redactor leak.
+    assert filt.active_secret_count() == 0
+
+
+def test_deferred_store_bounded_and_cleared():
+    try:
+        for i in range(_DEFERRED_MAX_ENTRIES + 20):
+            _stash_deferred_injected(f"exec-{i}", frozenset({f"k{i:03d}-value"}))
+        from vaultwarden.hooks import _DEFERRED_INJECTED, _DEFERRED_LOCK
+        with _DEFERRED_LOCK:
+            assert len(_DEFERRED_INJECTED) <= _DEFERRED_MAX_ENTRIES
+        clear_deferred_injected()
+        assert consume_deferred_injected("exec-0") == []
+    finally:
+        clear_deferred_injected()
+
+
+def test_retain_without_parent_scope_fails_safe(caplog):
+    """Missing parent scope: sanitized warning, temporary local scope, no leak."""
+    from vaultwarden.security import get_redacting_filter
+    filt = get_redacting_filter()
+    baseline = filt.active_secret_count()
+    with caplog.at_level("WARNING"):
+        retain_in_execution_scope("llll-orphan-secret", filt)
+    assert filt.active_secret_count() == baseline     # nothing leaked globally
+    msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("execution secret scope" in m for m in msgs)
+    # Sanitized: the value itself never appears in ANY log record.
+    assert all("llll-orphan-secret" not in m for m in msgs)
+
+
+def test_current_execution_scope_none_outside_execution():
+    assert current_execution_scope() is None
