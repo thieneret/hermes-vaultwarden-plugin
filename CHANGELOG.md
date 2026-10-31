@@ -5,6 +5,12 @@ Author: **thieneret**
 
 ---
 
+## v0.6.7
+
+- chore(security): AUD-07 resolved as false positive — `bw` CLI version logging is intentional and remains
+- Removed erroneous coding-agent rules from hooks.py docstring that incorrectly prohibited version/audit references in runtime logs
+- Documented AUD-07 resolution in SECURITY.md
+
 ## v0.6.6
 
 - feat(security): shell-escape injected secret file paths (AUD-05)
