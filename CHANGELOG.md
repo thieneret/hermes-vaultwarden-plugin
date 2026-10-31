@@ -5,6 +5,13 @@ Author: **thieneret**
 
 ---
 
+## v0.6.6
+
+- feat(security): shell-escape injected secret file paths (AUD-05)
+- Injected temporary secret-file paths are now shell-quoted before command substitution, preventing command injection from unsafe runtime directory paths
+- Control-character runtime directory paths fail closed instead of producing unsafe substitutions
+- SEC-02 single-temp-file and $-prefix fail-safe behavior preserved
+
 ## v0.6.5
 
 - feat(security): scoped redaction lifecycle for runtime secrets (AUD-02)
