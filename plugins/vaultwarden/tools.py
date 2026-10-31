@@ -508,13 +508,32 @@ def get_tools(auth: AuthManager, config: PluginConfig,
 
     # ------------------------------------------------------------ status
     def h_status(args: dict, **kw: Any) -> str:
-        # v0.5.7 (SEC-02 companion): expose the running plugin version so
-        # operators and the LLM can verify the exact build for debugging and
-        # audit compliance. Read dynamically from plugin.yaml (single source
-        # of truth — see get_plugin_version).
-        return _guard(lambda: {"status": auth.status_snapshot(),
-                               "plugin_version": get_plugin_version(),
-                               "placeholders_active": len(registry.active_tokens())})
+        def build():
+            # Phase-2B (Bug #2 fix): recovery-on-read. Reconcile the auth
+            # state BEFORE snapshotting so vaultwarden_status reflects the
+            # POST-recovery state — exactly what operations do implicitly via
+            # get_session()/run_with_recovery(). Without this, an expired
+            # session made status report a stale "locked" picture while the
+            # very next list/store/update/delete call silently re-authenticated
+            # and succeeded (the reported inconsistency). Matches the skill
+            # contract: expect auth_state unlocked / session_active true.
+            # Guarded so a status call NEVER hard-fails if recovery itself
+            # fails (e.g. network down): we fall through to the observational
+            # snapshot, which then reports operational=false truthfully.
+            try:
+                auth.ensure_authenticated()
+            except Exception:  # noqa: BLE001 - status must degrade, not raise
+                log.debug("status reconciliation failed; reporting "
+                          "observational snapshot.")
+            # v0.5.7 (SEC-02 companion): expose the running plugin version so
+            # operators and the LLM can verify the exact build for debugging
+            # and audit compliance. Read dynamically from plugin.yaml (single
+            # source of truth — see get_plugin_version).
+            return {"status": auth.status_snapshot(),
+                    "plugin_version": get_plugin_version(),
+                    "placeholders_active": len(registry.active_tokens())}
+
+        return _guard(build)
 
     _tools.append((schemas.VAULTWARDEN_STATUS, h_status))
 

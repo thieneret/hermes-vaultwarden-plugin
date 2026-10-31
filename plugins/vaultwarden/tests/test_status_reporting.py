@@ -9,7 +9,12 @@ vaultwarden_status must clearly distinguish:
     never persisted to disk/os.environ by security design).
 
 Additive fields introduced: session_key_available, operational,
-bw_profile_state. All pre-existing fields keep their exact v0.2.6 semantics.
+bw_profile_state. Phase-2B closes the two root-cause bugs: the capability
+fields (session_key_available / operational / session_active) now share ONE
+authoritative AND-predicate (UNLOCKED ∧ key ∧ unexpired — Bug #1), and the
+vaultwarden_status handler reconciles via ensure_authenticated() BEFORE
+snapshotting so status reflects post-recovery state (Bug #2). bw_profile_state
+stays verbatim. Field names/types are unchanged for backward compatibility.
 """
 from __future__ import annotations
 
@@ -55,15 +60,21 @@ def test_operational_true_when_session_key_in_memory(bw_cli):
     assert snap["session_active"] is True
 
 
-def test_logged_in_with_key_shows_capability_despite_locked_auth_state(bw_cli):
-    """The reported symptom triple: auth_state='logged_in' while a key IS
-    held in memory. The additive fields must show the plugin is operational;
-    legacy fields keep their verbatim values for compatibility."""
+def test_logged_in_with_stale_key_is_not_operational(bw_cli):
+    """Phase-2B Bug #1 (AND-semantics): auth_state='logged_in' with a STALE
+    key lingering in memory is NOT capability — get_session_key() gates on
+    UNLOCKED, so _ensure_session_env can never inject this key. Presence-only
+    used to over-report True here; all three capability fields must be False,
+    while session_age_seconds keeps its raw numeric value."""
     mgr = _manager_with(bw_cli, AuthState.LOGGED_IN, "SKEY-stale-window-2")
     snap = mgr.status_snapshot()
     assert snap["auth_state"] == "logged_in"          # unchanged semantics
-    assert snap["session_key_available"] is True      # actual capability
-    assert snap["operational"] is True
+    assert snap["session_key_available"] is False     # AND-predicate rejects
+    assert snap["operational"] is False
+    assert snap["session_active"] is False
+    assert isinstance(snap["session_age_seconds"], float)  # raw age kept
+    # And it matches the authoritative gate itself:
+    assert mgr.get_session_key() is None
 
 
 # ---------------------------------------------------------------------------
@@ -179,3 +190,145 @@ def test_status_output_never_contains_secrets(bw_cli):
     # And the same holds in the locked case.
     mgr_locked = _manager_with(bw_cli, AuthState.LOGGED_IN, None)
     assert key not in json.dumps(mgr_locked.status_snapshot())
+
+
+# ---------------------------------------------------------------------------
+# Phase-2B regression tests: AND-predicate edge cases + recovery-on-read
+# ---------------------------------------------------------------------------
+
+# Scenario B1: fresh unlock, no timeout -> all capability fields True
+def test_fresh_unlock_all_capability_fields_true(bw_cli):
+    mgr = _manager_with(bw_cli, AuthState.UNLOCKED, "SKEY-2b-fresh")
+    snap = mgr.status_snapshot()
+    assert snap["operational"] is True
+    assert snap["session_key_available"] is True
+    assert snap["session_active"] is True
+    assert snap["auth_state"] == "unlocked"
+
+
+# Scenario B2: session expired (age > timeout) -> all capability fields False,
+# raw age still reported (not nulled out)
+def test_expired_session_not_operational_but_age_kept():
+    mgr = _mocked_manager(AuthState.UNLOCKED, "SKEY-2b-expired",
+                          {"status": "locked"})
+    # Force the key to look older than the 14400s timeout of _mocked_manager.
+    mgr._session_created_at = time.time() - 14401
+    snap = mgr.status_snapshot()
+    assert snap["operational"] is False
+    assert snap["session_key_available"] is False
+    assert snap["session_active"] is False
+    # Raw age preserved for numeric consumers...
+    assert isinstance(snap["session_age_seconds"], float)
+    assert snap["session_age_seconds"] >= 14401
+    # ...but a stale/expired key no longer falsely flips the v0.2.6 indicator.
+    assert snap["server_status"]["state"] == "locked"
+    # NB: get_session_key() is deliberately NOT asserted here — it gates on
+    # state alone (no expiry check); expiry is enforced by is_unlocked()/
+    # get_session(), which is exactly what h_status recovery-on-read uses.
+
+
+# Scenario B3: h_status recovery-on-read — after expiry, the status TOOL
+# reconciles via ensure_authenticated() and reports post-recovery state.
+def test_h_status_recovers_expired_session_before_snapshot(bw_cli, monkeypatch):
+    from vaultwarden.placeholders import PlaceholderRegistry
+    from vaultwarden.tools import get_tools
+
+    cfg = make_config()
+    mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret",
+                      master_password="mp-secret")
+    mgr.ensure_authenticated()                     # real fake-bw -> UNLOCKED
+    stale_key = mgr.session_key
+    with mgr._lock:                                # simulate expiry window
+        mgr._session_created_at = time.time() - (cfg.session_timeout_seconds + 1)
+    # Direct snapshot (observational, no mutation): truthfully not operational.
+    assert mgr.status_snapshot()["operational"] is False
+    assert mgr.status_snapshot()["session_active"] is False
+
+    # Recovery must actually re-unlock (fresh key), not take the remembered-
+    # key fast path in _adopt_existing_unlocked_session (that gate checks key
+    # PRESENCE only, which is true for an expired-but-lingering key). This
+    # mirrors what operations do implicitly via get_session().
+    def fake_do_unlock():
+        with mgr._lock:
+            mgr._session_key = "SKEY-2b-refreshed"
+            mgr._session_created_at = time.time()
+            mgr._state = AuthState.UNLOCKED
+    monkeypatch.setattr(mgr, "_do_unlock", fake_do_unlock)
+
+    registry = PlaceholderRegistry(ttl_seconds=300, max_entries=50)
+    handlers = {schema["name"]: fn for schema, fn in get_tools(mgr, cfg, registry)}
+    payload = json.loads(handlers["vaultwarden_status"]({}))
+    status = payload["status"]
+    # Bug #2 fixed: the tool reflects POST-recovery state.
+    assert status["operational"] is True
+    assert status["session_key_available"] is True
+    assert status["session_active"] is True
+    assert status["auth_state"] == "unlocked"
+    assert status["session_age_seconds"] <= 60     # recovered just now
+    assert stale_key != "SKEY-2b-refreshed"
+
+
+# Scenario B4: recovery fails (network down) -> h_status must NOT raise;
+# it degrades to the observational snapshot with operational=false.
+def test_h_status_graceful_when_recovery_fails(bw_cli, monkeypatch):
+    from vaultwarden.errors import VaultwardenError
+    from vaultwarden.placeholders import PlaceholderRegistry
+    from vaultwarden.tools import get_tools
+
+    cfg = make_config()   # client_id user.1111... + server https://vault.example.com
+    mgr = AuthManager(bw_cli, cfg, client_secret="cs", master_password="mp")
+    mgr._state = AuthState.LOGGED_IN               # was up, now network died
+
+    # Profile says locked+correct account -> ensure_authenticated takes the
+    # unlock path; the network is down so the unlock attempt fails hard.
+    monkeypatch.setattr(mgr, "probe_status", lambda: {
+        "status": "locked", "serverUrl": cfg.server_url,
+        "userId": cfg.client_id.removeprefix("user."),
+        "userEmail": "op@example.com"})
+
+    def failing_unlock():
+        raise VaultwardenError("connection refused", code="NETWORK_ERROR")
+    monkeypatch.setattr(mgr, "_do_unlock", failing_unlock)
+    monkeypatch.setattr(mgr, "_maybe_initial_sync", lambda: None)
+
+    registry = PlaceholderRegistry(ttl_seconds=300, max_entries=50)
+    handlers = {schema["name"]: fn for schema, fn in get_tools(mgr, cfg, registry)}
+    res = handlers["vaultwarden_status"]({})       # must never hard-fail
+    assert isinstance(res, str)
+    payload = json.loads(res)
+    assert "error" not in payload                  # degraded, not raised
+    status = payload["status"]
+    assert status["operational"] is False
+    assert status["session_key_available"] is False
+    assert status["session_active"] is False
+    # Observational snapshot kept the pre-recovery truth: still logged_in,
+    # and bw_profile_state remains verbatim ("locked").
+    assert status["auth_state"] == "logged_in"
+    assert status["bw_profile_state"] == "locked"
+
+
+# Scenario B5: bw_profile_state independence — verbatim even when the
+# capability fields say the plugin IS operational.
+def test_bw_profile_state_independent_of_capability():
+    mgr = _mocked_manager(AuthState.UNLOCKED, "SKEY-2b-independent",
+                          {"status": "locked", "serverUrl": "https://vault.example.com"})
+    snap = mgr.status_snapshot()
+    assert snap["operational"] is True
+    assert snap["session_key_available"] is True
+    assert snap["session_active"] is True
+    # CHANGE 3: bw_profile_state stays the raw bw CLI persistent-profile value.
+    assert snap["bw_profile_state"] == "locked"
+
+
+# Scenario B6: backward compat under the new predicate — every pre-existing
+# field present, types unchanged (bool stays bool, str stays str).
+def test_backward_compat_types_under_and_predicate(bw_cli):
+    for state, key in ((AuthState.UNLOCKED, "SKEY-2b-bool"),
+                       (AuthState.LOGGED_IN, None)):
+        snap = _manager_with(bw_cli, state, key).status_snapshot()
+        assert isinstance(snap["session_active"], bool)
+        assert isinstance(snap["session_key_available"], bool)
+        assert isinstance(snap["operational"], bool)
+        assert isinstance(snap["auth_state"], str)
+        assert isinstance(snap["bw_profile_state"], str)
+        assert isinstance(snap["server_status"]["state"], str)
