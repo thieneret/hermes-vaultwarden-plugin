@@ -660,9 +660,17 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             tracked = _collect_secret_strings(args)
             if not generate and resolved_password:
                 tracked.append(resolved_password)
-                redactor.register_secret(resolved_password)
-            for t in tracked:
+            # AUD-02 (phase 2): dedupe before registration. The direct
+            # password channel stores the plaintext INSIDE args, so
+            # _collect_secret_strings already yields it — registering both
+            # `resolved_password` and the identical tracked entry would
+            # inflate the refcount by +2 while the finally block forgets
+            # exactly once, permanently leaking redactor state. One holder
+            # per unique value per handler invocation.
+            registered: list[str] = []
+            for t in dict.fromkeys(tracked):
                 redactor.register_secret(t)
+                registered.append(t)
 
             try:
                 item = _build_item(args)

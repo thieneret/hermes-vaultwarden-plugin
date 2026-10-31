@@ -123,6 +123,74 @@ _DEFAULT_STALE_TTL_SECONDS = 300
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# AUD-02 (phase 2): DEFERRED TRANSFORM HANDOFF GRACE STORE.
+#
+# Some Hermes hosts dispatch the authoritative `transform_tool_result` hook
+# AFTER the tool_execution middleware frame has fully returned — i.e. after
+# the execution scope already closed and released its refcounts. The result
+# object itself is still handed to the transformer, so exact per-execution
+# plaintext scrubbing (SEC-01) must keep working there.
+#
+# This store bridges that gap: on scope close the injected snapshot is
+# stashed here keyed by the execution id and consumed (popped) by the next
+# matching transform_tool_result call. It is HARD BOUNDED — both in entry
+# count and age — so it can never become unbounded global retention, and it
+# complements (never replaces) the refcounted redactor state, which is
+# already released exactly once by the scope itself.
+# ---------------------------------------------------------------------------
+
+_DEFERRED_MAX_ENTRIES = 64
+_DEFERRED_TTL_SECONDS = 300.0
+_DEFERRED_INJECTED: "dict[str, tuple[float, frozenset[str]]]" = {}
+_DEFERRED_LOCK = threading.Lock()
+
+
+def _stash_deferred_injected(exec_id: str, values: frozenset[str]) -> None:
+    """Record a closed scope's injected snapshot for the deferred transform."""
+    if not values:
+        return
+    key = exec_id or ""
+    with _DEFERRED_LOCK:
+        now = time.monotonic()
+        # Opportunistic purge of expired entries (bounded staleness).
+        expired = [k for k, (ts, _) in _DEFERRED_INJECTED.items()
+                   if now - ts > _DEFERRED_TTL_SECONDS]
+        for k in expired:
+            del _DEFERRED_INJECTED[k]
+        _DEFERRED_INJECTED[key] = (now, values)
+        # Hard size bound: drop the oldest entries when over capacity.
+        while len(_DEFERRED_INJECTED) > _DEFERRED_MAX_ENTRIES:
+            oldest = min(_DEFERRED_INJECTED,
+                         key=lambda k: _DEFERRED_INJECTED[k][0])
+            del _DEFERRED_INJECTED[oldest]
+
+
+def consume_deferred_injected(exec_id: str) -> list[str]:
+    """Pop (and forget) the deferred snapshot for *exec_id*, if any.
+
+    Consuming is deliberately one-shot: the authoritative transformer runs
+    once per execution result; leaving the snapshot behind would extend the
+    plaintext lifetime beyond the execution it belongs to. Entries whose
+    TTL elapsed are dropped without being returned.
+    """
+    key = exec_id or ""
+    with _DEFERRED_LOCK:
+        entry = _DEFERRED_INJECTED.pop(key, None)
+    if entry is None:
+        return []
+    ts, values = entry
+    if time.monotonic() - ts > _DEFERRED_TTL_SECONDS:
+        return []
+    return list(values)
+
+
+def clear_deferred_injected() -> None:
+    """Drop every deferred snapshot (session end / registry clear / tests)."""
+    with _DEFERRED_LOCK:
+        _DEFERRED_INJECTED.clear()
+
+
 class ExecutionSecretScope:
     """Reference-counted secret scope for ONE tool execution (AUD-02 phase 2).
 
@@ -161,6 +229,15 @@ class ExecutionSecretScope:
         # retention: the set lives only for the duration of this scope and
         # is cleared exactly once when close() runs.
         self._injected: frozenset[str] = frozenset(self._values)
+        # AUD-02 (phase 2): deferred transform handoff. When close() runs
+        # BEFORE the authoritative transform_tool_result hook has executed
+        # for this execution (hosts that dispatch the transformer AFTER the
+        # middleware call returns), the injected plaintext snapshot is moved
+        # into a bounded, task-keyed grace store instead of being dropped —
+        # so SEC-01 result redaction stays intact while the refcount release
+        # still happens exactly once at scope close. Cleared by consume().
+        self._task_id: str = ""
+        self._deferred_snapshot: frozenset[str] = frozenset()
 
     # -------------------------------------------------------- redactor pin
     def _get_redactor(self) -> Any:
@@ -201,7 +278,7 @@ class ExecutionSecretScope:
             # re-acquiring locks in nested order across modules invites
             # lock-ordering bugs. The +1 happens exactly once per unique
             # value per scope regardless of concurrent duplicate retains.
-            self._redactor.retain_secret(value)
+            self._get_redactor().retain_secret(value)
 
     # -------------------------------------------------------------- close
     def close(self) -> None:
@@ -212,13 +289,24 @@ class ExecutionSecretScope:
             self._closed = True
             values = list(self._values)
             self._values.clear()
-            # Drop the transform-handoff snapshot too — after close() no
-            # downstream consumer may read plaintext from this scope.
+            # AUD-02 (phase 2): move the transform-handoff snapshot into the
+            # bounded deferred grace store BEFORE dropping it, so hosts that
+            # dispatch the authoritative transform_tool_result hook AFTER
+            # this middleware frame returns still scrub echoes of THIS
+            # execution's injected plaintext from the result (SEC-01 must
+            # stay intact). The refcount release below is unaffected — the
+            # grace store holds the per-execution snapshot only; entries are
+            # consumed by the transformer and hard-bounded in size/TTL.
+            snapshot = self._injected
             self._injected = frozenset()
+            self._deferred_snapshot = snapshot
+        redactor = self._get_redactor()
         for value in values:
             # release_secret never raises; unknown releases are sanitized
             # warnings on the redactor side (length fingerprint only).
-            self._redactor.release_secret(value)
+            redactor.release_secret(value)
+        if snapshot:
+            _stash_deferred_injected(self._task_id, snapshot)
 
     @property
     def closed(self) -> bool:
@@ -240,7 +328,7 @@ class ExecutionSecretScope:
                 return
             self._values.discard(value)
             self._injected = frozenset(self._values)
-        self._redactor.release_secret(value)
+        self._get_redactor().release_secret(value)
 
     def injected_values(self) -> frozenset[str]:
         """Exact plaintext set retained by this scope (transform handoff).
@@ -927,6 +1015,9 @@ def clear_task_secrets() -> None:
         _INJECTED_SECRETS.clear()
     # SEC-01: never let plaintext linger in the current context either.
     _CURRENT_INJECTED_SECRETS.set(None)
+    # AUD-02 (phase 2): the deferred transform grace store must not outlive
+    # the session/registry it belongs to.
+    clear_deferred_injected()
 
 
 def _redact_in_result(result: Any) -> Any:
@@ -1101,6 +1192,13 @@ def make_result_redactor(auth: AuthManager,
             values = list(cv_values)
         else:
             values = peek_scope_injected_secrets(exec_id)
+            if not values:
+                # AUD-02 (phase 2): the owning scope may already have closed
+                # (hosts dispatching transform_tool_result AFTER the
+                # middleware frame returned). The one-shot deferred grace
+                # store still carries THIS execution's exact snapshot so
+                # SEC-01 result redaction is unchanged.
+                values = consume_deferred_injected(exec_id)
             if not values:
                 values = peek_task_secrets(exec_id)
         # 2) exact plaintext replacement of every injected value with the
