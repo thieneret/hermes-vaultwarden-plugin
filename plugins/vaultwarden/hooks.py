@@ -140,11 +140,21 @@ class ExecutionSecretScope:
     - nothing is ever logged that could expose a secret value.
     """
 
-    def __init__(self, redactor: Any) -> None:
+    def __init__(self, redactor: Any,
+                 values: "frozenset[str] | list[str] | None" = None) -> None:
         self._redactor = redactor
-        self._values: set[str] = set()
+        self._values: set[str] = set(values or ())
         self._closed = False
         self._lock = threading.Lock()
+        # AUD-02 (phase 2): the exact plaintext set injected by THIS
+        # execution. The authoritative transform_tool_result hook consumes
+        # it via peek_scope_injected_secrets() as a ContextVar-independent
+        # fallback channel — Hermes hosts may dispatch that hook on a
+        # different context/thread than the middleware frame, where the
+        # published ContextVar is not visible. This is NOT unbounded global
+        # retention: the set lives only for the duration of this scope and
+        # is cleared exactly once when close() runs.
+        self._injected: frozenset[str] = frozenset(self._values)
 
     # ------------------------------------------------------------- retain
     def retain(self, value: str) -> None:
@@ -162,6 +172,10 @@ class ExecutionSecretScope:
                 new_value = value not in self._values
                 if new_value:
                     self._values.add(value)
+                    # Keep the transform-handoff snapshot in sync (see
+                    # __init__): every plaintext retained by this scope is
+                    # part of THIS execution's injected set.
+                    self._injected = frozenset(self._values)
         if new_value:
             # Outside the scope lock: the redactor holds its own RLock and
             # re-acquiring locks in nested order across modules invites
@@ -178,6 +192,9 @@ class ExecutionSecretScope:
             self._closed = True
             values = list(self._values)
             self._values.clear()
+            # Drop the transform-handoff snapshot too — after close() no
+            # downstream consumer may read plaintext from this scope.
+            self._injected = frozenset()
         for value in values:
             # release_secret never raises; unknown releases are sanitized
             # warnings on the redactor side (length fingerprint only).
@@ -202,7 +219,19 @@ class ExecutionSecretScope:
             if value not in self._values:
                 return
             self._values.discard(value)
+            self._injected = frozenset(self._values)
         self._redactor.release_secret(value)
+
+    def injected_values(self) -> frozenset[str]:
+        """Exact plaintext set retained by this scope (transform handoff).
+
+        AUD-02 (phase 2): consumed by the authoritative
+        ``transform_tool_result`` redactor as a ContextVar-independent
+        channel. Returns an immutable snapshot; empty after ``close()``.
+        Callers must never log the returned values.
+        """
+        with self._lock:
+            return self._injected
 
     def retained_count(self) -> int:
         """Number of unique values this scope currently holds (no values)."""
@@ -230,11 +259,93 @@ def _open_execution_scope(redactor: Any) -> tuple["ExecutionSecretScope", Any]:
     return scope, token
 
 
+# ---------------------------------------------------------------------------
+# AUD-02 (phase 2): ACTIVE-SCOPE REGISTRY for the SEC-01 transform handoff.
+#
+# The authoritative `transform_tool_result` hook must be able to scrub echoes
+# of THIS execution's injected plaintext even when Hermes dispatches it on a
+# different context/thread than the middleware frame (where the published
+# ContextVar is invisible). The per-task dict fallback only works when the
+# host threads a task_id through — hosts that key executions by turn_id or
+# pass none at all have no correlation channel.
+#
+# The registry below IS that channel: scopes register themselves while open
+# and unregister in close(). It stores NO secret values directly — only scope
+# objects whose lifetime is bounded by their own execution (entries vanish
+# exactly once when each scope closes), so this can never become unbounded
+# global retention. Consumers read plaintext ONLY through the narrow
+# heuristics in peek_scope_injected_secrets(), which prefer the single most
+# recently opened still-active scope and require an exact exec-id match
+# against the scope's OWN task id before trusting a keyed lookup.
+# ---------------------------------------------------------------------------
+
+_ACTIVE_SCOPES: "list[ExecutionSecretScope]" = []
+_ACTIVE_SCOPES_LOCK = threading.Lock()
+
+
+def _register_active_scope(scope: ExecutionSecretScope) -> None:
+    with _ACTIVE_SCOPES_LOCK:
+        _ACTIVE_SCOPES.append(scope)
+
+
+def _unregister_active_scope(scope: ExecutionSecretScope) -> None:
+    with _ACTIVE_SCOPES_LOCK:
+        try:
+            _ACTIVE_SCOPES.remove(scope)
+        except ValueError:  # pragma: no cover - defensive (double close)
+            pass
+
+
+def active_scope_count() -> int:
+    """Number of currently-open execution scopes (no values exposed)."""
+    with _ACTIVE_SCOPES_LOCK:
+        return len(_ACTIVE_SCOPES)
+
+
+def _bind_scope_task(scope: ExecutionSecretScope, task_id: str) -> None:
+    """Attach the execution's task id to *scope* for transform correlation."""
+    if task_id:
+        scope._task_id = task_id  # noqa: SLF001 - internal correlation tag
+
+
+def peek_scope_injected_secrets(exec_id: str) -> list[str]:
+    """Injected-plaintext set from the ACTIVE scope(s) for one execution.
+
+    AUD-02 (phase 2) transform-side fallback: consulted by the authoritative
+    redactor AFTER the ContextVar channel and BEFORE the task-keyed store.
+    Never raises; returns ``[]`` when no active scope plausibly matches.
+
+    Correlation policy (deliberately conservative):
+    - exec_id given and equal to a scope's bound task id -> that scope wins;
+    - exec_id empty -> the MOST RECENTLY opened still-active scope wins
+      (Hermes dispatches transform_tool_result right after the middleware
+      call returns, while exactly its own scope is normally active);
+    - exec_id given but matching no bound scope -> union of ALL active
+      scopes' sets (fail-safe over-redaction: during overlapping executions
+      every retained value is still needed by someone anyway, and extra
+      scrubbing can never leak — only hide — text).
+    """
+    with _ACTIVE_SCOPES_LOCK:
+        scopes = list(_ACTIVE_SCOPES)
+    if not scopes:
+        return []
+    if exec_id:
+        for scope in reversed(scopes):
+            if getattr(scope, "_task_id", "") == exec_id:
+                return list(scope.injected_values())
+        merged: list[str] = []
+        for scope in scopes:
+            merged.extend(v for v in scope.injected_values() if v not in merged)
+        return merged
+    return list(scopes[-1].injected_values())
+
+
 def _close_execution_scope(scope: ExecutionSecretScope, token: Any) -> None:
     """Close *scope* exactly once and restore the previous ContextVar value."""
     try:
         scope.close()
     finally:
+        _unregister_active_scope(scope)
         try:
             _execution_secret_scope.reset(token)
         except ValueError:  # pragma: no cover - defensive (foreign context)
@@ -423,6 +534,7 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
                                temp_files: list[str], task_id: str = "",
                                injected_values_out: list[str] | None = None,
                                task_errors: list[dict] | None = None,
+                               scope: "ExecutionSecretScope | None" = None,
                                ) -> str | None:
     """SEC-02 (v0.5.7): atomically consume one unique token and create its
     single temp file; return the file path or ``None`` (fail-safe).
@@ -485,13 +597,19 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
     path = _write_secret_file(six_hex, value, secrets_dir, temp_files)
     # Register the value so it gets scrubbed from any log line / output echo.
     # AUD-02 (phase 2): runtime injected plaintext is retained through the
-    # ACTIVE execution secret scope (refcounted via the Phase-1 redactor API)
+    # OWNING execution secret scope (refcounted via the Phase-1 redactor API)
     # instead of the raw unbounded register_secret path — the owning
-    # middleware releases it exactly once when the execution concludes. If no
-    # parent scope exists unexpectedly (legacy/direct callers), the fail-safe
-    # helper uses a temporary local scope that is closed immediately after
-    # this operation and logs a sanitized warning (never the value).
-    retain_in_execution_scope(value, get_redacting_filter())
+    # middleware releases it exactly once when the execution concludes. The
+    # middleware passes its own *scope* object explicitly so retention works
+    # even when Hermes dispatches the tool on a different context/thread
+    # (ContextVars would not propagate there). If no scope was passed and no
+    # parent scope exists in this context (legacy/direct callers), the
+    # fail-safe helper uses a temporary local scope that is closed right
+    # after this operation and logs a sanitized warning (never the value).
+    if scope is not None:
+        scope.retain(value)
+    else:
+        retain_in_execution_scope(value, get_redacting_filter())
     # v0.1.4 (FAIL-6): also record the plaintext per-task so the redaction
     # layer can scrub it from this specific tool call's output even when the
     # global filter state was reset by another component in between.
@@ -600,6 +718,12 @@ def make_placeholder_resolver(auth: AuthManager,
         # execution has consumed the handoff), after temp-file cleanup
         # observability, and even when an exception aborts the lifecycle.
         _scope, _scope_token = _open_execution_scope(get_redacting_filter())
+        # AUD-02 (phase 2): bind the execution id so the authoritative
+        # transform_tool_result redactor can correlate THIS execution's
+        # injected set through the active-scope registry even when Hermes
+        # dispatches the hook on a different context/thread.
+        _bind_scope_task(_scope, task_id or "")
+        _register_active_scope(_scope)
         try:
           try:
             for key in targets:
@@ -614,7 +738,7 @@ def make_placeholder_resolver(auth: AuthManager,
                 for suffix in unique_suffixes:
                     path = _resolve_placeholder_token(
                         suffix, auth, registry, secrets_dir, temp_files,
-                        task_id, injected_values, task_errors)
+                        task_id, injected_values, task_errors, scope=_scope)
                     if path is None:
                         continue  # unknown/expired/used -> leave verbatim
                     replacements[f"$__VW_SECRET_{suffix}__"] = f"$(< {path})"
@@ -945,11 +1069,20 @@ def make_result_redactor(auth: AuthManager,
         exec_id = task_id or kwargs.get("task_id") or turn_id \
             or kwargs.get("turn_id") or ""
         # 1) per-execution injected secrets (SEC-01 handoff). ContextVar is
-        #    the primary channel; the task-keyed dict covers cross-context /
-        #    cross-thread dispatch. Never pop here — the middleware's finally
-        #    block owns forgetting the values.
+        #    the primary channel; the AUD-02 active-scope registry is the
+        #    context-independent fallback while the owning execution is still
+        #    in flight (its middleware closes the scope only AFTER this hook
+        #    has run); the task-keyed dict covers hosts that thread a task id
+        #    through but dispatch on another thread after the scope closed.
+        #    Never pop here — the middleware's finally block owns forgetting
+        #    the values.
         cv_values = _CURRENT_INJECTED_SECRETS.get()
-        values = list(cv_values) if cv_values else peek_task_secrets(exec_id)
+        if cv_values:
+            values = list(cv_values)
+        else:
+            values = peek_scope_injected_secrets(exec_id)
+            if not values:
+                values = peek_task_secrets(exec_id)
         # 2) exact plaintext replacement of every injected value with the
         #    literal [REDACTED] (shared building block; in-place for
         #    containers / writable .output objects, returned copy for plain
