@@ -575,11 +575,34 @@ class AuthManager:
                 log.debug("keep_appdata=False requested; leaving .bw-data untouched for safety.")
 
     def status_snapshot(self) -> dict:
+        # NOTE: deliberately observational — no lazy expiry enforcement here.
+        # status_snapshot() must never mutate state (operations recover via
+        # get_session()/run_with_recovery()); the additive capability fields
+        # below therefore report the raw in-memory facts, while the
+        # pre-existing session_active / server_status.state keep their v0.2.6
+        # semantics verbatim for backward compatibility.
         bw_status = self.probe_status()
+        # Raw `bw status` profile state, unmodified (real bw uses "status";
+        # older fixtures used "state"). This is the CLI's PERSISTENT-session
+        # view of the isolated profile — by security design the plugin never
+        # persists BW_SESSION to disk/os.environ, so this legitimately reads
+        # "locked" even while every operation succeeds via per-command
+        # BW_SESSION injection (_ensure_session_env, v0.6.4 HOTFIX).
+        bw_profile_state = (bw_status.get("status")
+                            or bw_status.get("state") or "unknown")
         with self._lock:
             state = self._state.value
             has_session = bool(self._session_key)
             age = (time.time() - self._session_created_at) if has_session else None
+        # Phase-2 status fix (additive): the plugin's ACTUAL operational
+        # capability — AuthManager holding a session key that
+        # _ensure_session_env can inject into any session-requiring command.
+        # Key presence IS the injectability condition (the v0.6.4 choke point
+        # pulls BW_SESSION from memory per command, independent of what the
+        # bw CLI profile persistently reports). Deliberately observational:
+        # no lazy expiry enforcement here — operations recover on demand via
+        # get_session()/run_with_recovery().
+        session_key_available = has_session
         return {
             "plugin": "vaultwarden",
             "enabled": self._config.enabled,
@@ -588,13 +611,24 @@ class AuthManager:
             "session_age_seconds": round(age, 1) if age is not None else None,
             "session_timeout_seconds": self._config.session_timeout_seconds,
             "server_configured": self._config.server_url,
+            # ---- additive fields (v0.6.x status fix): new consumers should
+            # prefer these over reinterpreting session_active/server_status.
+            # True iff AuthManager holds an injectable BW_SESSION value —
+            # i.e. the plugin CAN perform read/write operations right now.
+            "session_key_available": session_key_available,
+            # Overall operational capability: same predicate as above; kept
+            # separate so operators can distinguish "key in memory" from the
+            # unlocked FSM state without inferring across fields.
+            "operational": session_key_available,
+            # Verbatim persistent-session state reported by `bw status` for
+            # the isolated profile — informational fidelity, NOT capability.
+            "bw_profile_state": bw_profile_state,
             "server_status": {
                 # v0.2.6 (BUGFIX): use internal session state for the lock indicator.
                 # bw status is called WITHOUT BW_SESSION (session key lives in plugin
                 # memory only, by design), so it always reports "locked" even when
                 # the plugin holds an active session. The internal state is authoritative.
-                "state": "unlocked" if has_session else (
-                    bw_status.get("status") or bw_status.get("state") or "unknown"),
+                "state": "unlocked" if has_session else bw_profile_state,
                 "serverUrl": bw_status.get("serverUrl"),
                 "userEmail": bw_status.get("userEmail"),
                 "userId": bw_status.get("userId"),
