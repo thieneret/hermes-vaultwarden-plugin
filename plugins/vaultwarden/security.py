@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
 import re
 import shlex
 import threading
@@ -67,6 +68,91 @@ def shell_escape(value: str) -> str:
 def url_escape(value: str) -> str:
     """Escape for embedding inside a URL userinfo/param component."""
     return urllib.parse.quote_plus(value if isinstance(value, str) else str(value), safe="")
+
+
+# --------------------------------------------------- AUD-05: path quoting
+#: Control characters that must NEVER appear in an injected temp-file path.
+#: A runtime directory containing them is almost certainly misconfigured or
+#: adversarial — we fail closed instead of trying to quote our way out.
+_FORBIDDEN_PATH_CHARS = ("\x00", "\n", "\r")
+
+
+def _posix_shell_quote(path: str) -> str:
+    """POSIX-shell single-quoting of *path* (shlex.quote semantics).
+
+    ``shlex`` documents its quoting as "POSIX shell style"; we implement the
+    canonical form directly — wrap in single quotes and escape embedded
+    single quotes via the POSIX ``'\\''`` idiom. Unlike ``shlex.quote`` this
+    NEVER emits a bare double quote, which matters because the resulting
+    fragment is embedded inside a DOUBLE-QUOTED command string: a stray
+    ``"`` would terminate that quoting context (shlex's rare ``'"'``
+    fallback for single quotes is not safe for our embedding). The two forms
+    are semantically identical to any POSIX shell; we verify equivalence in
+    the tests with ``bash -n`` / ``bash --posix``.
+    """
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def validate_injected_path(path: str) -> str:
+    """Return *path* unchanged when it is safe to embed in a shell fragment.
+
+    AUD-05 (phase 1): defensive validation applied BEFORE any quoting.
+    Raises ``ValueError`` when *path*:
+
+    - is empty;
+    - contains a NUL (``\\x00``), newline (``\\n``) or carriage return
+      (``\\r``) — control characters in a runtime-directory path are never
+      legitimate, so we fail closed rather than quote them;
+    - is not absolute.
+
+    Spaces and shell metacharacters OTHER than the control characters above
+    are explicitly allowed: :func:`quote_injected_path` neutralises them with
+    POSIX-shell-safe single quoting. Pure function: no I/O, no shell
+    execution, and the ValueError message never echoes the offending path
+    (which could itself carry secret-bearing components).
+    """
+    if not isinstance(path, str):
+        raise ValueError("injected path must be a string")
+    if not path:
+        raise ValueError("injected path must not be empty")
+    for ch in _FORBIDDEN_PATH_CHARS:
+        if ch in path:
+            raise ValueError(
+                "injected path must not contain control characters "
+                f"(found {ch!r})"
+            )
+    if not os.path.isabs(path):
+        raise ValueError("injected path must be absolute")
+    return path
+
+
+def quote_injected_path(path: str) -> str:
+    """Return a shell-safe substitution fragment for a secret temp-file path.
+
+    AUD-05 (phase 1). The result has the form::
+
+        $(< '/quoted/absolute/path')
+
+    Rules:
+    - *path* is validated first (:func:`validate_injected_path`); unsafe
+      paths raise ``ValueError`` (fail closed).
+    - The FULL absolute path (never just the basename) is quoted with
+      POSIX-shell-safe single quoting (:func:`_posix_shell_quote`, the
+      canonical equivalent of ``shlex.quote`` that additionally guarantees
+      no bare double quote ever appears — shlex's ``'"'`` fallback for
+      embedded single quotes would break our embedding context). This
+      neutralises spaces, ``;``, ``$``, backticks, quotes, pipes, ``&`` etc.
+    - The fragment is safe to embed inside a DOUBLE-QUOTED command string:
+      the quoted word contains no ``"``, and every ``$`` / backtick it holds
+      sits inside single quotes, so the embedding quoting context cannot be
+      broken out of.
+
+    Pure helper: no I/O, no shell execution, no logging of the path value.
+    Intended for phase-2 use by the hooks middleware when rewriting
+    ``$__VW_SECRET_x__`` tokens into ``$(< path)`` substitutions.
+    """
+    validate_injected_path(path)
+    return f"$(< {_posix_shell_quote(path)})"
 
 
 def looks_like_url_context(command: str, token: str) -> bool:
