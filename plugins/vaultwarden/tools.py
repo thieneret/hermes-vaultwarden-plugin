@@ -660,9 +660,17 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             tracked = _collect_secret_strings(args)
             if not generate and resolved_password:
                 tracked.append(resolved_password)
-                redactor.register_secret(resolved_password)
-            for t in tracked:
+            # AUD-02 (phase 2): dedupe before registration. The direct
+            # password channel stores the plaintext INSIDE args, so
+            # _collect_secret_strings already yields it — registering both
+            # `resolved_password` and the identical tracked entry would
+            # inflate the refcount by +2 while the finally block forgets
+            # exactly once, permanently leaking redactor state. One holder
+            # per unique value per handler invocation.
+            registered: list[str] = []
+            for t in dict.fromkeys(tracked):
                 redactor.register_secret(t)
+                registered.append(t)
 
             try:
                 item = _build_item(args)
@@ -701,7 +709,11 @@ def get_tools(auth: AuthManager, config: PluginConfig,
 
                 return result
             finally:
-                for t in tracked:
+                # AUD-02 (phase 2): forget exactly what was registered —
+                # one release per unique holder acquired above. Iterating
+                # `tracked` here would double-release the deduped password
+                # channel and emit sanitized unknown-release warnings.
+                for t in registered:
                     redactor.forget_secret(t)
                 if generated_pw is not None:
                     redactor.forget_secret(generated_pw)
@@ -748,9 +760,15 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             tracked = _collect_secret_strings(args)
             if not generate and resolved_password:
                 tracked.append(resolved_password)
-                redactor.register_secret(resolved_password)
-            for t in tracked:
+            # AUD-02 (phase 2): dedupe before registration — same rationale
+            # as h_store. The direct password channel is already inside args,
+            # so registering both the explicit value and the identical
+            # tracked entry inflates the refcount while the finally block
+            # forgets once, permanently leaking redactor state.
+            registered: list[str] = []
+            for t in dict.fromkeys(tracked):
                 redactor.register_secret(t)
+                registered.append(t)
 
             try:
                 item_id = str(args["item_id"])
@@ -789,7 +807,10 @@ def get_tools(auth: AuthManager, config: PluginConfig,
 
                 return result
             finally:
-                for t in tracked:
+                # AUD-02 (phase 2): forget exactly what was registered —
+                # mirrors h_store. Releasing `tracked` would double-release
+                # the deduped password channel.
+                for t in registered:
                     redactor.forget_secret(t)
                 if generated_pw is not None:
                     redactor.forget_secret(generated_pw)

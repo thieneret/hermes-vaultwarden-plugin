@@ -32,6 +32,11 @@ def test_dir_creates_missing_with_0700_even_under_hostile_umask(tmp_path):
     d = tmp_path / "created"
     old = os.umask(0o022)
     try:
+        # Deterministic under ANY inherited umask (tmp_path itself may be
+        # 0o700 when a previous test leaked a hostile umask): drop the leaf
+        # mode to group/world-accessible so the validator's job is purely to
+        # repair it up to exactly 0700 regardless of the creation path.
+        os.chmod(str(tmp_path), 0o755)
         assert ensure_hardened_directory(d, create_if_missing=True) == d
     finally:
         os.umask(old)

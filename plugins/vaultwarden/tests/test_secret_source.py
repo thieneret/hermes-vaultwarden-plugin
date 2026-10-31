@@ -53,23 +53,29 @@ class TestVaultwardenSecretSource:
 
         filt = get_redacting_filter()
         registered: list[str] = []
-        original_register = filt.register_secret
+        original_register = filt.register_process_scoped_secret
 
         def spy(value: str) -> None:
             registered.append(value)
             original_register(value)
 
-        filt.register_secret = spy
+        filt.register_process_scoped_secret = spy
         try:
             result = source.get_secrets()
         finally:
-            del filt.register_secret  # restore the class-level method
+            del filt.register_process_scoped_secret  # restore class method
 
         assert result == {"DB_PASS": "redact-me-value"}
-        # v0.5.3 security fix: the value itself must be handed to the filter
+        # v0.5.3 security fix: the value itself must be handed to the filter.
+        # AUD-02 (phase 2): startup-injection values are long-lived, so they
+        # go through the process-scoped registration path — never the
+        # execution-scoped retain/release path.
         assert "redact-me-value" in registered
         # ...and therefore never appear raw in log records emitted afterwards
         assert "redact-me-value" not in filt.redact("password=redact-me-value")
+        # Process-scoped secrets survive execution-scoped release; demote
+        # first so test teardown can fully forget the value.
+        filt.demote_process_scoped("redact-me-value")
         filt.forget_secret("redact-me-value")
 
     def test_missing_item_id_skips_mapping(self):

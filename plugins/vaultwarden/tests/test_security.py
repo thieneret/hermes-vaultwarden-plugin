@@ -717,3 +717,172 @@ def test_register_fail_closed_without_transform_hook(monkeypatch, tmp_path,
     assert "transform_tool_result" in caplog.text
     # nothing was registered on the refused load path beyond tools/middleware
     assert all(kind != "transform_tool_result" for kind, _ in ctx.hooks)
+
+
+# ---------------------------------------------------------------------------
+# AUD-02 (phase 1): reference-counted secret retention on the RedactingFilter
+# ---------------------------------------------------------------------------
+
+def test_aud02_retain_then_release_once_removes_secret():
+    """retain once + release once -> secret fully removed from redaction."""
+    f = RedactingFilter()
+    secret = "aud02-single-holder"
+    f.retain_secret(secret)
+    assert f.has_secret(secret) is True
+    assert f.redact(f"leak {secret} here") == "leak [REDACTED] here"
+    f.release_secret(secret)
+    assert f.has_secret(secret) is False
+    assert f.active_secret_count() == 0
+    # no longer redacted: refcount hit zero and the value left the state
+    assert secret in f.redact(f"leak {secret} here")
+    assert f._secret_refcounts.get(secret) is None
+
+
+def test_aud02_retain_twice_release_once_keeps_secret():
+    """A second holder must keep the value redacted after the first release."""
+    f = RedactingFilter()
+    secret = "aud02-two-holders"
+    f.retain_secret(secret)
+    f.retain_secret(secret)
+    f.release_secret(secret)
+    assert f.has_secret(secret) is True
+    assert f._secret_refcounts[secret] == 1
+    assert secret not in f.redact(f"x {secret} y")
+    assert "[REDACTED]" in f.redact(f"x {secret} y")
+
+
+def test_aud02_retain_twice_release_twice_removes_secret():
+    f = RedactingFilter()
+    secret = "aud02-balanced"
+    f.retain_secret(secret)
+    f.retain_secret(secret)
+    f.release_secret(secret)
+    f.release_secret(secret)
+    assert f.has_secret(secret) is False
+    assert f._secret_refcounts.get(secret) is None
+    assert f.active_secret_count() == 0
+
+
+def test_aud02_permanent_secret_survives_release():
+    """Process-scoped secrets are NEVER dropped by execution-scoped release."""
+    f = RedactingFilter()
+    secret = "aud02-permanent-cs"
+    f.register_process_scoped_secret(secret)
+    f.release_secret(secret)          # must NOT remove it
+    assert f.has_secret(secret) is True
+    assert secret in f._permanent_secrets
+    assert f._secret_refcounts[secret] >= 1
+    assert secret not in f.redact(f"pw={secret}")
+    # extra releases keep clamping at one — never below, never removed
+    f.release_secret(secret)
+    f.release_secret(secret)
+    assert f.has_secret(secret) is True
+    assert f._secret_refcounts[secret] == 1
+
+
+def test_aud02_release_unknown_value_no_raise_sanitized_warning(caplog):
+    """Unknown release: no exception, warning WITHOUT the secret value."""
+    f = RedactingFilter()
+    unknown = "aud02-never-registered"
+    with caplog.at_level(logging.WARNING, logger="vaultwarden.security"):
+        f.release_secret(unknown)     # must not raise
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+    assert unknown not in caplog.text          # value never logged...
+    assert str(len(unknown)) in caplog.text    # ...only a length fingerprint
+    assert f.has_secret(unknown) is False
+
+
+def test_aud02_concurrent_retain_release_final_refcount_correct():
+    """Thread-safety: balanced retain/release churn ends at refcount zero."""
+    import threading as _threading
+
+    f = RedactingFilter()
+    secret = "aud02-contended-value"
+    errors: list[BaseException] = []
+    barrier = _threading.Barrier(8)
+
+    def worker() -> None:
+        try:
+            barrier.wait()
+            for _ in range(50):
+                f.retain_secret(secret)
+                f.release_secret(secret)
+        except BaseException as exc:  # noqa: BLE001 - surface to the test
+            errors.append(exc)
+
+    threads = [_threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    # every retain had a matching release: final refcount exactly zero
+    # (entry deleted), count never went negative, value fully gone.
+    assert f._secret_refcounts.get(secret, 0) == 0
+    assert f._secret_refcounts.get(secret, 0) >= 0
+    assert f.has_secret(secret) is False
+    assert f.active_secret_count() == 0
+
+
+def test_aud02_observability_never_leaks_values():
+    """has_secret / active_secret_count report safely without exposing data."""
+    f = RedactingFilter()
+    s1 = "aud02-alpha-secret"
+    s2 = "aud02-beta-secret"
+    perm = "aud02-gamma-permanent"
+    assert f.active_secret_count() == 0
+    f.retain_secret(s1)
+    f.retain_secret(s2)
+    f.register_process_scoped_secret(perm)
+    assert f.active_secret_count() == 3
+    assert f.has_secret(s1) is True
+    assert f.has_secret("not-a-registered-value") is False
+    # observability results carry no values and diagnostics stay clean
+    count_repr = repr(f.active_secret_count())
+    assert s1 not in count_repr and s2 not in count_repr and perm not in count_repr
+    f.release_secret(s1)
+    f.release_secret(s2)
+    f.release_secret(perm)   # permanent: survives
+    assert f.active_secret_count() == 1
+    assert f.has_secret(perm) is True
+
+
+def test_aud02_register_forget_compatibility():
+    """Existing register/forget call sites keep working with refcount rules."""
+    f = RedactingFilter()
+    secret = "aud02-compat-value"
+    # register behaves like retain
+    f.register_secret(secret)
+    f.register_secret(secret)
+    assert f._secret_refcounts[secret] == 2
+    # forget behaves like release: one holder down, still redacted
+    f.forget_secret(secret)
+    assert f.has_secret(secret) is True
+    assert secret not in f.redact(f"echo {secret}")
+    f.forget_secret(secret)
+    assert f.has_secret(secret) is False
+    # legacy discard semantics preserved: double-forget must not raise
+    f.forget_secret(secret)
+    # short/empty values keep being ignored (historical min-length guard)
+    f.register_secret("ab")
+    f.retain_secret("")
+    assert f.active_secret_count() == 0
+    # register on an already-permanent secret does not change permanence
+    perm = "aud02-compat-perm"
+    f.register_process_scoped_secret(perm)
+    f.register_secret(perm)
+    assert f._secret_refcounts[perm] == 1
+    f.forget_secret(perm)
+    assert f.has_secret(perm) is True
+
+
+def test_aud02_snapshot_secrets_still_available():
+    """snapshot_secrets keeps its SEC-01 contract alongside refcounting."""
+    f = RedactingFilter()
+    f.retain_secret("short-one")
+    f.retain_secret("much-longer-secret-value")
+    snap = f.snapshot_secrets()
+    assert snap == sorted(snap, key=len, reverse=True)
+    f.release_secret("short-one")
+    assert "short-one" not in f.snapshot_secrets()
+    assert "much-longer-secret-value" in f.snapshot_secrets()

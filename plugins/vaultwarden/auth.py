@@ -76,8 +76,14 @@ class AuthManager:
         # RedactingFilter FIRST — before any attribute assignment or log call
         # can possibly echo them. Everything below is scrubbed from here on.
         redactor = get_redacting_filter()
-        redactor.register_secret(client_secret)
-        redactor.register_secret(master_password)
+        # AUD-02 (phase 2): bootstrap credentials are PROCESS-SCOPED — they
+        # live for the whole process and must never be dropped by an
+        # execution-scoped release. register_process_scoped_secret is
+        # idempotent (permanent marking never inflates refcounts), so Auth
+        # Manager constructions across a test suite / session can no longer
+        # accumulate phantom references on these values.
+        redactor.register_process_scoped_secret(client_secret)
+        redactor.register_process_scoped_secret(master_password)
         self._bw = bw
         self._config = config
         self._client_id = config.client_id
@@ -355,7 +361,14 @@ class AuthManager:
         self._session_key = key
         self._session_created_at = time.time()
         self._state = AuthState.UNLOCKED
-        get_redacting_filter().register_secret(key)
+        # AUD-02 (phase 2): the session key lives for the whole UNLOCKED
+        # period — it is PROCESS-SCOPED redaction material, not an
+        # execution-scoped secret. register_process_scoped_secret is
+        # idempotent (permanent marking never inflates refcounts), so
+        # repeated unlocks of the same key cannot accumulate phantom
+        # references, and no execution-scoped release can ever drop it while
+        # the vault stays unlocked.
+        get_redacting_filter().register_process_scoped_secret(key)
         log.info("Vault unlocked; session key held in plugin memory only.")
 
     # -------------------------------------------------------- session mgmt
@@ -529,6 +542,16 @@ class AuthManager:
     # --------------------------------------------------------------- shutdown
     def _clear_session_locked(self) -> None:
         if self._session_key:
+            # AUD-02 (phase 2): the key leaves process scope when the vault
+            # locks. demote_process_scoped clears permanence ONLY while no
+            # active execution-scope holder still pins the value (refcount
+            # <= bootstrap baseline); any in-flight execution keeps it
+            # permanent AND redacted until its own scope closes. When
+            # demotion succeeds there is no live registration left, so the
+            # value simply drops out of the redaction state; forget_secret
+            # afterwards is a guaranteed no-op (unknown releases are
+            # sanitized warnings only, never exceptions).
+            get_redacting_filter().demote_process_scoped(self._session_key)
             get_redacting_filter().forget_secret(self._session_key)
         self._session_key = None
         self._session_created_at = 0.0

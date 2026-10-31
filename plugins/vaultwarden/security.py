@@ -38,6 +38,12 @@ SECRET_ENV_NAMES = ("VW_CLIENT_SECRET", "VW_MASTER_PASSWORD")
 
 _TOKEN_RE = re.compile(r"__VW_SECRET_([0-9a-f]{12})__")
 
+#: Logger for redactor-internal diagnostics (AUD-02). Deliberately a plain
+#: logging.Logger WITHOUT the RedactingFilter attached: the filter must never
+#: recurse into its own logging, and every message emitted through it is
+#: sanitized by construction (counts / lengths only, never secret values).
+_module_logger = logging.getLogger(__name__)
+
 
 def is_placeholder(text: str) -> bool:
     return isinstance(text, str) and "__VW_SECRET_" in text
@@ -100,22 +106,192 @@ class RedactingFilter(logging.Filter):
 
     Session keys are rendered as [SESSION:****]; master password / client
     secret / resolved credentials are replaced entirely with [REDACTED].
+
+    AUD-02 (phase 1): execution-scoped secrets are retained with reference
+    counts (:meth:`retain_secret` / :meth:`release_secret`) so a value still
+    in use by another active execution is never dropped, while values whose
+    last holder released them leave the redaction state instead of lingering
+    for the process lifetime. Long-lived bootstrap material is marked
+    permanent (:meth:`register_process_scoped_secret`) and can never be
+    removed by an execution-scoped release. ``register_secret`` /
+    ``forget_secret`` keep working unchanged: they map onto retain/release
+    semantics (a plain register on an already-permanent secret does not
+    change its permanence).
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._lock = threading.Lock()
+        # RLock: re-entrant, so public entry points may compose the private
+        # _*_locked helpers without risking deadlock or lock-ordering bugs.
+        self._lock = threading.RLock()
         self._secrets: set[str] = set()
+        self._secret_refcounts: dict[str, int] = {}
+        self._permanent_secrets: set[str] = set()
 
+    # ---------------------------------------------------- internal (locked)
+    def _retain_locked(self, value: str) -> None:
+        """Increment the refcount for *value* (caller must hold ``_lock``)."""
+        self._secret_refcounts[value] = self._secret_refcounts.get(value, 0) + 1
+        self._secrets.add(value)
+
+    def _release_locked(self, value: str) -> bool:
+        """Decrement the refcount for *value*; drop it when it hits zero.
+
+        Permanent secrets are NEVER removed from the redaction state — their
+        refcount is clamped at 1 instead. Returns True when *value* had a
+        live registration before this call (False => unknown release).
+        Caller must hold ``_lock``.
+        """
+        count = self._secret_refcounts.get(value)
+        if count is None:
+            return False
+        if value in self._permanent_secrets:
+            # Never below one: execution-scoped releases must not remove a
+            # process-scoped secret.
+            self._secret_refcounts[value] = max(count - 1, 1)
+            return True
+        if count <= 1:
+            del self._secret_refcounts[value]
+            self._secrets.discard(value)
+        else:
+            self._secret_refcounts[value] = count - 1
+        return True
+
+    def _bootstrap_locked(self, value: str) -> None:
+        """Register *value* as process-scoped WITHOUT inflating its refcount.
+
+        AUD-02 phase 2: long-lived material (bootstrap credentials, session
+        keys, startup-injection values) is re-registered on every unlock /
+        SecretSource refresh. Under plain retain semantics each refresh
+        would add a +1 that NEVER has a matching release — unbounded global
+        retention. Permanent values are clamped at refcount 1 by
+        :meth:`_release_locked`, so ensuring a baseline of exactly one here
+        keeps them permanently redacted while remaining releasable through
+        the legacy lifecycle path (see :meth:`demote_process_scoped`).
+        Caller must hold ``_lock``.
+        """
+        self._permanent_secrets.add(value)
+        self._secrets.add(value)
+        if self._secret_refcounts.get(value, 0) < 1:
+            self._secret_refcounts[value] = 1
+
+    def demote_process_scoped(self, value: str) -> bool:
+        """Return *value* to normal refcounted retention (AUD-02 phase 2).
+
+        Used by the session-key lifecycle: while unlocked the key is
+        process-scoped (a mid-session execution-scoped release must never
+        drop it); when the vault locks, the owning component releases its
+        bootstrap pin first. Demotion clears permanence ONLY while the value
+        still sits at the bootstrap baseline (refcount <= 1): any active
+        execution-scoped holder keeps the value permanent AND redacted, so a
+        lock operation can never prematurely remove a secret another
+        in-flight execution still needs. Returns True when permanence was
+        actually cleared. Never raises; empty values are ignored.
+        """
+        if not value:
+            return False
+        with self._lock:
+            if value not in self._permanent_secrets:
+                return False
+            if self._secret_refcounts.get(value, 0) > 1:
+                # Active execution holders: keep it pinned & permanent.
+                return False
+            self._permanent_secrets.discard(value)
+            if value not in self._secret_refcounts:
+                # No live registration left at all — drop from redaction.
+                self._secrets.discard(value)
+            return True
+
+    # ------------------------------------------------------------ lifecycle
+    def retain_secret(self, value: str) -> None:
+        """
+        Increment reference count for an execution-scoped secret.
+
+        The value stays redacted until every holder released it (see
+        :meth:`release_secret`). Empty / too-short values are ignored,
+        matching :meth:`register_secret`'s historical minimum-length guard.
+        """
+        if not value or len(value) < 4:
+            return
+        with self._lock:
+            self._retain_locked(value)
+
+    def release_secret(self, value: str) -> None:
+        """
+        Decrement reference count for an execution-scoped secret.
+
+        Remove from redaction state only when count reaches zero and the
+        secret is not permanent. Releasing an unknown value is a no-op that
+        logs a sanitized warning (length fingerprint only — the value itself
+        is never logged).
+        """
+        if not value:
+            return
+        with self._lock:
+            known = self._release_locked(value)
+        if not known:
+            # Sanitized diagnostic: never expose the secret value here.
+            _module_logger.warning(
+                "Redactor release for unknown secret (len=%d); ignored.",
+                len(value))
+
+    def register_process_scoped_secret(self, value: str) -> None:
+        """
+        Mark/retain a long-lived secret for the process lifetime.
+
+        Execution-scoped releases (:meth:`release_secret` /
+        :meth:`forget_secret`) must not remove it. Idempotent: repeated
+        calls do not inflate the refcount beyond one — long-lived material
+        is re-registered on every unlock/refresh and must never accumulate
+        phantom refcounts (AUD-02: no unbounded global retention).
+        """
+        if not value or len(value) < 4:
+            return
+        with self._lock:
+            self._bootstrap_locked(value)
+
+    def active_secret_count(self) -> int:
+        """
+        Return number of currently retained secret values.
+
+        Must not expose values.
+        """
+        with self._lock:
+            return len(self._secrets)
+
+    def has_secret(self, value: str) -> bool:
+        """
+        Test helper. Must not log the value.
+        """
+        with self._lock:
+            return value in self._secrets
+
+    # ------------------------------------------------------- compatibility
     def register_secret(self, value: str) -> None:
-        """Register a runtime secret value to scrub from every log record."""
-        if value and len(value) >= 4:
-            with self._lock:
+        """Register a runtime secret value to scrub from every log record.
+
+        AUD-02 phase 1: behaves like :meth:`retain_secret` — unless the
+        value is already process-scoped/permanent, in which case its
+        permanence (and refcount) are left untouched.
+        """
+        if not value or len(value) < 4:
+            return
+        with self._lock:
+            if value in self._permanent_secrets:
+                # Permanence preserved; make sure the value is still part of
+                # the redaction state, but never inflate its refcount.
                 self._secrets.add(value)
+                self._secret_refcounts.setdefault(value, 1)
+                return
+            self._retain_locked(value)
 
     def forget_secret(self, value: str) -> None:
-        with self._lock:
-            self._secrets.discard(value)
+        """Release a previously registered secret (refcount-aware).
+
+        Behaves like :meth:`release_secret`: the value leaves the redaction
+        state only when its last holder releases it and it is not permanent.
+        """
+        self.release_secret(value)
 
     def snapshot_secrets(self) -> list[str]:
         """Thread-safe copy of the registered secret values, LONGEST first.
@@ -155,11 +331,28 @@ class RedactingFilter(logging.Filter):
         return True
 
 
-#: shared filter instance used by all plugin modules
+#: shared filter instance used by all plugin modules.
+#: AUD-02 (phase 2): created EAGERLY at import (exactly one instance per
+#: process for production code) but always resolved through
+#: :func:`get_redacting_filter`. Tests isolate suites by swapping
+#: ``vaultwarden.security._shared_filter`` via monkeypatch — consumers must
+#: therefore never cache the instance in their own module globals.
+#:
+#: AUD-02 (phase 2): bootstrap credentials are registered PROCESS-SCOPED
+#: exactly ONCE, at the single production entry point
+#: (``vaultwarden.register()``, see __init__.py), right after
+#: ``load_secrets()`` returns them — BEFORE any ``AuthManager`` exists, so
+#: even a failing bootstrap cannot echo them. ``AuthManager.__init__`` keeps
+#: calling :meth:`RedactingFilter.register_process_scoped_secret` with the
+#: same values afterwards; that call is IDEMPOTENT (permanent marking never
+#: inflates refcounts) which prevents the phantom-refcount / unbounded
+#: retention accumulation plain ``register_secret`` would cause across many
+#: manager constructions.
 _shared_filter = RedactingFilter()
 
 
 def get_redacting_filter() -> RedactingFilter:
+    """Return the process-wide RedactingFilter singleton."""
     return _shared_filter
 
 

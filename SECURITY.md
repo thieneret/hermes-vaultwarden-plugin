@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.6.3
+**Applies to:** v0.6.5
 
 ## Threat Model
 
@@ -122,6 +122,7 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 | Bitwarden appdata hardening | The Bitwarden appdata directory (`.bw-data`) is validated before `BITWARDENCLI_APPDATA_DIR` is exported and before every `bw` subprocess call. A symlinked, wrong-owner, or group/world-accessible `.bw-data` directory blocks Bitwarden CLI execution. |
 | `secrets.yaml` pre-parse validation | Before bootstrap secret parsing, `secrets.yaml` is validated as an absolute path, regular file, non-symlink, owned by the current effective UID, with no group/other access bits. An existing but insecure `secrets.yaml` is never parsed. |
 | Lifecycle hook fail-closed registration | Critical lifecycle hooks required for cleanup and session termination are validated and registered before tools are exposed. If a required lifecycle hook cannot be registered, plugin initialization aborts. Existing `transform_tool_result` and `tool_execution` fail-closed behavior remains unchanged. |
+| Scoped redaction lifecycle | Runtime secrets registered with the RedactingFilter are retained only for active execution scopes using thread-safe reference counting. Overlapping executions sharing a secret do not cause premature removal. Process-scoped secrets remain retained for the process lifetime. |
 
 ### File-injected Placeholder Injection (VWP-04) — Crash Recovery (VWP-20)
 
@@ -195,8 +196,7 @@ access.
 The `RedactingFilter` (in `security.py`) is a **defense-in-depth** mechanism.
 It provides an additional layer of protection but has known limitations:
 
-- **Memory storage:** Registered secrets are stored in plugin memory
-(`_secrets: set[str]`) for the duration of the operation.
+- **Memory storage:** Runtime secrets are retained using execution-scoped reference counting. A secret value is removed from the redaction state when all active execution scopes that retained it have completed. Process-scoped secrets, such as startup-injection secrets, remain retained for the process lifetime.
 - **String replacement:** Uses `str.replace()` which is not cryptographic.
 - **Known gaps:** Base64-encoded or otherwise transformed secrets may
 bypass detection.
@@ -222,6 +222,7 @@ The plugin's security controls are validated by dedicated test suites:
 | Crash recovery tests | Startup cleanup of stale temp files after SIGKILL/SIGTERM | VWP-20 |
 | Filesystem hardening tests | Symlink rejection, ownership enforcement, permission enforcement, plugin load failure, `.bw-data` blocking, insecure `secrets.yaml` rejection | AUD-03 / AUD-04 / AUD-08 |
 | Lifecycle hook registration tests | Missing or failing required lifecycle hook registration refuses plugin load; successful registration loads the plugin | AUD-06 |
+| Scoped redaction tests | Execution-scoped retain/release lifecycle, overlapping same-secret executions, process-scoped secret retention, and redactor baseline restoration | AUD-02 |
 | Session key injection regression tests | `BW_SESSION` reaches the isolated subprocess env (explicit + AuthManager fallback at the choke point), parent env still never inherited, session key never appears in error messages (locked → `SESSION_ERROR`, expired → `SESSION_EXPIRED`) | HOTFIX-01 (v0.6.4) |
 
 All CI checks (pytest, ruff) are **blocking** — a failing check prevents merge.
@@ -229,6 +230,10 @@ All CI checks (pytest, ruff) are **blocking** — a failing check prevents merge
 ## Development Rules
 
 - Never log raw `bw` output (use structured status codes only).
+- Runtime secrets must be retained through execution-scoped retain/release APIs; do not reintroduce unbounded global registration for runtime secrets.
+- Process-scoped secrets must be registered through the process-scoped retention API and must not be released by execution cleanup.
+- Secret release must be reference-counted and thread-safe.
+- Never log secret values when diagnosing redactor or scope lifecycle issues.
 - Always call `register_secret()` before any operation that handles secrets.
 - Always call `forget_secret()` in a `finally` block.
 - Never pass secret values as log message arguments.
@@ -289,7 +294,7 @@ try/except that swallows failures. Fail-closed is mandatory.
 - All CI checks (pytest, ruff) are **blocking** — a failing check prevents
 merge. (VWP-15)
 
-## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-03 + AUD-04 + AUD-06 + AUD-08 + HOTFIX-01 implemented)
+## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-02 + AUD-03 + AUD-04 + AUD-06 + AUD-08 + HOTFIX-01 implemented)
 
 | ID | Description | Implemented |
 | --- | --- | --- |
@@ -297,6 +302,7 @@ merge. (VWP-15)
 | SEC-02 | Atomic placeholder resolution for multi-occurrence commands — repeated placeholder references are resolved exactly once, creating one temp file and rewriting all occurrences to the same secure file reference | v0.5.7 |
 | SEC-03 | Fail-closed policy for local terminal backend (`allow_insecure_local_backend` opt-in; plugin refuses to load on `local`/unset backend by default) | v0.5.5 |
 | AUD-01 | HTTPS enforcement for `server_url` — `server_url` MUST use `https://` scheme; HTTP or missing scheme is rejected fail-closed at plugin load. Explicit developer override: `allow_insecure_http` | v0.6.0 |
+| AUD-02 | Scoped redaction lifecycle — runtime secrets registered with the RedactingFilter are retained only for active execution scopes using thread-safe reference counting; overlapping executions sharing a secret are protected from premature removal; process-scoped secrets remain retained for the process lifetime | v0.6.5 |
 | AUD-03 | Secrets directory fail-closed validation at plugin load — `register()` runs `secure_fs.ensure_hardened_directory()` before any tool/hook registration; symlink / wrong owner / mode ≠ 0700 aborts activation (no partial state, no silent chmod repair) | v0.6.2 |
 | AUD-04 | `.bw-data` fail-closed validation before any `bw` invocation — shared hardened-directory validator gates `BITWARDENCLI_APPDATA_DIR` export and every `bw` subprocess call; insecure appdata dir blocks `bw` execution | v0.6.2 |
 | AUD-06 | Fail-closed lifecycle hook registration — required `post_tool_call` and session-end lifecycle hooks are validated and registered before tools are exposed; plugin refuses to load if a required lifecycle hook cannot be registered | v0.6.3 |

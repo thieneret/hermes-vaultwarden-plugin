@@ -2,12 +2,32 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _stable_umask():
+    """Pin the process umask to 0o022 for every test and restore it after.
+
+    Some tests (e.g. test_secure_fs.py hostile-umask cases) temporarily call
+    ``os.umask()``; if an assertion fails mid-test the restore in ``finally``
+    still runs, but thread-safety/ordering under pytest-randomly previously
+    allowed a leaked restrictive umask (0o077/0o070) to poison later tests
+    that create intentionally insecure dirs via ``mkdir(mode=0o755)`` — the
+    umask silently masked the requested bits. This autouse guard makes every
+    test hermetic with respect to the process-wide umask.
+    """
+    old = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(old)
 
 # Repo reorganization (v0.4.4 step 1): the plugin now lives at
 # plugins/vaultwarden/, so the repo root is THREE levels up from this file
