@@ -517,14 +517,28 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             # very next list/store/update/delete call silently re-authenticated
             # and succeeded (the reported inconsistency). Matches the skill
             # contract: expect auth_state unlocked / session_active true.
-            # Guarded so a status call NEVER hard-fails if recovery itself
-            # fails (e.g. network down): we fall through to the observational
-            # snapshot, which then reports operational=false truthfully.
+            #
+            # Two-stage reconciliation:
+            #   1. get_session() is the LIGHTER entry point and the exact one
+            #      operations use (run_with_recovery -> get_session), so the
+            #      snapshot matches what the next list/store call would see.
+            #      It also lazily clears + re-unlocks EXPIRED in-memory keys —
+            #      something ensure_authenticated()'s remembered-key fast path
+            #      (auth.py Case C) does not do.
+            #   2. If that raises (never bootstrapped / logged out / network
+            #      down), fall back to the full ensure_authenticated() FSM
+            #      reconciliation.
+            # Both stages are guarded so a status call NEVER hard-fails: on
+            # total failure we return the observational snapshot, which then
+            # truthfully reports operational=false.
             try:
-                auth.ensure_authenticated()
-            except Exception:  # noqa: BLE001 - status must degrade, not raise
-                log.debug("status reconciliation failed; reporting "
-                          "observational snapshot.")
+                auth.get_session()
+            except Exception:  # noqa: BLE001 - degraded below, never raises
+                try:
+                    auth.ensure_authenticated()
+                except Exception:  # noqa: BLE001 - status must degrade, not raise
+                    log.debug("status reconciliation failed; reporting "
+                              "observational snapshot.")
             # v0.5.7 (SEC-02 companion): expose the running plugin version so
             # operators and the LLM can verify the exact build for debugging
             # and audit compliance. Read dynamically from plugin.yaml (single
