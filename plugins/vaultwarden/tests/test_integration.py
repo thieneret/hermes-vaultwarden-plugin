@@ -674,7 +674,7 @@ def test_multiple_secrets_all_released_after_execution(auth_manager, registry,
         return out
 
     result = mw("terminal",
-                {"command": f'cat "{e1.token}" "{e2.token}"'},
+                {"command": f'cat "${e1.token}" "${e2.token}"'},
                 None, terminal_retained, task_id="aud02-multi")
     # Both plaintexts retained DURING the execution:
     assert mid_seen["both"], "secrets not retained while execution active"
