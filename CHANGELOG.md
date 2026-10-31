@@ -5,6 +5,15 @@ Author: **thieneret**
 
 ---
 
+## v0.6.9
+
+- feat(security): implement AUD-01 HTTPS enforcement for `server_url`
+- NOTE: AUD-01 was originally implemented in v0.6.0 but immediately reverted (commit 5b61a18) before shipping; prior documentation incorrectly listed it as implemented. This is the first production implementation.
+- `server_url` MUST use `https://` scheme; `http://` rejected fail-closed at plugin load
+- Added `allow_insecure_http` config flag (default `false`) as explicit developer override for local/testing; it permits `http://` only and logs a sanitized WARNING
+- Invalid schemes (`ftp://`, `file://`, `ws://`, missing/empty) always rejected
+- Version bump to 0.6.9
+
 ## v0.6.8
 
 - fix(status): close root-cause status reporting bugs in `vaultwarden_status`

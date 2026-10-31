@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.6.8**
+**Current version: v0.6.9**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -95,7 +95,7 @@ plugins:
       settings:
         enabled: true
         server_url: "https://vault.example.com"
-        allow_insecure_http: false    # HTTPS enforcement override
+        allow_insecure_http: false   # permits http:// for local testing only
         client_id: "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
         allow_write: false
         allow_startup_secret_injection: false
@@ -196,7 +196,7 @@ Behavior and guarantees:
 | --- | --- |
 | `enabled` | Master switch. Default: `false` |
 | `server_url` | Vaultwarden server URL (required, HTTPS enforced) |
-| `allow_insecure_http` | Disables strict HTTPS enforcement for `server_url`. Default: `false`. If `true`, the plugin will connect to an `http://` server (useful for local testing or isolated networks). In production, this should remain `false`. |
+| `allow_insecure_http` | Permits cleartext `http://` for `server_url`. Default `false` (fail-closed). Set `true` only for local/testing — credentials will be transmitted in plaintext. Does not permit other schemes. |
 | `client_id` | API-key client id, format `user.<uuid>` (required) |
 | `allow_write` | Enables `store`/`update`/`delete` operations. Default: `false` |
 | `auto_sync` | Sync vault before read operations. Default: `true` |
@@ -324,7 +324,7 @@ mkdir -m 700 /path/to/real-dir
 | Binary path pinning | `bw` is executed ONLY from the REQUIRED absolute `bw_cli_path`. No PATH lookup, no env override. |
 | Bootstrap secrets via secrets.yaml | Read directly from `secrets.yaml` (mode 0600 enforced). Never enter `.env` or OS environment. |
 | Local-backend fail-closed policy | Plugin refuses to load on `local` backend unless `allow_insecure_local_backend: true` is set. |
-| HTTPS enforcement | `server_url` MUST use `https://` scheme; HTTP is rejected fail-closed unless `allow_insecure_http: true` is explicitly set. |
+| HTTPS enforcement | `server_url` must use `https://` scheme; `http://` is rejected fail-closed unless `allow_insecure_http: true` is explicitly set. |
 | Filesystem hardening | Secrets dir, `.bw-data`, and `secrets.yaml` validated via `secure_fs.py` before use. Symlinks, wrong owners, and loose permissions abort execution. |
 | Lifecycle hook fail-closed registration | Critical lifecycle hooks are validated before tools are exposed; plugin refuses to load if required hook registration fails. |
 | Scoped log-redaction lifecycle | Runtime secrets are retained only for active execution scopes and released afterward using reference-counted redaction. Process-scoped secrets remain protected for the process lifetime. |

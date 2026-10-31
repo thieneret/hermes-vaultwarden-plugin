@@ -1,5 +1,5 @@
 name: vaultwarden
-version: 0.6.8
+version: 0.6.9
 description: >
   Vaultwarden secrets management for Hermes Agent. Provides secure
   access to vault items via placeholder injection, plus SSH key
@@ -64,6 +64,14 @@ config:
       local/unset backend (fail-closed, CRITICAL log). Set TRUE only on
       trusted single-user machines (a WARNING is then logged). Recommended
       posture: use the docker / ssh / modal backends for privilege separation.
+  # AUD-01 (v0.6.9): fail-closed HTTPS enforcement for server_url.
+  allow_insecure_http:
+    type: boolean
+    default: false
+    description: >-
+      Permits cleartext http:// server_url. Default FALSE (fail-closed).
+      Set TRUE only for local/testing; credentials will be transmitted
+      in plaintext. Does NOT permit other schemes (ftp/file/ws).
   # v0.3.7 (VWP-14): allow_direct_secret_retrieval removed entirely.
   # vaultwarden_get_secret_ref always returns only a placeholder.
   auto_sync:
