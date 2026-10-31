@@ -561,13 +561,12 @@ def test_register_succeeds_when_middleware_registration_works(monkeypatch, tmp_p
 # ===========================================================================
 
 import re as _re_mod  # noqa: E402
-import threading  # noqa: E402
 
 from vaultwarden.hooks import (  # noqa: E402
     make_placeholder_resolver,
     make_result_redactor,
 )
-from vaultwarden.security import RedactingFilter, get_redacting_filter  # noqa: E402
+from vaultwarden.security import RedactingFilter  # noqa: E402
 
 
 def _isolated_filter(monkeypatch) -> RedactingFilter:
@@ -627,7 +626,8 @@ def test_single_execution_returns_redactor_to_baseline(auth_manager, registry,
                                                        plugin_config,
                                                        monkeypatch, tmp_path):
     filt = _isolated_filter(monkeypatch)
-    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir(mode=0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     secret = "AUD02-ONE-EXEC-SECRET"
     _seed_item_password(monkeypatch, PG_ID, secret)
@@ -644,7 +644,8 @@ def test_multiple_secrets_all_released_after_execution(auth_manager, registry,
                                                        plugin_config,
                                                        monkeypatch, tmp_path):
     filt = _isolated_filter(monkeypatch)
-    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir(mode=0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     s1, s2 = "AUD02-MULTI-SECRET-A", "AUD02-MULTI-SECRET-B"
     _seed_item_password(monkeypatch, PG_ID, s1)
@@ -687,7 +688,8 @@ def test_multiple_secrets_all_released_after_execution(auth_manager, registry,
 def test_two_executions_different_scopes_release_independently(
         auth_manager, registry, plugin_config, monkeypatch, tmp_path):
     filt = _isolated_filter(monkeypatch)
-    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir(mode=0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     s1, s2 = "AUD02-DIFF-SECRET-A", "AUD02-DIFF-SECRET-B"
     _seed_item_password(monkeypatch, PG_ID, s1)
@@ -708,7 +710,8 @@ def test_overlapping_executions_same_secret_not_removed_prematurely(
     """Two concurrent executions inject the SAME plaintext; the first scope
     closing must not drop the secret while the second still holds it."""
     filt = _isolated_filter(monkeypatch)
-    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir(mode=0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     secret = "AUD02-OVERLAP-SHARED-SECRET"
     _seed_item_password(monkeypatch, PG_ID, secret)
@@ -754,7 +757,8 @@ def test_overlapping_executions_same_secret_not_removed_prematurely(
 def test_three_overlapping_executions_refcount_tracks_holders_exactly(
         auth_manager, registry, plugin_config, monkeypatch, tmp_path):
     filt = _isolated_filter(monkeypatch)
-    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir(mode=0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     secret = "AUD02-THREE-HOLDER-SECRET"
     _seed_item_password(monkeypatch, PG_ID, secret)
@@ -800,7 +804,8 @@ def test_three_overlapping_executions_refcount_tracks_holders_exactly(
 def test_exception_during_execution_still_releases_secrets(
         auth_manager, registry, plugin_config, monkeypatch, tmp_path):
     filt = _isolated_filter(monkeypatch)
-    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir(mode=0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     secret = "AUD02-EXCEPTION-SECRET"
     _seed_item_password(monkeypatch, PG_ID, secret)
@@ -824,7 +829,8 @@ def test_exception_during_execution_still_releases_secrets(
 def test_process_scoped_secret_survives_execution_cleanup(
         auth_manager, registry, plugin_config, monkeypatch, tmp_path):
     filt = _isolated_filter(monkeypatch)
-    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir(mode=0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     startup_secret = "AUD02-PROCESS-SCOPED-VALUE"
     filt.register_process_scoped_secret(startup_secret)
@@ -847,7 +853,8 @@ def test_transform_redacts_when_dispatched_after_middleware_frame(
         auth_manager, registry, plugin_config, monkeypatch, tmp_path):
     """Deferred host ordering (transform AFTER frame return) keeps SEC-01."""
     filt = _isolated_filter(monkeypatch)
-    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir(mode=0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     secret = "AUD02-DEFERRED-TRANSFORM"
     _seed_item_password(monkeypatch, PG_ID, secret)
@@ -878,7 +885,8 @@ def test_no_secret_values_appear_in_logs(auth_manager, registry,
                                          plugin_config, monkeypatch, tmp_path,
                                          caplog):
     filt = _isolated_filter(monkeypatch)
-    xdg = tmp_path / "xdg"; xdg.mkdir(mode=0o700)
+    xdg = tmp_path / "xdg"
+    xdg.mkdir(mode=0o700)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     secret = "AUD02-LOGSAFE-SECRET"
     _seed_item_password(monkeypatch, PG_ID, secret)
