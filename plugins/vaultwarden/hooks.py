@@ -106,6 +106,168 @@ _DEFAULT_COMMAND_KEYS = ("command", "cmd", "input", "script", "code")
 #: callers that predate TTL wiring keep working unchanged.
 _DEFAULT_STALE_TTL_SECONDS = 300
 
+# ---------------------------------------------------------------------------
+# AUD-02 (phase 2): execution-scoped secret retention.
+#
+# Runtime secrets injected during a tool execution are retained on the shared
+# RedactingFilter ONLY for the lifetime of that execution scope (Phase-1 API:
+# retain_secret / release_secret / register_process_scoped_secret). After the
+# execution concludes — at the latest safe lifecycle point, i.e. AFTER the
+# authoritative transform_tool_result redaction has run for this execution —
+# the scope closes and releases each retained value exactly once.
+#
+# Overlapping executions sharing the same plaintext never cause premature
+# removal: the refcount tracks active holders exactly. Process-scoped secrets
+# (bootstrap credentials, session keys, startup-injection values) are pinned
+# permanent by the redactor and survive execution-scoped cleanup untouched.
+# ---------------------------------------------------------------------------
+
+
+class ExecutionSecretScope:
+    """Reference-counted secret scope for ONE tool execution (AUD-02 phase 2).
+
+    Wraps the Phase-1 redactor refcount API so runtime injected secrets are
+    retained only while the owning execution (and its downstream result
+    redaction / error surfacing) still needs them.
+
+    Guarantees:
+    - ``retain(value)`` registers *value* with the redactor at most ONCE per
+      unique value per scope (repeated injection of the same plaintext inside
+      one execution does not inflate the refcount);
+    - ``close()`` releases every retained value EXACTLY once, is idempotent
+      and thread-safe, and never raises — an unknown release on the redactor
+      side surfaces only as a sanitized warning there;
+    - nothing is ever logged that could expose a secret value.
+    """
+
+    def __init__(self, redactor: Any) -> None:
+        self._redactor = redactor
+        self._values: set[str] = set()
+        self._closed = False
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------- retain
+    def retain(self, value: str) -> None:
+        """Retain *value* for this execution scope (once per unique value)."""
+        if not value:
+            return
+        with self._lock:
+            if self._closed:
+                # Fail-safe: a late retain after close must NOT leak an
+                # un-releasable reference. Release immediately instead.
+                log.warning("ExecutionSecretScope.retain after close; "
+                            "value released immediately (len=%d).", len(value))
+                new_value = False
+            else:
+                new_value = value not in self._values
+                if new_value:
+                    self._values.add(value)
+        if new_value:
+            # Outside the scope lock: the redactor holds its own RLock and
+            # re-acquiring locks in nested order across modules invites
+            # lock-ordering bugs. The +1 happens exactly once per unique
+            # value per scope regardless of concurrent duplicate retains.
+            self._redactor.retain_secret(value)
+
+    # -------------------------------------------------------------- close
+    def close(self) -> None:
+        """Release every retained value exactly once. Idempotent."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            values = list(self._values)
+            self._values.clear()
+        for value in values:
+            # release_secret never raises; unknown releases are sanitized
+            # warnings on the redactor side (length fingerprint only).
+            self._redactor.release_secret(value)
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def early_release(self, value: str) -> None:
+        """Release *value* ahead of close (e.g. temp-file materialisation
+        finished and the plaintext is no longer needed mid-execution).
+
+        Removes it from the scope's tracked set so ``close()`` will not
+        double-release it. Unknown/never-retained values are ignored without
+        touching the redactor.
+        """
+        if not value:
+            return
+        with self._lock:
+            if value not in self._values:
+                return
+            self._values.discard(value)
+        self._redactor.release_secret(value)
+
+    def retained_count(self) -> int:
+        """Number of unique values this scope currently holds (no values)."""
+        with self._lock:
+            return len(self._values)
+
+
+#: ContextVar carrying the ACTIVE execution secret scope for the current
+#: execution context. Set by the tool_execution middleware around the actual
+#: tool call; read by _resolve_placeholder_token when registering injected
+#: plaintext for redaction.
+_execution_secret_scope: contextvars.ContextVar["ExecutionSecretScope | None"] = \
+    contextvars.ContextVar("vaultwarden_execution_secret_scope", default=None)
+
+
+def current_execution_scope() -> "ExecutionSecretScope | None":
+    """Return the active execution secret scope (None outside an execution)."""
+    return _execution_secret_scope.get()
+
+
+def _open_execution_scope(redactor: Any) -> tuple["ExecutionSecretScope", Any]:
+    """Create + publish a fresh execution scope; returns (scope, cv_token)."""
+    scope = ExecutionSecretScope(redactor)
+    token = _execution_secret_scope.set(scope)
+    return scope, token
+
+
+def _close_execution_scope(scope: ExecutionSecretScope, token: Any) -> None:
+    """Close *scope* exactly once and restore the previous ContextVar value."""
+    try:
+        scope.close()
+    finally:
+        try:
+            _execution_secret_scope.reset(token)
+        except ValueError:  # pragma: no cover - defensive (foreign context)
+            _execution_secret_scope.set(None)
+
+
+def retain_in_execution_scope(value: str, redactor: Any) -> None:
+    """Register runtime-injected *value* via the ACTIVE execution scope.
+
+    Falls back to a temporary LOCAL scope (retained now, released immediately)
+    when called without a surrounding middleware execution scope — e.g. legacy
+    direct callers. That path logs a sanitized warning (the missing parent
+    scope), never the value, and guarantees no unbounded global retention:
+    the local scope is closed in a finally block.
+    """
+    if not value:
+        return
+    scope = _execution_secret_scope.get()
+    if scope is not None:
+        scope.retain(value)
+        return
+    # Unexpected: no active parent scope. Fail-safe local scope so the value
+    # is redacted for the duration of THIS operation and released right after
+    # — never left registered process-wide (AUD-02: no unbounded retention).
+    log.warning("No active execution secret scope; using temporary local "
+                "scope (value length=%d, value itself never logged).",
+                len(value))
+    local = ExecutionSecretScope(redactor)
+    try:
+        local.retain(value)
+    finally:
+        local.close()
+
 
 def resolve_secrets_dir_path() -> Path:
     """Resolve (WITHOUT creating or validating) the secrets directory path.
@@ -322,7 +484,14 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
     # Write the secret to a mkstemp file (chmod 600, atomic, symlink-protected).
     path = _write_secret_file(six_hex, value, secrets_dir, temp_files)
     # Register the value so it gets scrubbed from any log line / output echo.
-    get_redacting_filter().register_secret(value)
+    # AUD-02 (phase 2): runtime injected plaintext is retained through the
+    # ACTIVE execution secret scope (refcounted via the Phase-1 redactor API)
+    # instead of the raw unbounded register_secret path — the owning
+    # middleware releases it exactly once when the execution concludes. If no
+    # parent scope exists unexpectedly (legacy/direct callers), the fail-safe
+    # helper uses a temporary local scope that is closed immediately after
+    # this operation and logs a sanitized warning (never the value).
+    retain_in_execution_scope(value, get_redacting_filter())
     # v0.1.4 (FAIL-6): also record the plaintext per-task so the redaction
     # layer can scrub it from this specific tool call's output even when the
     # global filter state was reset by another component in between.
@@ -423,7 +592,16 @@ def make_placeholder_resolver(auth: AuthManager,
         injected_values: list[str] = []
         new_args = dict(args)
         resolved_any = False
+        # AUD-02 (phase 2): open the execution secret scope BEFORE resolving
+        # any placeholder so every injected plaintext is retained through it
+        # (refcounted on the shared redactor). The scope closes exactly once,
+        # in the OUTERMOST finally below — i.e. only AFTER next_call returned
+        # (so the authoritative transform_tool_result redaction for THIS
+        # execution has consumed the handoff), after temp-file cleanup
+        # observability, and even when an exception aborts the lifecycle.
+        _scope, _scope_token = _open_execution_scope(get_redacting_filter())
         try:
+          try:
             for key in targets:
                 command = new_args[key]
                 # 1. Extract unique token bodies (first-seen order preserved).
@@ -475,7 +653,7 @@ def make_placeholder_resolver(auth: AuthManager,
                 return result
             finally:
                 _restore_injected_secrets(cv_token)
-        finally:
+          finally:
             # Cleanup temp files — MUST run even if the command fails/times
             # out. v0.5.8 OBSERVABLE CLEANUP: a failed deletion is logged as
             # a sanitized WARNING (path + error only). The path itself is
@@ -492,6 +670,21 @@ def make_placeholder_resolver(auth: AuthManager,
             # is the single OWNER that forgets injected values — neither the
             # transformer nor the observer pops them.
             take_task_secrets(task_id)
+        finally:
+            # AUD-02 (phase 2): LATEST SAFE LIFECYCLE POINT. Everything that
+            # may still need the injected plaintext has now run for THIS
+            # execution: next_call returned (so Hermes dispatched
+            # transform_tool_result on the returned object — the authoritative
+            # SEC-01 redaction consumed the handoff BEFORE the inner finally
+            # restored it), temp-file cleanup ran, and the per-task store was
+            # forgotten. Close the scope exactly once: each value retained by
+            # THIS scope is released once on the refcounted redactor, so an
+            # overlapping execution holding the same secret keeps it redacted
+            # until its own scope closes, and process-scoped secrets are never
+            # dropped by this path. Runs even when an exception aborted the
+            # lifecycle (fail-safe release). close() is idempotent and never
+            # raises.
+            _close_execution_scope(_scope, _scope_token)
 
     return vaultwarden_inject_secrets
 

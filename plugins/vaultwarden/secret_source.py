@@ -70,9 +70,16 @@ class VaultwardenSecretSource(SecretSourceABC):
                 if value:
                     key = str(m.get("env") or f"VW_{m['item_id']}")
                     out[key] = value
-                    # Register with redactor for log safety
+                    # Register with redactor for log safety.
+                    # AUD-02 (phase 2): startup-injection values are handed
+                    # to the agent environment for the whole session — they
+                    # are PROCESS-SCOPED, never execution-scoped. The
+                    # idempotent permanent registration means repeated
+                    # SecretSource refreshes cannot inflate refcounts or
+                    # leak unbounded retention, and execution cleanup can
+                    # never drop them.
                     from .security import get_redacting_filter
-                    get_redacting_filter().register_secret(value)
+                    get_redacting_filter().register_process_scoped_secret(value)
             except Exception as exc:  # fail-safe: never crash agent startup
                 log.warning("SecretSource mapping for %s failed (%s).",
                             m.get("item_id"), type(exc).__name__)
