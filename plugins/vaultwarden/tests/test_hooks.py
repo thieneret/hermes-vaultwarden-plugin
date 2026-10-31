@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import threading
 
 import pytest
@@ -19,6 +22,9 @@ from vaultwarden.hooks import (
     make_post_cleanup_hook,
     make_session_end_hook,
 )
+from vaultwarden.security import quote_injected_path
+
+BASH = shutil.which("bash")
 
 
 @pytest.fixture()
@@ -564,6 +570,215 @@ def test_retain_without_parent_scope_fails_safe(caplog):
     assert any("execution secret scope" in m for m in msgs)
     # Sanitized: the value itself never appears in ANY log record.
     assert all("llll-orphan-secret" not in m for m in msgs)
+
+
+# ---------------------------------------------------- AUD-05 phase 2 wiring
+#: The middleware must embed every injected temp path through the shell-safe
+#: quoting helper: $(< '/quoted/path') — never the raw $(< /raw/path) form.
+
+
+def _quoted_frag(path: str) -> str:
+    """Expected quoted fragment for *path* (canonical POSIX single-quoting)."""
+    return "$(< '" + path.replace("'", "'\\''") + "')"
+
+
+@pytest.fixture()
+def hostile_dir(tmp_path):
+    """A hardened (0700, owned) runtime dir whose NAME carries metachars."""
+    d = tmp_path / "vw run;dir"
+    d.mkdir(mode=0o700)
+    yield str(d)
+    # best-effort cleanup of any leftover temp files
+    for f in os.listdir(d):
+        try:
+            os.unlink(os.path.join(d, f))
+        except OSError:
+            pass
+    try:
+        os.rmdir(d)
+    except OSError:
+        pass
+
+
+def _point_secrets_dir_at(monkeypatch, directory: str):
+    """Pin BOTH creation and basename checks to a hostile-but-valid dir."""
+    monkeypatch.setattr("vaultwarden.hooks.resolve_secrets_dir_path",
+                        lambda: __import__("pathlib").Path(directory))
+    real_check = __import__("vaultwarden.secure_fs", fromlist=["x"])
+
+    def patched(p, **kw):
+        return real_check.ensure_hardened_directory(
+            __import__("pathlib").Path(directory), **kw)
+
+    monkeypatch.setattr("vaultwarden.hooks.ensure_hardened_directory",
+                        patched)
+
+
+def test_substitution_emits_quoted_fragment(mw, registry, hostile_dir,
+                                            monkeypatch):
+    """Normal substitution: rewritten command uses $(< 'quoted-path')."""
+    _point_secrets_dir_at(monkeypatch, hostile_dir)
+    t = token_for(registry)
+    res, seen = run_mw(mw, "terminal", {"command": f'run --secret "{t}"'})
+    assert res == {"output": "ran"}
+    paths = _injected_paths(seen["command"])
+    assert len(paths) == 1
+    assert _quoted_frag(paths[0]) in seen["command"]
+    assert t not in seen["command"]          # no unresolved leftovers
+    assert "sup3r-s3cret-pg!" not in seen["command"]
+
+
+def test_multi_occurrence_same_quoted_fragment(mw, registry, hostile_dir,
+                                               monkeypatch):
+    """SEC-02 preserved under AUD-05: ONE resolve call, ONE temp file,
+    ALL occurrences rewritten to the SAME quoted fragment."""
+    _point_secrets_dir_at(monkeypatch, hostile_dir)
+    t = token_for(registry)
+    suffix = t[1:][len("__VW_SECRET_"):-len("__")]
+
+    calls: list[str] = []
+    real_car = registry.consume_and_resolve
+
+    def spy_car(token):
+        calls.append(token)
+        return real_car(token)
+
+    monkeypatch.setattr(registry, "consume_and_resolve", spy_car)
+
+    created: list[str] = []
+    from vaultwarden import hooks as _hooks_mod
+    real_writer = _hooks_mod._write_secret_file
+
+    def spy_writer(token, value, secrets_dir, temp_files):
+        path = real_writer(token, value, secrets_dir, temp_files)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr("vaultwarden.hooks._write_secret_file", spy_writer)
+
+    command = f'curl -H "Auth: {t}" -H "Cookie: {t}" -d "pw={t}"'
+    _, seen = run_mw(mw, "terminal", {"command": command})
+    out_cmd = seen["command"]
+
+    assert calls == [f"__VW_SECRET_{suffix}__"]   # exactly ONE resolve
+    assert len(created) == 1                      # exactly ONE temp file
+    frags = set(re.findall(r"\$\(<\s*'[^']*(?:'\\''[^']*)*'\s*\)", out_cmd))
+    assert len(frags) == 1                        # ONE distinct fragment
+    assert out_cmd.count(frags.pop()) == 3        # reused for all 3 spots
+    assert set(_injected_paths(out_cmd)) == {created[0]}
+    assert t not in out_cmd
+    assert "sup3r-s3cret-pg!" not in out_cmd
+
+
+def test_runtime_dir_with_space_stays_isolated(mw, registry, hostile_dir,
+                                               monkeypatch):
+    """Runtime dir containing a SPACE: path is fully quoted, one arg."""
+    _point_secrets_dir_at(monkeypatch, hostile_dir)  # dir name has a space
+    t = token_for(registry)
+    _, seen = run_mw(mw, "terminal", {"command": f"cat {t}"})
+    frag = _quoted_frag(_injected_paths(seen["command"])[0])
+    assert frag in seen["command"]
+    assert " " in frag                            # space lives INSIDE quotes
+    # The inner path word is ONE single-quoted token -> the shell never
+    # word-splits it.  (shlex.split on the RAW command cannot model the
+    # nested single quotes inside $( ... ) -- that is a Python-shlex
+    # limitation, already covered by the bash -n tests; here we verify the
+    # quoting structure itself: exactly two quote chars and no bare space.)
+    inner = frag[len("$(< '"):-2]               # strip "$(< '" and trailing "')"
+    assert inner.count("'") == 0                  # nothing closes the quote early
+    assert " " in inner                           # space is INSIDE the quotes
+    assert seen["command"].count("'") == 2        # only our open/close pair
+
+
+@pytest.mark.parametrize("meta", [";", "`id`", "$(pwd)", "|", "&", "$HOME"])
+def test_runtime_dir_metacharacters_neutralised(mw, registry, tmp_path,
+                                                monkeypatch, meta):
+    """Runtime dir with ; / backtick / $() / pipe / & : quoted, inert."""
+    d = tmp_path / f"vw run{meta}dir"
+    d.mkdir(mode=0o700)
+    _point_secrets_dir_at(monkeypatch, str(d))
+    t = token_for(registry)
+    _, seen = run_mw(mw, "terminal", {"command": f"cat {t}"})
+    cmd = seen["command"]
+    paths = _injected_paths(cmd)
+    assert len(paths) == 1 and d.name in paths[0]
+    frag = _quoted_frag(paths[0])
+    assert frag in cmd                            # properly quoted form
+    assert cmd.count("$(") == 1 or meta in ("$(pwd)",)  # $( only inside our op or quoted body
+    if BASH:
+        chk = subprocess.run([BASH, "-n", "-c", cmd], capture_output=True)
+        assert chk.returncode == 0, chk.stderr.decode()
+
+
+def test_runtime_dir_newline_fails_closed(mw, registry, tmp_path, caplog,
+                                          monkeypatch):
+    """Control-character runtime dir: fail closed, NO unsafe substitution."""
+    d = tmp_path / ("vw bad\ndir")
+    d.mkdir(mode=0o700)
+    _point_secrets_dir_at(monkeypatch, str(d))
+    t = token_for(registry)
+    command = f"cat {t}"
+    _PENDING_ERRORS.clear()
+    with caplog.at_level("ERROR"):
+        res, seen = run_mw(mw, "terminal", {"command": command})
+    assert res == {"output": "ran"}
+    # untouched command passed on: token verbatim ($ expands to empty string)
+    assert seen["command"] == command
+    assert "$(<" not in seen["command"]           # no substitution emitted
+    pending = [e for errs in _PENDING_ERRORS.values() for e in errs]
+    assert any(e["error_code"] == "PLACEHOLDER_ERROR" for e in pending)
+    # sanitized logging only: secret value never appears anywhere
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "sup3r-s3cret-pg!" not in joined
+    _PENDING_ERRORS.clear()
+
+
+def test_middleware_not_run_fallback_expands_empty(hostile_dir):
+    """$-prefix fail-safe: without the middleware the shell still runs the
+    command and $__VW_SECRET_x__ expands to an EMPTY string (no error)."""
+    if not BASH:
+        pytest.skip("bash not available")
+    probe = os.path.join(hostile_dir, "probe.txt")
+    cmd = f'printf %s "${{__VW_SECRET_deadbeefcafe__}}" > {shlex.quote(probe)}'
+    rc = subprocess.run([BASH, "-c", cmd], capture_output=True)
+    assert rc.returncode == 0                     # valid shell syntax
+    with open(probe) as fh:
+        assert fh.read() == ""                    # empty expansion
+
+
+def test_redaction_still_applied_after_quoting(mw, registry, auth_manager,
+                                               hostile_dir, monkeypatch):
+    """SEC-01 unchanged: the authoritative transform_tool_result redactor
+    still scrubs echoes even though the injected fragment is now quoted."""
+    from vaultwarden.hooks import make_result_redactor
+
+    _point_secrets_dir_at(monkeypatch, hostile_dir)
+    redact = make_result_redactor(auth_manager, registry)
+    t = token_for(registry)
+    _, seen = run_mw(mw, "terminal", {"command": f"cat {t}"},
+                     task_id="aud05-red")
+    frag = _quoted_frag(_injected_paths(seen["command"])[0])
+    leaked = {"output": f"leaked sup3r-s3cret-pg! via {frag} done"}
+    observed = redact("terminal", leaked, task_id="aud05-red")
+    assert "sup3r-s3cret-pg!" not in observed["output"]
+    assert "[REDACTED]" in observed["output"]
+    assert frag in observed["output"]          # path itself stays visible
+
+
+def test_executed_expansion_reads_dummy_file(tmp_path):
+    """Execute (synthetic dummy, NOT a real secret): bash expands the
+    quoted fragment to the exact file content, spaces included."""
+    if not BASH:
+        pytest.skip("bash not available")
+    d = tmp_path / "dummy run dir"
+    d.mkdir()
+    dummy = d / "secretfile"
+    dummy.write_text("DUMMY-NOT-A-SECRET\n")
+    frag = quote_injected_path(str(dummy))
+    rc = subprocess.run([BASH, "-c", f'echo "value={frag}"'],
+                        capture_output=True)
+    assert rc.returncode == 0
+    assert rc.stdout.decode().strip() == "value=DUMMY-NOT-A-SECRET"
 
 
 def test_current_execution_scope_none_outside_execution():

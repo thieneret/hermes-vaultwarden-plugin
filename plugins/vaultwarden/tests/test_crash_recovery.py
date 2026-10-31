@@ -23,7 +23,6 @@ from vaultwarden.hooks import (
     make_placeholder_resolver,
 )
 
-
 #: AUD-05 phase 2: the middleware emits $(< '/quoted/path'); the bare form
 #: is still matched for robustness.
 _INJECTED_PATH_RE = re.compile(
