@@ -574,27 +574,99 @@ class AuthManager:
             if not keep_appdata:  # pragma: no cover - destructive, off by default
                 log.debug("keep_appdata=False requested; leaving .bw-data untouched for safety.")
 
+    def _capability_locked(self) -> tuple[AuthState, bool, float | None]:
+        """Authoritative capability predicate — single source of truth.
+
+        Phase-2B (Bug #1 fix): mirrors ``is_unlocked()`` / ``get_session_key()``
+        with AND-semantics: UNLOCKED ∧ key-present ∧ age <= timeout. Presence
+        alone is NOT capability — a stale key lingering while the FSM sits in
+        LOGGED_IN (e.g. lock()/expiry race windows) can never be injected by
+        the v0.6.4 ``_ensure_session_env`` choke point, because
+        ``get_session_key()`` gates on UNLOCKED. Computed without mutating
+        anything (unlike ``is_unlocked()``, which lazily clears expired
+        sessions); recovery-on-read happens in the status handler instead.
+
+        Caller MUST hold ``self._lock`` (RLock — re-entrant on the owner).
+        Returns ``(state, usable, age_or_None)``; ``age`` is the RAW key age
+        whenever a key is present, even when ``usable`` is False, so
+        ``session_age_seconds`` keeps reporting the numeric value for existing
+        consumers.
+        """
+        has_key = bool(self._session_key)
+        age = (time.time() - self._session_created_at) if has_key else None
+        usable = (
+            self._state is AuthState.UNLOCKED
+            and has_key
+            and age is not None
+            and age <= self._config.session_timeout_seconds
+        )
+        return self._state, usable, age
+
     def status_snapshot(self) -> dict:
+        # NOTE: deliberately observational — no lazy expiry *enforcement*
+        # (i.e. no state mutation) here; operations recover via
+        # get_session()/run_with_recovery(), and the vaultwarden_status tool
+        # additionally reconciles BEFORE snapshotting (Phase-2B Bug #2 fix,
+        # tools.py h_status), so the snapshot an operator sees reflects the
+        # post-recovery state.
         bw_status = self.probe_status()
+        # Raw `bw status` profile state, unmodified (real bw uses "status";
+        # older fixtures used "state"). This is the CLI's PERSISTENT-session
+        # view of the isolated profile — by security design the plugin never
+        # persists BW_SESSION to disk/os.environ, so this legitimately reads
+        # "locked" even while every operation succeeds via per-command
+        # BW_SESSION injection (_ensure_session_env, v0.6.4 HOTFIX).
+        bw_profile_state = (bw_status.get("status")
+                            or bw_status.get("state") or "unknown")
         with self._lock:
-            state = self._state.value
-            has_session = bool(self._session_key)
-            age = (time.time() - self._session_created_at) if has_session else None
+            state, usable, age = self._capability_locked()
+            state = state.value
+        # Phase-2B (Bug #1 fix): the capability fields are driven by ONE
+        # authoritative AND-predicate — UNLOCKED ∧ key-present ∧ unexpired —
+        # identical to what get_session_key()/is_unlocked() use to decide
+        # whether BW_SESSION can actually be injected per-command (v0.6.4
+        # _ensure_session_env choke point). Presence-only over-reported
+        # capability whenever a stale key lingered in LOGGED_IN state or the
+        # session had expired; both cases now correctly read False.
+        session_key_available = usable
         return {
             "plugin": "vaultwarden",
             "enabled": self._config.enabled,
             "auth_state": state,
-            "session_active": has_session,
+            # Phase-2B: reinterpreted as the authoritative capability flag
+            # (was presence-only `bool(self._session_key)`). Type-compatible
+            # (bool); every pinned scenario (fresh unlock -> True, no key ->
+            # False) keeps its value — only the stale-key/expired edge cases
+            # change, which is precisely Bug #1.
+            "session_active": usable,
+            # Raw age whenever a key is present — NOT nulled out on expiry, so
+            # existing numeric consumers keep working.
             "session_age_seconds": round(age, 1) if age is not None else None,
             "session_timeout_seconds": self._config.session_timeout_seconds,
             "server_configured": self._config.server_url,
+            # ---- additive fields (v0.6.x status fix): new consumers should
+            # prefer these over reinterpreting session_active/server_status.
+            # True iff AuthManager holds an INJECTABLE BW_SESSION value under
+            # the authoritative gate — i.e. the plugin CAN perform read/write
+            # operations right now.
+            "session_key_available": session_key_available,
+            # Overall operational capability: same predicate as above; kept
+            # separate so operators can distinguish "usable session" from the
+            # raw FSM state without inferring across fields.
+            "operational": session_key_available,
+            # Verbatim persistent-session state reported by `bw status` for
+            # the isolated profile — informational fidelity, NOT capability.
+            # Unchanged by design (Phase-2B CHANGE 3): legitimately "locked"
+            # while operational=true because BW_SESSION is memory-only.
+            "bw_profile_state": bw_profile_state,
             "server_status": {
                 # v0.2.6 (BUGFIX): use internal session state for the lock indicator.
                 # bw status is called WITHOUT BW_SESSION (session key lives in plugin
                 # memory only, by design), so it always reports "locked" even when
                 # the plugin holds an active session. The internal state is authoritative.
-                "state": "unlocked" if has_session else (
-                    bw_status.get("status") or bw_status.get("state") or "unknown"),
+                # Phase-2B: "unlocked" now requires the USABLE predicate, so a stale/
+                # expired key no longer falsely flips this indicator.
+                "state": "unlocked" if usable else bw_profile_state,
                 "serverUrl": bw_status.get("serverUrl"),
                 "userEmail": bw_status.get("userEmail"),
                 "userId": bw_status.get("userId"),
