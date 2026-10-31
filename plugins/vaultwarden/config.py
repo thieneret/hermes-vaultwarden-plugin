@@ -48,6 +48,11 @@ _DEFAULTS: dict[str, Any] = {
     # plugin REFUSES to load unless the operator explicitly opts in by setting
     # this flag to true. Any ambiguity resolves to false — never fail open.
     "allow_insecure_local_backend": False,
+    # AUD-01 (v0.6.9): fail-closed HTTPS enforcement for server_url. Default
+    # FALSE: validate() rejects any non-https scheme. Setting TRUE permits
+    # ONLY http:// (local/testing); ftp/file/ws/missing schemes remain
+    # rejected regardless — never fail open.
+    "allow_insecure_http": False,
     # v0.5.3: startup-injection mappings consumed by the optional
     # SecretSource adapter (see __init__.py / secret_source.py). Listed in
     # _DEFAULTS so extract_plugin_section() picks them up via the native
@@ -176,6 +181,14 @@ class PluginConfig:
     def allow_insecure_local_backend(self) -> bool:
         return _as_bool(self._raw("allow_insecure_local_backend"))
 
+    # AUD-01 (v0.6.9): explicit opt-in permitting cleartext http:// server_url
+    # for local/testing deployments ONLY. Default FALSE = fail-closed:
+    # validate() requires https://. This flag permits ONLY http:// — it never
+    # permits any other scheme (ftp/file/ws/missing are always rejected).
+    @property
+    def allow_insecure_http(self) -> bool:
+        return _as_bool(self._raw("allow_insecure_http"))
+
     # VWP-13 (v0.4.3): when True, vaultwarden_list / vaultwarden_search mask
     # `username` and `uris` with "***". Default OFF preserves usability.
     @property
@@ -269,9 +282,47 @@ class PluginConfig:
             return Path(hermes_home).expanduser() / "plugins" / "vaultwarden" / ".bw-data"
         return PLUGIN_DIR / ".bw-data"
 
+    def _validate_server_url_scheme(self) -> None:
+        """AUD-01 (v0.6.9): strictly enforce https:// server_url.
+
+        Fail-closed: only https:// is accepted by default. The explicit
+        ``allow_insecure_http`` override permits ONLY http:// — every other
+        scheme (ftp/file/ws/missing/empty) is rejected regardless of the
+        flag. The WARNING log contains ONLY the scheme and hostname — never
+        credentials, paths, query strings, or session data.
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.server_url)
+        scheme = parsed.scheme.lower()
+
+        if scheme == "https":
+            return
+
+        if scheme == "http":
+            if self.allow_insecure_http:
+                log.warning(
+                    "server_url uses insecure scheme 'http' for host %s "
+                    "(allow_insecure_http=true). Credentials travel in "
+                    "plaintext. Disable in production.",
+                    parsed.hostname or "<unknown>",
+                )
+                return
+            raise errors.ConfigError(
+                "secrets.vaultwarden.server_url must use https://. "
+                "Set allow_insecure_http: true to permit http:// for "
+                "local/testing environments."
+            )
+
+        raise errors.ConfigError(
+            "secrets.vaultwarden.server_url has unsupported scheme "
+            f"'{scheme}'; only https:// is accepted."
+        )
+
     def validate(self) -> None:
         if not self.server_url:
             raise errors.ConfigError("secrets.vaultwarden.server_url is required.")
+        self._validate_server_url_scheme()
         if not self.client_id:
             raise errors.ConfigError("secrets.vaultwarden.client_id is required.")
         if not self.client_id.startswith("user."):
