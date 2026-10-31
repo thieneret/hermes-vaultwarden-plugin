@@ -157,31 +157,50 @@ class RedactingFilter(logging.Filter):
             self._secret_refcounts[value] = count - 1
         return True
 
-    def _migrate_legacy_state_locked(self) -> None:
-        """AUD-02 phase 1 migration shim (one-time, lazy).
+    def _bootstrap_locked(self, value: str) -> None:
+        """Register *value* as process-scoped WITHOUT inflating its refcount.
 
-        The pre-refcount codebase kept a single global ``_secrets`` set and
-        relied on SET semantics: repeated ``register_secret`` calls were
-        idempotent and ``forget_secret`` removed a value outright. Test
-        fixtures that build several AuthManagers against the shared filter
-        therefore leave bootstrap values registered once, with no matching
-        release. When reference counting was introduced those entries would
-        otherwise accumulate phantom refcounts (every new manager registers
-        "cs-secret" again -> forget removes nothing), silently changing the
-        behaviour legacy call sites depend on.
-
-        To keep Phase 1 strictly redactor-side we migrate every entry that
-        exists in ``_secrets`` but has NO refcount bookkeeping yet into the
-        permanent (process-scoped) class with refcount 1: exactly the old
-        "registered until explicitly forgotten" retention model, now visible
-        through the new state. Freshly retained values always get a refcount
-        inside the lock, so an entry without one can only pre-date the
-        migration. This runs once per filter instance, under ``_lock``.
+        AUD-02 phase 2: long-lived material (bootstrap credentials, session
+        keys, startup-injection values) is re-registered on every unlock /
+        SecretSource refresh. Under plain retain semantics each refresh
+        would add a +1 that NEVER has a matching release — unbounded global
+        retention. Permanent values are clamped at refcount 1 by
+        :meth:`_release_locked`, so ensuring a baseline of exactly one here
+        keeps them permanently redacted while remaining releasable through
+        the legacy lifecycle path (see :meth:`demote_process_scoped`).
+        Caller must hold ``_lock``.
         """
-        for value in self._secrets:
+        self._permanent_secrets.add(value)
+        self._secrets.add(value)
+        if self._secret_refcounts.get(value, 0) < 1:
+            self._secret_refcounts[value] = 1
+
+    def demote_process_scoped(self, value: str) -> bool:
+        """Return *value* to normal refcounted retention (AUD-02 phase 2).
+
+        Used by the session-key lifecycle: while unlocked the key is
+        process-scoped (a mid-session execution-scoped release must never
+        drop it); when the vault locks, the owning component releases its
+        bootstrap pin first. Demotion clears permanence ONLY while the value
+        still sits at the bootstrap baseline (refcount <= 1): any active
+        execution-scoped holder keeps the value permanent AND redacted, so a
+        lock operation can never prematurely remove a secret another
+        in-flight execution still needs. Returns True when permanence was
+        actually cleared. Never raises; empty values are ignored.
+        """
+        if not value:
+            return False
+        with self._lock:
+            if value not in self._permanent_secrets:
+                return False
+            if self._secret_refcounts.get(value, 0) > 1:
+                # Active execution holders: keep it pinned & permanent.
+                return False
+            self._permanent_secrets.discard(value)
             if value not in self._secret_refcounts:
-                self._permanent_secrets.add(value)
-                self._secret_refcounts[value] = 1
+                # No live registration left at all — drop from redaction.
+                self._secrets.discard(value)
+            return True
 
     # ------------------------------------------------------------ lifecycle
     def retain_secret(self, value: str) -> None:
@@ -195,7 +214,6 @@ class RedactingFilter(logging.Filter):
         if not value or len(value) < 4:
             return
         with self._lock:
-            self._migrate_legacy_state_locked()
             self._retain_locked(value)
 
     def release_secret(self, value: str) -> None:
@@ -210,7 +228,6 @@ class RedactingFilter(logging.Filter):
         if not value:
             return
         with self._lock:
-            self._migrate_legacy_state_locked()
             known = self._release_locked(value)
         if not known:
             # Sanitized diagnostic: never expose the secret value here.
@@ -224,19 +241,14 @@ class RedactingFilter(logging.Filter):
 
         Execution-scoped releases (:meth:`release_secret` /
         :meth:`forget_secret`) must not remove it. Idempotent: repeated
-        calls do not inflate the refcount beyond one.
+        calls do not inflate the refcount beyond one — long-lived material
+        is re-registered on every unlock/refresh and must never accumulate
+        phantom refcounts (AUD-02: no unbounded global retention).
         """
         if not value or len(value) < 4:
             return
         with self._lock:
-            self._migrate_legacy_state_locked()
-            if value in self._permanent_secrets:
-                if value not in self._secret_refcounts:
-                    self._secret_refcounts[value] = 1
-                self._secrets.add(value)
-                return
-            self._permanent_secrets.add(value)
-            self._retain_locked(value)
+            self._bootstrap_locked(value)
 
     def active_secret_count(self) -> int:
         """
@@ -265,7 +277,6 @@ class RedactingFilter(logging.Filter):
         if not value or len(value) < 4:
             return
         with self._lock:
-            self._migrate_legacy_state_locked()
             if value in self._permanent_secrets:
                 # Permanence preserved; make sure the value is still part of
                 # the redaction state, but never inflate its refcount.
@@ -320,7 +331,12 @@ class RedactingFilter(logging.Filter):
         return True
 
 
-#: shared filter instance used by all plugin modules
+#: shared filter instance used by all plugin modules.
+#: AUD-02 (phase 2): resolved LAZILY through :func:`get_redacting_filter`
+#: only. Module-level singletons must NOT eagerly capture the shared
+#: instance, because tests isolate suites by swapping
+#: ``vaultwarden.security._shared_filter`` — an eager module global would
+#: pin a stale instance and silently break that isolation.
 _shared_filter = RedactingFilter()
 
 
