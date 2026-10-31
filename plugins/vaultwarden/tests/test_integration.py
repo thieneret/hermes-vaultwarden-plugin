@@ -560,6 +560,7 @@ def test_register_succeeds_when_middleware_registration_works(monkeypatch, tmp_p
 # process-memory measurements, never secret values in logs.
 # ===========================================================================
 
+import re as _re_mod  # noqa: E402
 import threading  # noqa: E402
 
 from vaultwarden.hooks import (  # noqa: E402
@@ -598,6 +599,9 @@ def _seed_item_password(monkeypatch, item_id: str, value: str) -> None:
 PG_ID = "aaaa1111-0000-0000-0000-000000000001"   # "Postgres prod"
 GF_ID = "aaaa1111-0000-0000-0000-000000000002"   # "Grafana" (conftest vault)
 
+#: ``$(< /abs/path)`` shell substitution produced by the middleware rewrite.
+_AUD02_SUBST_RE = _re_mod.compile(r"\$\(<\s*(/\S+)\)")
+
 
 def _run_execution(middleware, transform, registry, item_id, secret, task_id,
                    echo_plaintext=True):
@@ -606,7 +610,9 @@ def _run_execution(middleware, transform, registry, item_id, secret, task_id,
     cmd_ref = f"${entry.token}"
 
     def terminal(args: dict) -> dict:
-        path = args["command"].split("$(< ")[1].rstrip(")")
+        m = _AUD02_SUBST_RE.search(args["command"])
+        assert m is not None, f"no $(< path) substitution: {args['command']!r}"
+        path = m.group(1)
         with open(path, encoding="utf-8") as fh:
             raw = fh.read() + "\n"
         return {"output": raw} if echo_plaintext else {"output": "ok\n"}
@@ -652,17 +658,26 @@ def test_multiple_secrets_all_released_after_execution(auth_manager, registry,
 
     def terminal(args: dict) -> dict:
         outs = []
-        import re as _re
-        for p in _re.findall(r"\$\(< (/\\S+)", args["command"]):
+        for p in _AUD02_SUBST_RE.findall(args["command"]):
             with open(p, encoding="utf-8") as fh:
                 outs.append(fh.read())
         return {"output": "".join(outs)}
 
+    # Assert the retention DURING the execution (inside next_call): AUD-02
+    # phase 2 releases execution-scoped secrets when the middleware frame's
+    # scope closes, so post-return has_secret() checks are no longer valid.
+    mid_seen: dict[str, bool] = {}
+
+    def terminal_retained(args: dict) -> dict:
+        out = terminal(args)
+        mid_seen["both"] = filt.has_secret(s1) and filt.has_secret(s2)
+        return out
+
     result = mw("terminal",
-                {"command": f'cat "$%{e1.token[:]}$" "$%{e2.token}$"'},
-                None, terminal, task_id="aud02-multi")
+                {"command": f'cat "{e1.token}" "{e2.token}"'},
+                None, terminal_retained, task_id="aud02-multi")
     # Both plaintexts retained DURING the execution:
-    assert filt.has_secret(s1) and filt.has_secret(s2)
+    assert mid_seen["both"], "secrets not retained while execution active"
     transformed = tf("terminal", result, task_id="aud02-multi")
     assert s1 not in transformed["output"]
     assert s2 not in transformed["output"]
@@ -706,24 +721,17 @@ def test_overlapping_executions_same_secret_not_removed_prematurely(
         # While ANY execution is in flight, the shared secret must be active.
         active_mid = filt.has_secret(secret)
         barrier.wait()                     # force overlap of both scopes
-        path = args["command"].split("$(< ")[1].rstrip(")")
+        m = _AUD02_SUBST_RE.search(args["command"])
+        assert m is not None, f"no $(< path) substitution: {args['command']!r}"
+        path = m.group(1)
         with open(path, encoding="utf-8") as fh:
             raw = fh.read()
         outcomes[f"mid_{threading.get_ident()}"] = active_mid
         assert raw == secret               # injection itself works
         return {"output": "done\n"}
 
-    threads = [
-        threading.Thread(
-            target=mw,
-            args=("terminal",
-                  {"command": f'cat "$(%%s)"' % f"$" + registry.create(PG_ID, "password").token[1:]},
-                  None, terminal),
-            kwargs={"task_id": f"aud02-overlap-{i}"})
-        for i in range(2)
-    ]
-    # Build commands INSIDE each thread's args correctly instead: simpler to
-    # pre-create tokens here (registry is thread-safe).
+    # Pre-create tokens here (registry is thread-safe); each execution gets
+    # its own single-use placeholder but resolves the SAME vault secret.
     tokens = [registry.create(PG_ID, "password").token for _ in range(2)]
     threads = [
         threading.Thread(target=mw,
@@ -760,12 +768,15 @@ def test_three_overlapping_executions_refcount_tracks_holders_exactly(
         tid = threading.get_ident()
         with lock:
             order.append(f"in-{tid}")
-        ready.wait()
-        path = args["command"].split("$(< ")[1].rstrip(")")
+        ready.wait()                      # all three scopes are live here
+        m = _AUD02_SUBST_RE.search(args["command"])
+        assert m is not None, f"no $(< path) substitution: {args['command']!r}"
+        path = m.group(1)
         with open(path, encoding="utf-8") as fh:
             assert fh.read() == secret
         return {"output": "ok\n"}
 
+    baseline = filt.active_secret_count()
     tokens = [registry.create(PG_ID, "password").token for _ in range(3)]
     threads = [threading.Thread(target=mw,
                                  args=("terminal", {"command": f'cat "${t}"'},
@@ -776,12 +787,13 @@ def test_three_overlapping_executions_refcount_tracks_holders_exactly(
         t.start()
     for t in threads:
         t.join(timeout=15)
-    assert len(order) == 6 - 3            # three "in-" markers only (scopes
-    # closed after join); every holder entered while all were active
-    assert filt.has_secret.__self__ is filt
-    # After ALL three scopes closed the secret is gone — refcount tracked the
-    # three holders exactly (no premature removal happened: each terminal()
-    # read the plaintext from its temp file while every scope was live).
+    assert not any(t.is_alive() for t in threads)
+    assert len(order) == 3                # every holder entered its tool call
+    # The barrier guarantees all three executions overlapped while the
+    # shared secret was retained by exactly three holders; refcounting must
+    # have dropped it to zero only after ALL scopes closed — back to
+    # baseline, no negative counts, no premature removal.
+    assert filt.active_secret_count() == baseline
     assert not filt.has_secret(secret)
 
 
@@ -846,7 +858,9 @@ def test_transform_redacts_when_dispatched_after_middleware_frame(
     entry = registry.create(PG_ID, "password")
 
     def terminal(args: dict) -> dict:
-        path = args["command"].split("$(< ")[1].rstrip(")")
+        m = _AUD02_SUBST_RE.search(args["command"])
+        assert m is not None, f"no $(< path) substitution: {args['command']!r}"
+        path = m.group(1)
         with open(path, encoding="utf-8") as fh:
             return {"output": fh.read() + "\n"}
 
