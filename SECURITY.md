@@ -299,6 +299,24 @@ try/except that swallows failures. Fail-closed is mandatory.
 - Do not treat a successful `None` return value from hook registration as failure unless the host API explicitly defines it as failure.
 - Lifecycle-hook registration failures must abort plugin initialization before tools are exposed.
 
+## Compatibility Exceptions
+
+### Terminal Backend Detection (SEC-03)
+
+The plugin detects the Hermes terminal backend via two mechanisms:
+1. `TERMINAL_ENV` environment variable (first priority)
+2. Direct read of `$HERMES_HOME/config.yaml` (fallback)
+
+**Why this deviates from VWP-05:** The Hermes Agent `PluginContext.get_config()` API
+only exposes plugin-scoped settings (`plugins.entries.vaultwarden.settings`),
+not global Hermes configuration like `terminal.backend`. No native API exists
+for plugins to query the active terminal backend.
+
+**Mitigation:** This is documented as an intentional compatibility exception.
+The SEC-03 fail-closed policy remains enforced; the detection mechanism is
+best-effort and may not reflect the actual backend if the operator configures
+it outside the standard paths.
+
 ## Supply Chain
 
 - Dev dependencies are pinned via `uv.lock` (committed to the repository).
