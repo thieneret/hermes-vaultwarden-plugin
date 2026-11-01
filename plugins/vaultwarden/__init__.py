@@ -23,7 +23,7 @@ from . import compat
 from . import secrets as _secrets
 from .auth import AuthManager, ensure_appdata_dir
 from .bw_cli import BwCli, find_bw_binary
-from .config import load_config
+from .config import load_config, _sanitize_url_for_logging
 from .hooks import (
     _cleanup_stale_secrets,
     _cleanup_stale_sockets,
@@ -348,6 +348,8 @@ def register(ctx: Any) -> bool:
 
     PLUGIN_STATE.update({"auth": auth, "registry": registry,
                          "config": config, "bw": bw})
+    # HVA-02 (v0.7.1): the server URL is sanitized to scheme://host[:port]
+    # so user-info / query / fragment material never reaches the logs.
     log.info("Vaultwarden plugin ACTIVE (server=%s, write=%s, auth=deferred).",
-             config.server_url, config.allow_write)
+             _sanitize_url_for_logging(config.server_url), config.allow_write)
     return True

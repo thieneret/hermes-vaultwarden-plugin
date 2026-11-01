@@ -25,7 +25,7 @@ from pathlib import Path
 
 from . import compat, errors
 from .bw_cli import BwCli
-from .config import PluginConfig
+from .config import PluginConfig, _sanitize_url_for_logging
 from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
 from .security import get_logger, get_redacting_filter
 
@@ -299,7 +299,7 @@ class AuthManager:
         server_url = self._config.server_url
         if not server_url:
             return
-        log.info("Configuring bw server: %s", server_url)
+        log.info("Configuring bw server: %s", _sanitize_url_for_logging(server_url))
         try:
             self._bw.config_server(server_url)
         except errors.VaultwardenError as exc:

@@ -86,6 +86,25 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
+def _sanitize_url_for_logging(url: str) -> str:
+    """HVA-02 (v0.7.1): return scheme://hostname[:port] only.
+
+    Strips user-info (username/password), path, query, and fragment so a
+    server URL can NEVER leak credentials or sensitive parameters into log
+    records or diagnostic output. Port is included only when it is not the
+    scheme's default (80/443).
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return "<invalid>"
+    result = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port and parsed.port not in (80, 443):
+        result += f":{parsed.port}"
+    return result
+
+
 def _as_int(value: Any, default: int) -> int:
     try:
         return int(value)
@@ -290,6 +309,12 @@ class PluginConfig:
         scheme (ftp/file/ws/missing/empty) is rejected regardless of the
         flag. The WARNING log contains ONLY the scheme and hostname — never
         credentials, paths, query strings, or session data.
+
+        HVA-02 (v0.7.1): additionally rejects URLs containing user-info
+        (username/password), query parameters, or fragments. These
+        components could leak sensitive material into logging or diagnostic
+        output, so validation is fail-closed: any prohibited component
+        present => ConfigError. The path component remains allowed.
         """
         from urllib.parse import urlparse
 
@@ -297,9 +322,8 @@ class PluginConfig:
         scheme = parsed.scheme.lower()
 
         if scheme == "https":
-            return
-
-        if scheme == "http":
+            pass  # accepted (AUD-01)
+        elif scheme == "http":
             if self.allow_insecure_http:
                 log.warning(
                     "server_url uses insecure scheme 'http' for host %s "
@@ -307,17 +331,37 @@ class PluginConfig:
                     "plaintext. Disable in production.",
                     parsed.hostname or "<unknown>",
                 )
-                return
+            else:
+                raise errors.ConfigError(
+                    "secrets.vaultwarden.server_url must use https://. "
+                    "Set allow_insecure_http: true to permit http:// for "
+                    "local/testing environments."
+                )
+        else:
             raise errors.ConfigError(
-                "secrets.vaultwarden.server_url must use https://. "
-                "Set allow_insecure_http: true to permit http:// for "
-                "local/testing environments."
+                "secrets.vaultwarden.server_url has unsupported scheme "
+                f"'{scheme}'; only https:// is accepted."
             )
 
-        raise errors.ConfigError(
-            "secrets.vaultwarden.server_url has unsupported scheme "
-            f"'{scheme}'; only https:// is accepted."
-        )
+        # HVA-02 (v0.7.1): reject sensitive URL components — fail-closed.
+        # Checked AFTER scheme enforcement so AUD-01 rejection messages keep
+        # their precedence; every prohibited component raises ConfigError.
+        if parsed.username or parsed.password:
+            raise errors.ConfigError(
+                "secrets.vaultwarden.server_url must not contain user-info "
+                "(username/password). Use separate authentication mechanisms."
+            )
+        if parsed.query:
+            raise errors.ConfigError(
+                "secrets.vaultwarden.server_url must not contain query "
+                "parameters. Sensitive data in query strings may be logged."
+            )
+        if parsed.fragment:
+            raise errors.ConfigError(
+                "secrets.vaultwarden.server_url must not contain fragments. "
+                "Fragments are not transmitted but may indicate "
+                "misconfiguration."
+            )
 
     def validate(self) -> None:
         if not self.server_url:
