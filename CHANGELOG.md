@@ -5,6 +5,19 @@ Author: **thieneret**
 
 ---
 
+## v0.7.2
+
+### Fixed
+- **Session first-burst regression:** eliminated the recurring "empty vault + exit 1" failure on the first burst of calls after idle/expiry. Root cause was a three-way inconsistency: read blind spot (locked vault returns exit 0 empty list), stale key injection (`get_session_key()` ignored expiry), and write recovery bypass (`create_item` raised generic error instead of `SessionError`).
+
+### Changed
+- `get_session_key()` now enforces expiry-age validation consistent with `is_unlocked()` (shared `_session_valid_locked()` predicate)
+- `_ensure_session_env()` performs a synchronous lazy-unlock when no valid session key is available, and raises `SessionError` instead of silently proceeding against a locked vault
+- `create_item`/`edit_item` locked-vault failures are now classified as `SessionError` for synchronous recovery via `run_with_recovery()`
+
+### Tests
+- Added `test_session_first_burst.py` regression suite
+
 ## v0.7.1
 
 ### Security

@@ -414,9 +414,29 @@ class BwCli:
             current in-memory session key is injected here so the isolation
             choke point can never silently drop it.
 
+        v0.7.2 (CHANGE 2): PRE-FLIGHT LOCK CHECK — the choke point can now
+        NEVER spawn a session-requiring command without a valid BW_SESSION:
+          * the fallback key comes from ``AuthManager.get_session_key()``,
+            which enforces expiry since v0.7.2 (no stale-key injection);
+          * when NO valid key is available, a synchronous lazy-unlock runs
+            via ``AuthManager.get_session()`` for EVERY registered manager —
+            get_session() is itself gated: it only spawns login/unlock when
+            the FSM already sits in CONFIGURED/LOGGED_IN/UNLOCKED (a
+            re-authenticatable profile), and raises a sanitized SessionError
+            for UNINITIALIZED/LOGGED_OUT profiles, so an un-bootstrapped
+            profile can never be force-logged-in from inside a data command;
+          * if no recoverable key exists, a sanitized :class:`errors.SessionError`
+            is raised BEFORE the subprocess is spawned — instead of silently
+            proceeding against a locked profile (the read blind spot: locked
+            ``bw list`` returns an EMPTY list with exit 0 and would never
+            reach error classification).
+        Explicit caller-provided env values still take precedence, and
+        non-session commands are completely unaffected.
+
         The session key lives in plugin memory ONLY: it is never written to
         disk and never logged (base_env() still builds the env from scratch —
-        the parent environment is NOT inherited).
+        the parent environment is NOT inherited). No session-key value ever
+        appears in the raised error message or any log line.
         """
         merged: dict[str, str] = dict(env or {})
         verb = args[0] if args else ""
@@ -424,8 +444,41 @@ class BwCli:
             if not merged.get("BW_SESSION"):
                 auth = get_auth_manager()
                 key = auth.get_session_key() if auth is not None else None
+                if not key and auth is not None:
+                    # Pre-flight synchronous lazy-unlock via get_session().
+                    # Gated INTERNALLY by AuthManager.get_session(): it only
+                    # spawns login/unlock when the FSM already sits in
+                    # CONFIGURED/LOGGED_IN/UNLOCKED (a re-authenticatable
+                    # profile) and raises a sanitized SessionError otherwise,
+                    # so an un-bootstrapped/locked-out profile can never be
+                    # force-logged-in from inside a data command. Duck-typed
+                    # managers without get_session() simply fail the
+                    # callable() check below and fall through to the
+                    # canonical SessionError.
+                    get_session = getattr(auth, "get_session", None)
+                    if callable(get_session):
+                        # Any failure is swallowed here — the canonical,
+                        # sanitized SessionError below keeps the message free
+                        # of exception text that could carry secret fragments.
+                        try:
+                            key = get_session()
+                        except Exception as exc:  # noqa: BLE001 - fail-closed below
+                            # VWP-17: code extraction only — never the message.
+                            log.warning(
+                                "Choke-point lazy unlock failed (%s); "
+                                "raising SessionError before spawning '%s'.",
+                                compat.get_error_code(exc), verb)
+                            key = None
                 if key:
                     merged["BW_SESSION"] = key
+                else:
+                    raise errors.SessionError(
+                        f"Vault session is locked and could not be "
+                        f"re-established; re-unlock required ('{verb}').",
+                        suggestion="The plugin will attempt automatic "
+                                   "re-unlock on the next call after you "
+                                   "unlock the vault (vaultwarden_status / "
+                                   "re-auth).")
         return self.base_env(merged)
 
     def _session_error(self, verb: str, err: str,
@@ -456,6 +509,56 @@ class BwCli:
                        f"and retry. bw stderr: {safe_err}")
 
     # ------------------------------------------------------------- run core
+    def _write_failure(self, verb: str, rc: int, out: str, err: str,
+                       session_key: str | None) -> errors.VaultwardenError:
+        """Classify a direct-subprocess write failure (v0.7.2, CHANGE 3).
+
+        ``create_item`` / ``edit_item`` bypass :meth:`run` (they pipe the
+        encoded payload via stdin), so their non-zero exit codes never reach
+        the generic ``_classify_error()`` taxonomy — a locked-vault failure
+        used to surface as a generic ``VaultwardenError`` (PLUGIN_ERROR),
+        which ``AuthManager.run_with_recovery`` does NOT catch (it only
+        handles ``SessionError``). That was the "write recovery bypass" leg
+        of the first-burst regression: ``bw create item failed (exit 1)``
+        propagated with zero re-unlock.
+
+        Now the stderr is routed through the SAME marker classification as
+        :meth:`run`:
+          * session markers ("vault is locked", "not logged in", "invalid
+            master password", ...) => :func:`_session_error` — a
+            ``SessionError`` (SESSION_EXPIRED vs SESSION_ERROR mapping
+            preserved from v0.6.4) that ``run_with_recovery`` catches and
+            recovers synchronously;
+          * rate-limit / network markers => the matching error classes;
+          * anything else => the sanitized generic ``VaultwardenError``
+            (unchanged message shape: "bw <verb> failed (exit N).").
+
+    Security: bw stderr on write paths may contain payload fragments — it is
+        NEVER logged or attached raw. Only :func:`_sanitize_bw_stderr` output
+        (known secrets replaced with [REDACTED], length-capped) is ever
+        surfaced, exactly like the v0.6.4 read path.
+        """
+        combined = ((out or "") + "\n" + (err or "")).lower()
+        category = self._classify_error(combined)
+        if category == "session":
+            return self._session_error(verb, err, session_key)
+        if category == "rate_limit":
+            return errors.RateLimitError(
+                "Vaultwarden rate limit hit (HTTP 429).")
+        if category == "network":
+            return errors.NetworkError(
+                "Vaultwarden server appears unreachable.")
+        safe_err = _sanitize_bw_stderr(err, session_key, out)
+        log.error(
+            "bw %s failed rc=%d category=%s; sanitized stderr: %s",
+            verb, rc, category, safe_err or "<empty>",
+        )
+        suggestion = "Run 'vaultwarden_status' for details."
+        if safe_err:
+            suggestion += f" bw stderr: {safe_err}"
+        return errors.VaultwardenError(
+            f"bw {verb} failed (exit {rc}).", suggestion=suggestion)
+
     def run(self, args: list[str], *, env: Mapping[str, str] | None = None,
             raw: bool = False, timeout: int | None = None,
             _retry_count: int = 0, retryable: bool = True) -> Any:
@@ -672,10 +775,15 @@ class BwCli:
 
         out = (proc.stdout or "").strip()
         if proc.returncode != 0:
-            # NB: stderr may contain payload fragments — never log it.
-            raise errors.VaultwardenError(
-                f"bw create item failed (exit {proc.returncode}).",
-                suggestion="Run 'vaultwarden_status' for details.")
+            # v0.7.2 (CHANGE 3): classify through the SAME marker taxonomy as
+            # run() — locked-vault stderr now raises SessionError so
+            # AuthManager.run_with_recovery can re-unlock synchronously
+            # instead of the failure escaping as a generic PLUGIN_ERROR.
+            # NB: stderr may contain payload fragments — never logged raw;
+            # _write_failure sanitizes it (v0.6.4 behavior preserved).
+            raise self._write_failure("create item", proc.returncode,
+                                      out, (proc.stderr or "").strip(),
+                                      session_key)
         if not out:
             raise errors.ParseError("bw create item returned empty output.")
         try:
@@ -708,9 +816,12 @@ class BwCli:
 
         out = (proc.stdout or "").strip()
         if proc.returncode != 0:
-            raise errors.VaultwardenError(
-                f"bw edit item failed (exit {proc.returncode}).",
-                suggestion="Run 'vaultwarden_status' for details.")
+            # v0.7.2 (CHANGE 3): same classification as create_item — locked-
+            # vault stderr => SessionError for synchronous run_with_recovery;
+            # stderr is only ever surfaced sanitized, never raw.
+            raise self._write_failure("edit item", proc.returncode,
+                                      out, (proc.stderr or "").strip(),
+                                      session_key)
         if not out:
             raise errors.ParseError("bw edit item returned empty output.")
         try:
