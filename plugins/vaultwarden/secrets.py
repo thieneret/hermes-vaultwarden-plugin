@@ -218,7 +218,15 @@ def load_secrets(hermes_home: str) -> tuple[str, str]:
 
 
 def _backend_from_hermes_config() -> str:
-    """Read ``terminal.backend`` from ~/.hermes/config.yaml (best effort)."""
+    """
+    Detect terminal backend from $HERMES_HOME/config.yaml.
+
+    NOTE: This deviates from VWP-05 (native Hermes API only) because the
+    PluginContext.get_config() API only exposes plugin-scoped settings, not
+    global Hermes configuration like terminal.backend. No native API exists
+    for plugins to query the active terminal backend. This is documented as
+    an intentional compatibility exception in SECURITY.md.
+    """
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
     config_path = (Path(hermes_home).expanduser() if hermes_home
                    else Path.home() / ".hermes") / "config.yaml"

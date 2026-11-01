@@ -25,7 +25,7 @@ from pathlib import Path
 
 from . import compat, errors
 from .bw_cli import BwCli
-from .config import PluginConfig
+from .config import PluginConfig, _sanitize_url_for_logging
 from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
 from .security import get_logger, get_redacting_filter
 
@@ -299,7 +299,7 @@ class AuthManager:
         server_url = self._config.server_url
         if not server_url:
             return
-        log.info("Configuring bw server: %s", server_url)
+        log.info("Configuring bw server: %s", _sanitize_url_for_logging(server_url))
         try:
             self._bw.config_server(server_url)
         except errors.VaultwardenError as exc:
@@ -643,7 +643,10 @@ class AuthManager:
             # existing numeric consumers keep working.
             "session_age_seconds": round(age, 1) if age is not None else None,
             "session_timeout_seconds": self._config.session_timeout_seconds,
-            "server_configured": self._config.server_url,
+            # HVA-02 (v0.7.1): status/diagnostic output uses the sanitized
+            # accessor (scheme://host[:port] only) so user-info / query /
+            # fragment material can never appear in snapshots.
+            "server_configured": self._config.server_url_sanitized,
             # ---- additive fields (v0.6.x status fix): new consumers should
             # prefer these over reinterpreting session_active/server_status.
             # True iff AuthManager holds an INJECTABLE BW_SESSION value under

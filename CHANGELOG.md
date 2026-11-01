@@ -5,6 +5,14 @@ Author: **thieneret**
 
 ---
 
+## v0.7.1
+
+### Security
+- **HVA-02:** server_url validation now rejects user-info, query, and fragment components to prevent credential leakage in logs and diagnostic output
+
+### Documentation
+- Terminal backend detection documented as intentional VWP-05 compatibility exception
+
 ## v0.7.0
 
 ### Security
