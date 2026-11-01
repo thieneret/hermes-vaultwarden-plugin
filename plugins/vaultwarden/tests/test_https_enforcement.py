@@ -248,15 +248,39 @@ def test_sanitize_url_for_logging(url, expected):
     assert _sanitize_url_for_logging(url) == expected
 
 
-def test_log_sanitization_strips_credentials(caplog, tmp_path, monkeypatch,
-                                             fake_bw):
+def test_log_sanitization_strips_credentials(tmp_path, monkeypatch,
+                                              fake_bw):
     # HVA-02 defence-in-depth: register() sanitizes the server URL in its
     # ACTIVE log line down to scheme://host[:port]. The config section is
     # patched AFTER validate() runs (the real lifecycle validates first and
     # would fail closed on this URL), so the sanitizer is exercised as the
     # last line of defence on the log path.
+    #
+    # Log capture is wired directly onto the plugin logger hierarchy with an
+    # explicit handler instead of relying on pytest's caplog fixture: the
+    # plugin's get_logger() attaches a fallback StreamHandler when the root
+    # logger has no handlers yet, which detaches records from propagation
+    # and makes caplog ordering-dependent (flaky). A dedicated handler on
+    # the 'hermes.plugins.vaultwarden' parent is hermetic and deterministic.
     import vaultwarden
     from vaultwarden.config import PluginConfig
+
+    captured: list[str] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                captured.append(record.getMessage())
+            except Exception:  # pragma: no cover - capture must never raise
+                pass
+
+    plugin_logger = logging.getLogger("hermes.plugins.vaultwarden")
+    handler = _CaptureHandler(level=logging.DEBUG)
+    orig_level = plugin_logger.level
+    orig_propagate = plugin_logger.propagate
+    plugin_logger.addHandler(handler)
+    plugin_logger.setLevel(logging.DEBUG)
+    plugin_logger.propagate = False
 
     plugdir = tmp_path / "plugins" / "vaultwarden"
     plugdir.mkdir(parents=True, exist_ok=True)
@@ -290,10 +314,12 @@ def test_log_sanitization_strips_credentials(caplog, tmp_path, monkeypatch,
         ok = vaultwarden.register(ctx)
     finally:
         monkeypatch.setattr(PluginConfig, "validate", orig_validate)
+        plugin_logger.removeHandler(handler)
+        plugin_logger.setLevel(orig_level)
+        plugin_logger.propagate = orig_propagate
     assert ok is True, "registration must succeed; ACTIVE line is emitted"
 
-    active = [r.getMessage() for r in caplog.records
-              if "plugin ACTIVE" in r.getMessage()]
+    active = [msg for msg in captured if "plugin ACTIVE" in msg]
     assert active, "expected the ACTIVE log line to be emitted"
     joined = "\n".join(active)
     assert "https://vault.example.com" in joined

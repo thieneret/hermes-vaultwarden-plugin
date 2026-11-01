@@ -23,7 +23,7 @@ from . import compat
 from . import secrets as _secrets
 from .auth import AuthManager, ensure_appdata_dir
 from .bw_cli import BwCli, find_bw_binary
-from .config import load_config, _sanitize_url_for_logging
+from .config import _sanitize_url_for_logging, load_config
 from .hooks import (
     _cleanup_stale_secrets,
     _cleanup_stale_sockets,
