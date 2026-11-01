@@ -91,6 +91,15 @@ _RATE_LIMIT_MARKERS = ("too many requests", "rate limit", "429")
 
 # Cat-1: bw CLI state messages (MEDIUM stability — version-dependent,
 # anchored by the step-1 version check)
+# v0.7.2 (lazy-unlock prompt hardening, CHANGE 3): signature of the bw CLI's
+# INTERACTIVE master-password fallback ("? Master password: [input is hidden]").
+# When this text appears on stderr the child actually tried to prompt a human;
+# the operator-facing message must point at secrets.yaml instead of echoing
+# the raw prompt text back through logs / tool responses.
+_PASSWORD_PROMPT_MARKERS = (
+    "master password:", "[input is hidden]", "password: [hidden]",
+)
+
 _SESSION_INVALID_MARKERS = (
     "not logged in",
     "you are not currently logged in",
@@ -222,6 +231,18 @@ def _sanitize_bw_stderr(err: str, *secret_values: str | None) -> str:
         if secret:
             text = text.replace(str(secret), "[REDACTED]")
     return text[:200]
+
+
+def _looks_like_password_prompt(err: str) -> bool:
+    """True when bw stderr carries the interactive master-password prompt.
+
+    v0.7.2 (lazy-unlock prompt hardening, CHANGE 3): used at the session
+    choke point to convert a raw "? Master password: [input is hidden]"
+    fallback into an actionable operator message. Detection only — the raw
+    prompt text is never surfaced.
+    """
+    lowered = (err or "").lower()
+    return any(m in lowered for m in _PASSWORD_PROMPT_MARKERS)
 
 
 class BwCli:
@@ -460,18 +481,51 @@ class BwCli:
                         # Any failure is swallowed here — the canonical,
                         # sanitized SessionError below keeps the message free
                         # of exception text that could carry secret fragments.
+                        # v0.7.2 (lazy-unlock prompt hardening, CHANGE 3):
+                        # the exception TYPE (sanitized code) and its
+                        # sanitized message/suggestion text are captured so a
+                        # failed unlock that fell back to bw's INTERACTIVE
+                        # master-password prompt can be converted into an
+                        # actionable operator message ("verify master_password
+                        # in secrets.yaml") instead of echoing the raw prompt
+                        # text. The matched excerpt is NEVER propagated — only
+                        # the boolean matters; no master password or session
+                        # key value appears in any log line or raised message.
+                        unlock_error_code = None
+                        unlock_prompt_seen = False
                         try:
                             key = get_session()
                         except Exception as exc:  # noqa: BLE001 - fail-closed below
                             # VWP-17: code extraction only — never the message.
+                            unlock_error_code = compat.get_error_code(exc)
+                            unlock_prompt_seen = _looks_like_password_prompt(
+                                str(getattr(exc, "message", "") or "") + " " +
+                                str(getattr(exc, "suggestion", "") or ""))
                             log.warning(
                                 "Choke-point lazy unlock failed (%s); "
                                 "raising SessionError before spawning '%s'.",
-                                compat.get_error_code(exc), verb)
+                                unlock_error_code, verb)
                             key = None
                 if key:
                     merged["BW_SESSION"] = key
                 else:
+                    # v0.7.2 (CHANGE 3): when the lazy-unlock failed with the
+                    # interactive-prompt signature (or an AUTH_ERROR — e.g.
+                    # the falsy-master-password fail-closed path), surface an
+                    # actionable bootstrap hint. The raw "? Master password:"
+                    # prompt text NEVER reaches this message, any log line,
+                    # or the tool response.
+                    if unlock_prompt_seen or unlock_error_code == "AUTH_ERROR":
+                        raise errors.SessionError(
+                            f"Non-interactive unlock failed — verify "
+                            f"master_password in secrets.yaml ('{verb}').",
+                            suggestion="The plugin refused to fall back to "
+                                       "bw's interactive master-password "
+                                       "prompt. Check the master_password "
+                                       "entry in "
+                                       "$HERMES_HOME/plugins/vaultwarden/"
+                                       "secrets.yaml (chmod 600) and "
+                                       "re-bootstrap.")
                     raise errors.SessionError(
                         f"Vault session is locked and could not be "
                         f"re-established; re-unlock required ('{verb}').",
@@ -549,6 +603,12 @@ class BwCli:
             return errors.NetworkError(
                 "Vaultwarden server appears unreachable.")
         safe_err = _sanitize_bw_stderr(err, session_key, out)
+        # v0.7.2 (lazy-unlock prompt hardening, CHANGE 3): never echo the
+        # interactive master-password prompt into logs / tool responses —
+        # replace it with an actionable operator message (secrets.yaml hint).
+        if _looks_like_password_prompt(safe_err):
+            safe_err = ("non-interactive unlock failed — verify "
+                        "master_password in secrets.yaml")
         log.error(
             "bw %s failed rc=%d category=%s; sanitized stderr: %s",
             verb, rc, category, safe_err or "<empty>",
@@ -574,12 +634,26 @@ class BwCli:
         """
         full_env = self._ensure_session_env(args, env)
         cmd = [self.bw_path, *args]
+        # v0.7.2 (lazy-unlock prompt hardening, CHANGE 1): every bw call that
+        # does NOT carry an input payload runs with stdin=subprocess.DEVNULL.
+        # Without this the child INHERITS the gateway's stdin, so any bw
+        # command that falls back to an interactive prompt (e.g.
+        # "? Master password: [input is hidden]" when --passwordenv points at
+        # a missing BW_MP variable) can actually render and block — exactly
+        # the first-burst regression this closes. DEVNULL makes an interactive
+        # prompt structurally impossible for argv-only invocations, matching
+        # the pattern already used by the SSH helpers in tools.py. Callers
+        # that DO pass input= (create_item / edit_item / encode) keep their
+        # own stdin=PIPE path — those bypass run() entirely, and subprocess
+        # forbids combining input= with stdin= in one call, so the two are
+        # never mixed here.
         try:
             # v0.1.4 (FAIL-5): look up subprocess.run via the module attribute so
             # tests can monkeypatch subprocess.run deterministically.
             proc = subprocess.run(
                 cmd, env=full_env, capture_output=True, text=True,
                 timeout=timeout or self.timeout,
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired as exc:
             raise errors.NetworkError(
@@ -643,6 +717,13 @@ class BwCli:
 
             safe_err = _sanitize_bw_stderr(
                 err, (env or {}).get("BW_SESSION"), out)
+            # v0.7.2 (lazy-unlock prompt hardening, CHANGE 3): if bw fell
+            # back to its interactive master-password prompt, NEVER echo the
+            # raw prompt text into logs or the tool response — replace it
+            # with an actionable operator message pointing at secrets.yaml.
+            if _looks_like_password_prompt(safe_err):
+                safe_err = ("non-interactive unlock failed — verify "
+                            "master_password in secrets.yaml")
             log.error(
                 "bw %s failed rc=%d category=unknown; sanitized stderr: %s",
                 args[0], proc.returncode, safe_err or "<empty>",
@@ -703,7 +784,25 @@ class BwCli:
                       raw=True, retryable=False)
 
     def unlock_passwordenv(self, master_password: str) -> str:
-        """Returns the raw session key (kept in plugin memory only)."""
+        """Returns the raw session key (kept in plugin memory only).
+
+        v0.7.2 (lazy-unlock prompt hardening, CHANGE 2): FAIL-CLOSED guard —
+        a falsy master password raises ``errors.AuthError`` (AUTH_ERROR
+        category, NOT SessionError) BEFORE any subprocess is spawned. The
+        master password is delivered exclusively via the BW_MP environment
+        variable, and ``base_env()`` silently drops falsy extras — so
+        spawning ``bw unlock --passwordenv BW_MP`` with an empty/missing MP
+        would point --passwordenv at a nonexistent variable and bw would fall
+        back to its interactive "? Master password:" prompt. Using AuthError
+        (recoverable=False) also keeps ``run_with_recovery`` from entering a
+        re-unlock loop that can never succeed without a master password. The
+        password VALUE never appears in the message or any log line.
+        """
+        if not master_password or not str(master_password).strip():
+            raise errors.AuthError(
+                "master password unavailable; cannot unlock "
+                "non-interactively. Verify master_password in secrets.yaml "
+                "and re-bootstrap.")
         env = {"BW_MP": master_password}
         key = self.run(["unlock", "--passwordenv", "BW_MP", "--raw", "--nointeraction"],
                        env=env, raw=True, retryable=False)
