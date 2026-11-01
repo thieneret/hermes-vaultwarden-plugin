@@ -5,6 +5,14 @@ Author: **thieneret**
 
 ---
 
+## v0.7.0
+
+### Security
+- **HVA-01:** SSH secret lifecycle management — all SSH tool handlers now release registered secrets in finally blocks, preventing plaintext secrets from lingering in the redaction registry
+
+### Tests
+- Added test_ssh_lifecycle.py with full lifecycle coverage
+
 ## v0.6.9
 
 - feat(security): implement AUD-01 HTTPS enforcement for `server_url`

@@ -34,6 +34,67 @@ log = get_logger("tools")
 Handler = Callable[..., str]
 
 
+# ------------------------------------------------ HVA-01: SSH secret lifecycle
+def _retain_ssh_secret(value: str, redactor: Any) -> None:
+    """Register SSH passphrase / key material for redaction (HVA-01).
+
+    When an ACTIVE execution scope exists (the tool_execution middleware
+    opened one around this handler call), the value is retained through
+    :func:`vaultwarden.hooks.retain_in_execution_scope` instead of a raw
+    ``register_secret()``: its lifetime becomes tied to the execution scope
+    and the scope releases it exactly once when the execution concludes —
+    even on exception paths. The import is deferred and guarded because
+    ``hooks.py`` imports this module at load time (no circular import at
+    module level); if hooks are unavailable the helper transparently falls
+    back to the manual path below.
+
+    Without an active scope the value is registered with a +1 refcount and
+    appended to *redactor* ``forget_secret()`` in a ``finally`` block
+    (guaranteed release; see the SSH handlers). Empty / short values are
+    ignored by the redactor's minimum-length guard and therefore never
+    tracked — so no phantom release can occur.
+
+    SECURITY: never logs the value; only lengths / names are loggable and
+    this function logs nothing at all.
+    """
+    if not value:
+        return
+    try:  # pragma: no cover - defensive: hooks always present in production
+        from .hooks import current_execution_scope, retain_in_execution_scope
+        if current_execution_scope() is not None:
+            # Scope-managed retention: the scope owns the ONLY release of
+            # this value. Callers must NOT forget_secret() it manually —
+            # a second release would trigger the redactor's sanitized
+            # unknown-release warning (HVA-01 CHANGE 3: no double-release).
+            retain_in_execution_scope(value, redactor)
+            return
+    except Exception:  # pragma: no cover - defensive fallback
+        pass
+    redactor.register_secret(value)
+
+
+def _release_ssh_secret(value: str, redactor: Any) -> None:
+    """Release a scope-less SSH secret registration (HVA-01).
+
+    No-op for empty values (mirrors :func:`_retain_ssh_secret`). When an
+    active execution scope exists, the scope owns the release and this
+    helper deliberately does NOTHING — calling ``forget_secret()`` here in
+    addition to the scope's own release would be a double-release.
+
+    Outside any scope this is the guaranteed ``finally``-block counterpart
+    of :func:`_retain_ssh_secret`'s manual ``register_secret()`` path.
+    """
+    if not value:
+        return
+    try:  # pragma: no cover - defensive: hooks always present in production
+        from .hooks import current_execution_scope
+        if current_execution_scope() is not None:
+            return  # the execution scope releases this value exactly once
+    except Exception:  # pragma: no cover - defensive fallback
+        pass
+    redactor.forget_secret(value)
+
+
 # --------------------------------------------------------------- helpers
 def _remove_quietly(path: str, label: str) -> None:
     """Delete *path*, never raising; log a sanitized WARNING on failure.
@@ -1049,8 +1110,15 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
 
             # Single secret-generation path (decision 1): bw generate, NOT a
             # stdlib generator. Register immediately with the RedactingFilter.
+            # HVA-01: scope-aware retention — when an active execution scope
+            # exists the scope releases the passphrase exactly once at close;
+            # otherwise the finally block below forgets it manually. The
+            # generated PRIVATE KEY content is tracked the same way so no
+            # registration is ever left unreleased (success, subprocess
+            # failure, exception, or early return).
             passphrase = _generate_password(auth, {"mode": "password", "length": 32})
-            redactor.register_secret(passphrase)
+            _retain_ssh_secret(passphrase, redactor)
+            key_content = ""
             tmpdir = None
             try:
                 tmpdir, key_path, public_key, fingerprint = \
@@ -1059,7 +1127,8 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 try:
                     with open(key_path, "r", encoding="utf-8",
                               errors="replace") as f:
-                        redactor.register_secret(f.read())
+                        key_content = f.read()
+                    _retain_ssh_secret(key_content, redactor)
                 except OSError:
                     pass
                 result = auth.create_ssh_item(name, user, passphrase, key_path)
@@ -1079,7 +1148,10 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 # v0.5.8 cleanup observability: sanitized WARNING on failure.
                 if tmpdir is not None:
                     _rmtree_quietly(tmpdir)
-                redactor.forget_secret(passphrase)
+                # HVA-01: guaranteed release on ALL paths. No-op when the
+                # execution scope owns the value (no double-release).
+                _release_ssh_secret(key_content, redactor)
+                _release_ssh_secret(passphrase, redactor)
 
         # Upload mode: resolve the passphrase from exactly one channel.
         passphrase, pw_warning = _resolve_secret_input(
@@ -1109,25 +1181,35 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
 
         _validate_ssh_key_file(file_path)
 
-        redactor.register_secret(passphrase)
+        # HVA-01: every SSH registration is paired with a guaranteed release.
+        # Scope-aware retention when an execution scope is active; otherwise
+        # the finally block forgets passphrase + key content exactly once —
+        # on success, attachment failure, exception, or early return.
+        key_content = ""
+        _retain_ssh_secret(passphrase, redactor)
         try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                redactor.register_secret(f.read())
-        except OSError:
-            pass
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    key_content = f.read()
+                _retain_ssh_secret(key_content, redactor)
+            except OSError:
+                pass
 
-        result = auth.create_ssh_item(name, user, passphrase, file_path)
-        log.info("Stored SSH key item '%s' (%s).", name, result.get("id"))
-        response = {
-            "created": True,
-            "id": result.get("id", ""),
-            "name": name,
-            "ssh_user": user,
-            "attachment": os.path.basename(file_path),
-        }
-        if pw_warning:
-            response["warning"] = pw_warning
-        return response
+            result = auth.create_ssh_item(name, user, passphrase, file_path)
+            log.info("Stored SSH key item '%s' (%s).", name, result.get("id"))
+            response = {
+                "created": True,
+                "id": result.get("id", ""),
+                "name": name,
+                "ssh_user": user,
+                "attachment": os.path.basename(file_path),
+            }
+            if pw_warning:
+                response["warning"] = pw_warning
+            return response
+        finally:
+            _release_ssh_secret(key_content, redactor)
+            _release_ssh_secret(passphrase, redactor)
     return _guard(run)
 
 
@@ -1198,7 +1280,13 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
             rsa_bits = int(args.get("rsa_bits") or 4096)
 
             passphrase = _generate_password(auth, {"mode": "password", "length": 32})
-            redactor.register_secret(passphrase)
+            # HVA-01: scope-aware retention for the rotated passphrase and
+            # the new private key content; the finally block below guarantees
+            # a release on every path (success, rotation failure, exception)
+            # when no execution scope owns them. No double-release: the
+            # release helper is a no-op while a scope holds the value.
+            _retain_ssh_secret(passphrase, redactor)
+            key_content = ""
             tmpdir = None
             try:
                 tmpdir, key_path, public_key, fingerprint = \
@@ -1207,7 +1295,8 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 try:
                     with open(key_path, "r", encoding="utf-8",
                               errors="replace") as f:
-                        redactor.register_secret(f.read())
+                        key_content = f.read()
+                    _retain_ssh_secret(key_content, redactor)
                 except OSError:
                     pass
 
@@ -1240,7 +1329,10 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                 # v0.5.8 cleanup observability: sanitized WARNING on failure.
                 if tmpdir is not None:
                     _rmtree_quietly(tmpdir)
-                redactor.forget_secret(passphrase)
+                # HVA-01: guaranteed release on ALL paths (scope no-op when
+                # an execution scope owns the values — never double-release).
+                _release_ssh_secret(key_content, redactor)
+                _release_ssh_secret(passphrase, redactor)
 
         # Non-generate update path (upload semantics).
         resolved_pass, pw_warning = _resolve_secret_input(
@@ -1252,31 +1344,40 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
             updates["username"] = str(args["user"])
         if resolved_pass is not None:
             updates["password"] = resolved_pass
-            redactor.register_secret(resolved_pass)
+            # HVA-01: the NEW passphrase registration must be released when
+            # this execution concludes; the try/finally below covers every
+            # remaining path (edit, attachment replacement, exceptions).
+            _retain_ssh_secret(resolved_pass, redactor)
         if args.get("notes") is not None:
             updates["notes"] = str(args["notes"])
 
-        if updates:
-            current = auth.get_item(item_id)
-            login = dict(current.get("login") or {})
-            login.update(updates)
-            current["login"] = login
-            auth.edit_item(current)
+        try:
+            if updates:
+                current = auth.get_item(item_id)
+                login = dict(current.get("login") or {})
+                login.update(updates)
+                current["login"] = login
+                auth.edit_item(current)
 
-        if args.get("file"):
-            file_path = str(args["file"])
-            _validate_ssh_key_file(file_path)
-            session = auth.get_session()
-            atts = item.get("attachments") or []
-            for att in atts:
-                auth._bw.delete_attachment(session, att.get("id", ""), item_id)
-            auth._bw.create_attachment(session, file_path, item_id)
+            if args.get("file"):
+                file_path = str(args["file"])
+                _validate_ssh_key_file(file_path)
+                session = auth.get_session()
+                atts = item.get("attachments") or []
+                for att in atts:
+                    auth._bw.delete_attachment(session, att.get("id", ""), item_id)
+                auth._bw.create_attachment(session, file_path, item_id)
 
-        log.info("Updated SSH key item '%s' (%s).", name, item_id)
-        response = {"updated": True, "id": item_id, "name": name}
-        if pw_warning:
-            response["warning"] = pw_warning
-        return response
+            log.info("Updated SSH key item '%s' (%s).", name, item_id)
+            response = {"updated": True, "id": item_id, "name": name}
+            if pw_warning:
+                response["warning"] = pw_warning
+            return response
+        finally:
+            # HVA-01: guaranteed release of the new-passphrase registration
+            # on success AND exception paths (no-op without a registration
+            # and while an execution scope owns the value).
+            _release_ssh_secret(resolved_pass, redactor)
     return _guard(run)
 
 
@@ -1359,11 +1460,20 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
             os.chmod(key_path, 0o600)
 
             redactor = get_redacting_filter()
-            redactor.register_secret(passphrase)
+            # HVA-01: scope-aware retention for the passphrase and the
+            # downloaded key content. The OUTER finally block below releases
+            # both on every path — ssh-add success, ssh-add failure (non-zero
+            # exit -> AuthError), and any unexpected exception — while the
+            # release helper stays a no-op when an active execution scope
+            # owns the values (the scope's close() releases exactly once;
+            # manual forget_secret here would be a double-release).
+            _retain_ssh_secret(passphrase, redactor)
+            key_content = ""
             try:
                 with open(key_path, "r", encoding="utf-8",
                           errors="replace") as f:
-                    redactor.register_secret(f.read())
+                    key_content = f.read()
+                _retain_ssh_secret(key_content, redactor)
             except OSError:
                 pass
 
@@ -1417,6 +1527,11 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
             # Clean up askpass script
             if askpass_path and os.path.exists(askpass_path):
                 _remove_quietly(askpass_path, "askpass helper")
+            # HVA-01: guaranteed redaction-registry release of the
+            # passphrase + key material on ALL paths (success, subprocess
+            # failure, exception). No-op when the execution scope owns them.
+            _release_ssh_secret(key_content, redactor)
+            _release_ssh_secret(passphrase, redactor)
     return _guard(run)
 
 
