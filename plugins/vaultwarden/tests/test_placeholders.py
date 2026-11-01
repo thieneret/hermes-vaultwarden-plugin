@@ -9,7 +9,12 @@ import pytest
 from vaultwarden import errors
 from vaultwarden.placeholders import TOKEN_PREFIX, PlaceholderRegistry
 
+# Hex digits are all lowercase by construction (secrets.token_hex), but a
+# pure-digit body like '402854517576' has no cased characters, so str.islower()
+# returns False for it. Match the token shape against an explicit hex alphabet
+# instead of relying on islower()/isalpha() semantics.
 TOKEN_RE = re.compile(r"^__VW_SECRET_[0-9a-f]{12}__$")
+HEX_BODY_RE = re.compile(r"^[0-9a-f]+$")
 
 
 def test_token_format_and_entropy():
@@ -17,7 +22,7 @@ def test_token_format_and_entropy():
     entry = reg.create("item-uuid", "password")
     assert TOKEN_RE.match(entry.token)
     body = entry.token[len(TOKEN_PREFIX):-2]
-    assert len(body) == 12 and body.islower()
+    assert len(body) == 12 and HEX_BODY_RE.match(body)
     # v0.1.4 (FAIL-3): the registry caps live entries at max_entries (default 50).
     # The first token above is still live, so creating another 50 would hit the
     # cap; drop it first so the entropy check starts from a clean slate.
