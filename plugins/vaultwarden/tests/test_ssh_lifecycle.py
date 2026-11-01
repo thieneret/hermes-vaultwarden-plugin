@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from vaultwarden import tools
 from vaultwarden.auth import AuthManager, AuthState
 from vaultwarden.hooks import (
     ExecutionSecretScope,
@@ -27,7 +28,6 @@ from vaultwarden.hooks import (
 )
 from vaultwarden.security import RedactingFilter
 from vaultwarden.tests.conftest import make_config
-from vaultwarden import tools
 
 # Module-level fake secret material (test sentinels only — never real keys).
 GEN_PW = "Zk9#xQ2vLm8pRt4wYb7nKp3mQs8vXc1d"           # fake bw generate output
@@ -61,6 +61,9 @@ class FakeBw:
     def list_items(self, session, filters=None):
         return [dict(i) for i in self._items]
 
+    def delete_item(self, session, item_id, permanent=False):
+        return item_id
+
     def generate_password(self, session_key, args):
         return GEN_PW
 
@@ -85,6 +88,7 @@ def _fake_auth(existing_items=None):
     auth.get_session = lambda: "sess"                            # noqa: SLF001
     auth.get_item = lambda iid: {"id": iid, "name": "svc", "login": {}}
     auth.edit_item = lambda item: {"id": item.get("id", "")}
+    auth.search_items = lambda q: [dict(i) for i in (existing_items or [])]
 
     created = {}
 
