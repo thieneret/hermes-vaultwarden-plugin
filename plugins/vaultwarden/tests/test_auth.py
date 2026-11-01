@@ -229,15 +229,26 @@ def test_status_snapshot_shows_locked_when_no_session():
 # ---------------------------------------------------------------------------
 
 def test_do_unlock_has_no_early_return_guard():
-    """v0.2.3: _do_unlock() must ALWAYS attempt the unlock (no toggle guard)."""
+    """v0.2.3: _do_unlock() must ALWAYS attempt the unlock (no toggle guard).
+
+    v0.7.2 (lazy-unlock prompt hardening, CHANGE 2): the ONE permitted If is
+    the fail-closed falsy-master-password guard that raises AuthError BEFORE
+    spawning a doomed `bw unlock --passwordenv BW_MP`. It never early-returns
+    — it raises — so the "always attempt the unlock when possible" invariant
+    from v0.2.3 (no auto_unlock toggle / silent skip) still holds.
+    """
     import ast
     import inspect
     import textwrap
     body = ast.parse(textwrap.dedent(inspect.getsource(AuthManager._do_unlock)))
     fn = body.body[0]
-    # No conditional early-return at the top of the method body.
+    if_guards = [stmt for stmt in fn.body if isinstance(stmt, ast.If)]
+    # Exactly one conditional block: the v0.7.2 falsy-MP fail-closed guard.
+    assert len(if_guards) == 1, "unexpected extra guard in _do_unlock"
+    guard_src = ast.dump(if_guards[0])
+    assert "AuthError" in guard_src, (
+        "_do_unlock's only If must be the fail-closed master-password guard")
     for stmt in fn.body:
-        assert not isinstance(stmt, ast.If), "unexpected guard in _do_unlock"
         assert not isinstance(stmt, ast.Return), "unexpected early return in _do_unlock"
 
 
