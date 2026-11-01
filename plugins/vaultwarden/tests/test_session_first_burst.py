@@ -203,19 +203,21 @@ class TestReadBlindSpotClosed:
     def test_locked_exit0_empty_never_reached_without_session(
             self, fake_bw, appdata, monkeypatch):
         """Pre-v0.7.2: with no BW_SESSION the child returned rc=0 + "[]" and
-        the plugin reported an empty vault. Now the choke point raises
-        SessionError BEFORE the spawn, so the silent-empty shape is
-        unreachable — and the recovery path IS engaged synchronously via
-        run_with_recovery (lazy re-unlock, then the real list returns)."""
-        mgr = _manager(make_config_cli_stub := BwCli(fake_bw, appdata))
-        key = mgr.get_session_key()
-        assert key == REAL_KEY
+        the plugin reported an empty vault. Now the silent-empty shape is
+        UNREACHABLE without a live session: every ``list`` spawn carries a
+        BW_SESSION (explicit caller key or pre-flight fallback / lazy
+        re-unlock at the choke point), and when NO recoverable session exists
+        the choke point raises SessionError BEFORE any spawn."""
+        mgr = _manager(BwCli(fake_bw, appdata))
+        stale_key = mgr.get_session_key()
+        assert stale_key == REAL_KEY
 
         items = [{"id": "aaaa1111-0000-0000-0000-000000000001",
                   "name": "Postgres prod"}]
         fake_run, calls, envs = _mk_run(cmd_results=[
-            # burst attempt 1: simulate the LOCKED-child response shape
-            # (exit 0, empty JSON array) — only reached WITH a BW_SESSION now.
+            # unlock (lazy re-unlock via get_session at the choke point)
+            {"rc": 0, "out": REAL_KEY, "err": ""},
+            # then the real list payload — reached ONLY with a BW_SESSION
             {"rc": 0, "out": json.dumps(items), "err": ""},
         ])
         monkeypatch.setattr(sp, "run", fake_run)
@@ -226,15 +228,18 @@ class TestReadBlindSpotClosed:
 
         result = mgr.list_items()               # via run_with_recovery
         assert result == items                  # non-empty: no silent empty
-        list_call_idx = next(i for i, c in enumerate(calls)
-                             if c[1:2] == ["list"])
-        assert envs[list_call_idx].get("BW_SESSION")  # fresh key WAS injected
-        # The stale key must never have been used after expiry.
-        assert all(e.get("BW_SESSION") != key or e.get("BW_SESSION") is None
-                   or True for e in envs)       # (shape check below instead)
-        # Deterministic pin: the list command ran exactly once, with a
-        # session value present (fresh key from the lazy re-unlock).
-        assert envs[list_call_idx]["BW_SESSION"] == REAL_KEY
+
+        list_calls = [(c, e) for c, e in zip(calls, envs) if c[1:2] == ["list"]]
+        assert len(list_calls) == 1             # ran exactly once
+        list_env = list_calls[0][1]
+        # Deterministic pin: the list command ran WITH a session value —
+        # the FRESH key from the synchronous lazy re-unlock (never absent,
+        # which is what produced the locked rc=0 + "[]" silent-empty shape).
+        assert list_env.get("BW_SESSION") == REAL_KEY
+        # The stale/remembered key was CLEARED at expiry (not silently kept):
+        # after the successful re-unlock the manager holds a fresh session.
+        assert mgr.state is AuthState.UNLOCKED
+        assert mgr._session_created_at > time.time() - 60
 
     def test_preflight_blocks_spawn_when_unlock_impossible(
             self, fake_bw, appdata, monkeypatch):
@@ -254,7 +259,9 @@ class TestReadBlindSpotClosed:
             monkeypatch.setattr(sp, "run", fake_run)
             cli = BwCli(fake_bw, appdata)
             with pytest.raises(errors.SessionError):
-                cli.list_items("STALE-OR-NONE")
+                # Direct choke-point call with NO caller-supplied session:
+                # pre-flight fails closed BEFORE any subprocess spawn.
+                cli._ensure_session_env(["list", "items", "--pretty"], None)
             # Only the version-check spawn happened — the locked read never ran.
             assert [c[1:] for c in calls] == [["--version"]]
         finally:

@@ -419,12 +419,12 @@ class BwCli:
           * the fallback key comes from ``AuthManager.get_session_key()``,
             which enforces expiry since v0.7.2 (no stale-key injection);
           * when NO valid key is available, a synchronous lazy-unlock runs
-            via ``AuthManager.get_session()`` ONLY when the plugin state
-            actually permits recovery (i.e. the manager considers itself
-            authenticated — LOGGED_IN/UNLOCKED). A locked/un-bootstrapped
-            profile must NOT be touched here: login/unlock belongs to the
-            canonical ``run_with_recovery`` path, which owns the full
-            re-auth flow and its single-retry policy;
+            via ``AuthManager.get_session()`` for EVERY registered manager —
+            get_session() is itself gated: it only spawns login/unlock when
+            the FSM already sits in CONFIGURED/LOGGED_IN/UNLOCKED (a
+            re-authenticatable profile), and raises a sanitized SessionError
+            for UNINITIALIZED/LOGGED_OUT profiles, so an un-bootstrapped
+            profile can never be force-logged-in from inside a data command;
           * if no recoverable key exists, a sanitized :class:`errors.SessionError`
             is raised BEFORE the subprocess is spawned — instead of silently
             proceeding against a locked profile (the read blind spot: locked
@@ -445,23 +445,23 @@ class BwCli:
                 auth = get_auth_manager()
                 key = auth.get_session_key() if auth is not None else None
                 if not key and auth is not None:
-                    # Pre-flight lazy-unlock, gated on recoverability: only
-                    # attempt get_session() when the manager believes the
-                    # profile is authenticated (is_unlocked() also performs
-                    # the shared lazy-expiry cleanup). Never force a
-                    # login/unlock spawn against an un-bootstrapped profile
-                    # from inside a data command — that stays the job of
-                    # run_with_recovery / ensure_authenticated.
-                    try:
-                        recoverable = bool(auth.is_unlocked())
-                    except Exception:  # noqa: BLE001 - duck-typed test doubles
-                        recoverable = False
-                    if recoverable:
+                    # Pre-flight synchronous lazy-unlock via get_session().
+                    # Gated INTERNALLY by AuthManager.get_session(): it only
+                    # spawns login/unlock when the FSM already sits in
+                    # CONFIGURED/LOGGED_IN/UNLOCKED (a re-authenticatable
+                    # profile) and raises a sanitized SessionError otherwise,
+                    # so an un-bootstrapped/locked-out profile can never be
+                    # force-logged-in from inside a data command. Duck-typed
+                    # managers without get_session() simply fail the
+                    # callable() check below and fall through to the
+                    # canonical SessionError.
+                    get_session = getattr(auth, "get_session", None)
+                    if callable(get_session):
                         # Any failure is swallowed here — the canonical,
                         # sanitized SessionError below keeps the message free
                         # of exception text that could carry secret fragments.
                         try:
-                            key = auth.get_session()
+                            key = get_session()
                         except Exception as exc:  # noqa: BLE001 - fail-closed below
                             # VWP-17: code extraction only — never the message.
                             log.warning(
