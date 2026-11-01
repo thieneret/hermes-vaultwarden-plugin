@@ -232,6 +232,48 @@ def test_http_override_still_rejects_user_info():
 
 
 # ---------------------------------------------------------------------------
+# HVA-02 (v0.7.1): server_url_sanitized accessor — defence-in-depth on the
+# display/log path.  The canonical ``server_url`` stays verbatim (functional
+# consumers need the exact URL); ``server_url_sanitized`` is what status and
+# diagnostic payloads must expose.
+# ---------------------------------------------------------------------------
+
+def test_server_url_property_is_verbatim_canonical_value():
+    cfg = _cfg(server_url="https://vault.example.com/path")
+    assert cfg.server_url == "https://vault.example.com/path"
+
+
+def test_server_url_sanitized_strips_sensitive_components():
+    # A hostile value that somehow survives validate() (e.g. the config
+    # section mutated after validation) must still be reduced to
+    # scheme://host[:port] by the sanitized accessor.
+    cfg = _cfg(server_url="https://vault.example.com")
+    cfg.section["server_url"] = (
+        "https://alice:sup3rs3cret@vault.example.com/x?token=S#frag")
+    assert cfg.server_url_sanitized == "https://vault.example.com"
+    for leak in ("alice", "sup3rs3cret", "token", "#frag", "/x"):
+        assert leak not in cfg.server_url_sanitized
+
+
+def test_server_url_sanitized_keeps_nondefault_port():
+    cfg = _cfg(server_url="https://vault.example.com:8443/path")
+    assert cfg.server_url_sanitized == "https://vault.example.com:8443"
+
+
+def test_server_url_sanitized_empty_when_unparseable():
+    # Host-less / unparseable values never reach a logger through this
+    # accessor — it degrades to the empty string instead of "<invalid>".
+    cfg = _cfg(server_url="https://vault.example.com")
+    cfg.section["server_url"] = "not a url at all"
+    assert cfg.server_url_sanitized == ""
+
+
+def test_server_url_sanitized_empty_stays_empty():
+    cfg = _cfg(server_url="")
+    assert cfg.server_url_sanitized == ""
+
+
+# ---------------------------------------------------------------------------
 # HVA-02 (v0.7.1): log sanitization — credentials never appear in logs
 # ---------------------------------------------------------------------------
 

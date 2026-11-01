@@ -183,8 +183,12 @@ class PluginConfig:
         # hostile value that somehow survives validate() (e.g. the config
         # section mutated after validation) is reduced to
         # scheme://host[:port] here, so user-info / query / fragment
-        # material can NEVER reach a consumer that opts into this property.
-        # Status/diagnostic payloads should prefer this accessor.
+        # material can NEVER reach a consumer that reads this accessor.
+        # Status/diagnostic payloads use this property instead of
+        # ``server_url``.  The canonical ``server_url`` stays verbatim on
+        # purpose: functional consumers (auth server-match comparison,
+        # ``bw config server``) need the exact configured URL, and several
+        # tests assert round-trip fidelity of the raw value.
         url = self.server_url
         if not url:
             return url
