@@ -171,7 +171,21 @@ class PluginConfig:
 
     @property
     def server_url(self) -> str:
-        return str(self._raw("server_url") or "").rstrip("/")
+        # HVA-02 (v0.7.1): defence-in-depth on the log path — a hostile value
+        # that somehow survives validate() (e.g. the config section mutated
+        # after validation) is sanitized down to scheme://host[:port] here,
+        # so user-info / query / fragment material can NEVER reach any
+        # consumer of this property (log lines, status snapshots). The
+        # stored section keeps the raw value for bw subprocess calls;
+        # validate() remains the fail-closed gate for those.
+        url = str(self._raw("server_url") or "").rstrip("/")
+        if not url:
+            return url
+        sanitized = _sanitize_url_for_logging(url)
+        if sanitized == "<invalid>":
+            # Unparseable / host-less value: never hand it to a logger.
+            return ""
+        return sanitized
 
     @property
     def client_id(self) -> str:
