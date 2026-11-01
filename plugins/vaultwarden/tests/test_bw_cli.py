@@ -648,15 +648,29 @@ class TestExponentialBackoff:
 
     def test_retry_only_on_network(self, fake_bw, appdata, monkeypatch):
         import subprocess as sp
-        fake_run, calls = _mk_run(cmd_results=[dict(_SESS_ERR)])
-        monkeypatch.setattr(sp, "run", fake_run)
-        sleeps: list[float] = []
-        monkeypatch.setattr("time.sleep", lambda s=None, *_: sleeps.append(s))
-        cli = BwCli(fake_bw, appdata)
-        with pytest.raises(errors.SessionError):
-            cli.run(["list", "items"])
-        assert sleeps == []           # session errors never retried
-        assert len(calls) == 2        # version check + single attempt
+
+        from vaultwarden import bw_cli as mod
+        # v0.7.2: the choke point now fails closed (pre-flight SessionError)
+        # when NO session is available — register a key-bearing dummy so the
+        # command actually spawns and the injected _SESS_ERR stderr drives
+        # the classification under test.
+        class DummyAuth:
+            def get_session_key(self):
+                return "DUMMY-SESSION-KEY"
+
+        mod.register_auth_manager(DummyAuth())
+        try:
+            fake_run, calls = _mk_run(cmd_results=[dict(_SESS_ERR)])
+            monkeypatch.setattr(sp, "run", fake_run)
+            sleeps: list[float] = []
+            monkeypatch.setattr("time.sleep", lambda s=None, *_: sleeps.append(s))
+            cli = BwCli(fake_bw, appdata)
+            with pytest.raises(errors.SessionError):
+                cli.run(["list", "items"])
+            assert sleeps == []           # session errors never retried
+            assert len(calls) == 2        # version check + single attempt
+        finally:
+            mod.register_auth_manager(None)
 
     def test_retry_only_when_idempotent(self, fake_bw, appdata, monkeypatch):
         import subprocess as sp

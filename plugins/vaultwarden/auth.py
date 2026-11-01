@@ -116,6 +116,29 @@ class AuthManager:
         with self._lock:
             return self._session_key
 
+    def _session_valid_locked(self) -> bool:
+        """Shared validity predicate — single source of truth (v0.7.2).
+
+        A session is VALID iff state is UNLOCKED ∧ key present ∧ age within
+        ``session_timeout_seconds``. When the raw age exceeds the timeout the
+        expired session is lazily cleared and demoted to LOGGED_IN (the exact
+        behaviour :meth:`is_unlocked` has always had — extracted here so
+        :meth:`get_session_key` closes the stale-key gap without duplicating
+        the logic).
+
+        Caller MUST hold ``self._lock`` (RLock — re-entrant on the owner).
+        NEVER logs the key value.
+        """
+        if self._state is not AuthState.UNLOCKED or not self._session_key:
+            return False
+        age = time.time() - self._session_created_at
+        if age > self._config.session_timeout_seconds:
+            # Expired -> locked: clear the key, demote state (lazy expiry).
+            self._clear_session_locked()
+            self._state = AuthState.LOGGED_IN
+            return False
+        return True
+
     def get_session_key(self) -> str | None:
         """Return the current in-memory session key, or None when locked.
 
@@ -123,9 +146,17 @@ class AuthManager:
         defense-in-depth fallback so BW_SESSION can never be silently dropped
         from a session-requiring subprocess environment. NEVER logs the value
         and NEVER writes it to disk — memory-only handoff to the child env.
+
+        v0.7.2 (CHANGE 1): expiry-age is now ENFORCED here via the shared
+        :meth:`_session_valid_locked` predicate — identical semantics to
+        :meth:`is_unlocked`. Previously this gated on state + presence only,
+        so a STALE (expired-but-remembered) key could still be injected at
+        the choke point and run ``bw`` against a locked profile — one leg of
+        the first-burst "empty vault + exit 1" regression. An expired key is
+        cleared, the state demotes to LOGGED_IN, and None is returned.
         """
         with self._lock:
-            if self._state is AuthState.UNLOCKED and self._session_key:
+            if self._session_valid_locked():
                 return self._session_key
             return None
 
@@ -163,15 +194,13 @@ class AuthManager:
             return self._state is AuthState.UNLOCKED
 
     def is_unlocked(self) -> bool:
+        # v0.7.2 (CHANGE 1): delegates to the shared _session_valid_locked()
+        # predicate — identical semantics AND identical lazy-expiry behaviour
+        # (expired -> clear key, demote to LOGGED_IN, return False). Kept as
+        # a public method; get_session_key() now agrees with it exactly, so
+        # no stale-key gap can exist between the two capability predicates.
         with self._lock:
-            if self._state is not AuthState.UNLOCKED or not self._session_key:
-                return False
-            age = time.time() - self._session_created_at
-            if age > self._config.session_timeout_seconds:
-                self._clear_session_locked()
-                self._state = AuthState.LOGGED_IN
-                return False
-            return True
+            return self._session_valid_locked()
 
     # ------------------------------------------------------------- bootstrap
     def configure_server_if_needed(self) -> None:
@@ -390,7 +419,20 @@ class AuthManager:
             raise errors.SessionError("Could not establish a bw session.")
 
     def run_with_recovery(self, fn):
-        """Execute *fn(session_key)*; on SESSION_ERROR re-auth once and retry."""
+        """Execute *fn(session_key)*; on SESSION_ERROR re-auth once and retry.
+
+        v0.7.2 (CHANGE 3): the single-retry policy is unchanged — it applies
+        to EVERY wrapped operation, including NON-idempotent writes
+        (create/edit/delete/attachments, VWP-10). The wrapped ``fn`` performs
+        exactly ONE subprocess attempt; the recovery path adds at most ONE
+        further attempt AFTER a synchronous re-unlock. No additional retries
+        are ever introduced for non-idempotent operations: network-level
+        retry remains governed by ``BwCli.run(retryable=...)`` inside the
+        first pass, and locked-vault SessionErrors raised from the write
+        paths now land HERE (instead of escaping as generic PLUGIN_ERRORs),
+        so the first burst after idle/expiry recovers synchronously rather
+        than failing the caller's initial call outright.
+        """
         session = self.get_session()
         try:
             return fn(session)
