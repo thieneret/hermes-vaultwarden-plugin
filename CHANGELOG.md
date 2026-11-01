@@ -9,14 +9,17 @@ Author: **thieneret**
 
 ### Fixed
 - **Session first-burst regression:** eliminated the recurring "empty vault + exit 1" failure on the first burst of calls after idle/expiry. Root cause was a three-way inconsistency: read blind spot (locked vault returns exit 0 empty list), stale key injection (`get_session_key()` ignored expiry), and write recovery bypass (`create_item` raised generic error instead of `SessionError`).
+- **Non-interactive unlock hardening:** the synchronous lazy-unlock at the session choke point can never fall back to the bw CLI's interactive master-password prompt. All bw calls without a payload use stdin=DEVNULL, and a falsy master password fails closed with a sanitized AUTH error before any unlock is spawned.
 
 ### Changed
 - `get_session_key()` now enforces expiry-age validation consistent with `is_unlocked()` (shared `_session_valid_locked()` predicate)
 - `_ensure_session_env()` performs a synchronous lazy-unlock when no valid session key is available, and raises `SessionError` instead of silently proceeding against a locked vault
 - `create_item`/`edit_item` locked-vault failures are now classified as `SessionError` for synchronous recovery via `run_with_recovery()`
+- BwCli.run() defaults stdin to DEVNULL when no input payload is passed; _ensure_session_env() surfaces an actionable operator message ("verify master_password in secrets.yaml") when a non-interactive unlock fails
 
 ### Tests
 - Added `test_session_first_burst.py` regression suite
+- Added test_lazy_unlock_prompt.py regression suite
 
 ## v0.7.1
 

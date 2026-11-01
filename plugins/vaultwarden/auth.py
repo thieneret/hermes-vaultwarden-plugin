@@ -377,6 +377,19 @@ class AuthManager:
     def _do_unlock(self) -> None:
         # v0.2.3 (BREAKING): auto_unlock toggle removed — the vault is ALWAYS
         # auto-unlocked with the master password. No early-return guard.
+        # v0.7.2 (lazy-unlock prompt hardening, CHANGE 2): fail CLOSED when
+        # the in-memory master password is falsy — raise a sanitized AUTH
+        # error BEFORE spawning `bw unlock --passwordenv BW_MP` (base_env()
+        # drops falsy extras, so the spawn would point --passwordenv at a
+        # nonexistent variable and bw could fall back to its interactive
+        # "? Master password:" prompt). AuthError (NOT SessionError) keeps
+        # run_with_recovery from looping on a re-unlock that can never
+        # succeed without a master password. The value is never logged.
+        if not self._master_password or not str(self._master_password).strip():
+            raise errors.AuthError(
+                "master password unavailable; cannot unlock "
+                "non-interactively. Verify master_password in secrets.yaml "
+                "and re-bootstrap.")
         try:
             key = self._bw.unlock_passwordenv(self._master_password)
         except errors.VaultwardenError as exc:
