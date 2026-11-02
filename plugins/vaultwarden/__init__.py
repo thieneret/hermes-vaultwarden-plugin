@@ -208,6 +208,11 @@ def register(ctx: Any) -> bool:
             max_retries=config.bw_max_retries,
             backoff_base=config.bw_backoff_base,
             max_delay=config.bw_max_delay,
+            # v0.7.2 (first-burst bootstrap fix, CHANGE 1): register() must
+            # spawn ZERO bw subprocesses — even the VWP-11 version probe is
+            # deferred to the first authenticated operation via the choke
+            # point's _ensure_version_checked().
+            check_version=False,
         )
         auth = AuthManager(bw, config,
                            client_secret=client_secret,

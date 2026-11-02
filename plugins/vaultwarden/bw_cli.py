@@ -245,6 +245,39 @@ def _looks_like_password_prompt(err: str) -> bool:
     return any(m in lowered for m in _PASSWORD_PROMPT_MARKERS)
 
 
+# v0.7.2 (first-burst bootstrap fix, CHANGE 3): markers showing the failure
+# happened BEFORE any unlock attempt — the profile was never bootstrapped
+# (server not configured / apikey login rejected). Such failures must NEVER
+# be reported as a master-password problem.
+_LOGIN_STAGE_MARKERS = (
+    "not logged in",
+    "you are not currently logged in",
+    "you must log in",
+    "please log in first",
+    "logout required",
+    # v0.7.2 (first-burst bootstrap fix, CHANGE 3): the apikey-login stage
+    # of a FRESH profile fails with this exact bw wording when the server
+    # URL was never configured (or the credentials were rejected) — it is
+    # NOT an unlock failure and must never be blamed on master_password.
+    # Genuine UNLOCK rejections use the distinct "cannot unlock vault" /
+    # "invalid master password" wording (see _unlock_passwordenv path).
+    "username or password is incorrect",
+)
+
+
+def _looks_like_login_stage_failure(err: str) -> bool:
+    """True when sanitized text shows a LOGIN / server-CONFIG stage failure.
+
+    v0.7.2 (first-burst bootstrap fix, CHANGE 3): distinguishes an
+    un-bootstrapped profile (config-server / apikey-login stage) from a
+    genuine UNLOCK failure. Only fixed marker substrings are matched — the
+    input is always sanitized/derived text, and nothing matched here is ever
+    propagated into a message or log line.
+    """
+    lowered = (err or "").lower()
+    return any(m in lowered for m in _LOGIN_STAGE_MARKERS)
+
+
 class BwCli:
     """Stateless command runner; session/auth state lives in AuthManager."""
 
@@ -252,7 +285,8 @@ class BwCli:
              timeout: int = 30,
              max_retries: int = 3,
              backoff_base: float = 1.0,
-             max_delay: float = 10.0):
+             max_delay: float = 10.0,
+             check_version: bool = True):
         if not bw_path or not find_bw_binary(bw_path):
             # VWP-01 (v0.4.7): the path is validated strictly here — no PATH
             # lookup and no env override; config.yaml is the only source of
@@ -269,13 +303,36 @@ class BwCli:
         self._backoff_base = backoff_base
         self._max_delay = max_delay
 
-        # VWP-11 (step 1): fail-fast version check — keep LAST
-        self._bw_version = self._check_version()
+        # v0.7.2 (first-burst bootstrap fix, CHANGE 1): register() must
+        # perform ZERO bw subprocesses — even the fail-fast version probe
+        # is deferred to the first authenticated operation (the auth FSM /
+        # choke point), so a fresh profile sees its FIRST `bw` spawn as the
+        # status probe of the bootstrap sequence, not --version at load
+        # time. ``check_version=False`` marks a construction that will be
+        # probed lazily; direct constructions keep the eager VWP-11 default.
+        self._version_checked = False
+        if check_version:
+            self._bw_version = self._check_version()
+        else:
+            self._bw_version = ""
 
     @property
     def bw_version(self) -> str:
         """The validated bw CLI version string (VWP-11)."""
         return self._bw_version
+
+    def _ensure_version_checked(self) -> None:
+        """Lazily run the VWP-11 fail-fast version probe (v0.7.2).
+
+        Idempotent: runs `bw --version` exactly once per instance, on the
+        first session-requiring / bootstrap command — never at register()
+        time (deferred startup pin). A too-old or unparsable bw still fails
+        closed with UnsupportedBwVersionError at the first real use.
+        """
+        if self._version_checked:
+            return
+        self._bw_version = self._check_version()
+        self._version_checked = True
 
     # ------------------------------------------------------------------ env
     def base_env(self, extra: Mapping[str, str] | None = None) -> dict:
@@ -465,6 +522,58 @@ class BwCli:
         """
         merged: dict[str, str] = dict(env or {})
         verb = args[0] if args else ""
+        # v0.7.2 (first-burst bootstrap fix, CHANGE 1/2): LAZY BOOTSTRAP for
+        # session-requiring commands — whenever NO valid BW_SESSION is
+        # available (explicitly falsy caller key OR no key at all), the full
+        # ensure_authenticated() FSM runs BEFORE the subprocess is spawned,
+        # so a fresh CONFIGURED profile bootstraps correctly on the FIRST
+        # burst instead of spawning `bw list` against an un-bootstrapped
+        # profile (which exits 0 with an EMPTY payload — the read blind spot)
+        # or letting `bw create` die with exit 1. Gated INTERNALLY by
+        # AuthManager.get_session(): UNINITIALIZED profiles raise a
+        # sanitized SessionError before any spawn (deferred-startup +
+        # never-force-login pins preserved); non-session commands and
+        # callers that already hold a VALID explicit key are completely
+        # unaffected (no extra subprocess on the healthy path).
+        auth_manager = get_auth_manager()
+        # v0.7.2 (first-burst bootstrap fix, CHANGE 1/2): the FSM re-bootstrap
+        # capability attached by the REAL AuthManager constructor
+        # (``_bootstrap_via_auth_manager``) is the authoritative signal that
+        # a lazy full-FSM bootstrap is possible for THIS BwCli instance —
+        # including when the call arrives through the manager's own command
+        # wrappers with an explicit (possibly expired) BW_SESSION. Duck-typed
+        # test doubles and bare BwCli instances never get the capability, so
+        # their explicit keys stay trusted as-is (zero extra subprocesses on
+        # healthy paths, minimal doubles keep working).
+        _fsm_bootstrap = getattr(self, "_bootstrap_via_auth_manager", None)
+        _is_real_manager = callable(_fsm_bootstrap) or callable(
+            getattr(auth_manager, "ensure_authenticated", None))
+        _can_vouch = callable(getattr(auth_manager, "get_session_key", None))
+        if verb in self._SESSION_REQUIRED_COMMANDS:
+            _explicit_key = merged.get("BW_SESSION")
+            _valid_key_available = bool(
+                _explicit_key
+                and (_is_real_manager
+                     and _can_vouch
+                     and auth_manager is not None
+                     and auth_manager.get_session_key() == _explicit_key
+                     or not _is_real_manager))
+            if not _valid_key_available and auth_manager is not None:
+                _gs = getattr(auth_manager, "get_session", None)
+                if callable(_gs):
+                    try:
+                        _boot_key = _gs()
+                    except Exception as _exc:  # noqa: BLE001 - fail-closed below
+                        # Sanitized code extraction only — never exception
+                        # text; the canonical SessionError further down keeps
+                        # the surfaced message free of secret-bearing detail.
+                        log.warning(
+                            "Choke-point lazy bootstrap failed (%s) before "
+                            "spawning '%s'.",
+                            compat.get_error_code(_exc), verb)
+                    else:
+                        if _boot_key and not _explicit_key:
+                            merged["BW_SESSION"] = _boot_key
         # v0.7.2 (lazy-unlock prompt hardening): initialized OUTSIDE the
         # lazy-unlock branch so the fail-closed check below is always bound —
         # including when no auth manager is registered at all (both default
@@ -472,21 +581,26 @@ class BwCli:
         # sanitized SessionError wording for that path).
         unlock_error_code: str | None = None
         unlock_prompt_seen = False
+        # v0.7.2 (first-burst bootstrap fix, CHANGE 3): structured stage
+        # marker set by get_session() ("login" when the config-server /
+        # apikey-login stage failed on an un-bootstrapped profile). Only a
+        # fixed identifier string — never secret material.
+        unlock_bootstrap_stage: str | None = None
         if verb in self._SESSION_REQUIRED_COMMANDS:
             if not merged.get("BW_SESSION"):
-                auth = get_auth_manager()
-                key = auth.get_session_key() if auth is not None else None
-                if not key and auth is not None:
+                auth = auth_manager
+                key = auth.get_session_key() if _can_vouch else None
+                if not key and auth is not None and _can_vouch:
                     # Pre-flight synchronous lazy-unlock via get_session().
                     # Gated INTERNALLY by AuthManager.get_session(): it only
                     # spawns login/unlock when the FSM already sits in
-                    # CONFIGURED/LOGGED_IN/UNLOCKED (a re-authenticatable
-                    # profile) and raises a sanitized SessionError otherwise,
-                    # so an un-bootstrapped/locked-out profile can never be
-                    # force-logged-in from inside a data command. Duck-typed
-                    # managers without get_session() simply fail the
-                    # callable() check below and fall through to the
-                    # canonical SessionError.
+                    # CONFIGURED/LOGGED_OUT/LOGGED_IN/UNLOCKED (a
+                    # re-authenticatable profile) and raises a sanitized
+                    # SessionError otherwise, so an un-bootstrapped/locked-out
+                    # profile can never be force-logged-in from inside a data
+                    # command. Duck-typed managers without get_session()
+                    # simply fail the callable() check below and fall through
+                    # to the canonical SessionError.
                     get_session = getattr(auth, "get_session", None)
                     if callable(get_session):
                         # Any failure is swallowed here — the canonical,
@@ -504,11 +618,19 @@ class BwCli:
                         # key value appears in any log line or raised message.
                         unlock_error_code = None
                         unlock_prompt_seen = False
+                        unlock_bootstrap_stage = None
                         try:
                             key = get_session()
                         except Exception as exc:  # noqa: BLE001 - fail-closed below
                             # VWP-17: code extraction only — never the message.
                             unlock_error_code = compat.get_error_code(exc)
+                            # CHANGE 3: read ONLY the structured stage marker
+                            # (a fixed identifier like "login"), never any
+                            # exception text — a login/config-stage failure
+                            # must not be blamed on master_password below.
+                            _stage = getattr(exc, "bootstrap_stage", None)
+                            if isinstance(_stage, str) and _stage == "login":
+                                unlock_bootstrap_stage = "login"
                             # Detection inputs are ONLY sanitized/derived
                             # text (the already-scrubbed exception message/
                             # suggestion and the test-only stderr-injection
@@ -521,6 +643,12 @@ class BwCli:
                             )
                             if _looks_like_password_prompt(probe):
                                 unlock_prompt_seen = True
+                            elif _looks_like_login_stage_failure(probe):
+                                # CHANGE 3: structured-marker fallback for
+                                # managers that do not attach
+                                # ``bootstrap_stage`` — detection only; the
+                                # matched excerpt is never propagated.
+                                unlock_bootstrap_stage = "login"
                             else:
                                 # Belt-and-braces: run()'s classification path
                                 # may not have scrubbed every prompt variant
@@ -533,9 +661,12 @@ class BwCli:
                                         injected):
                                     unlock_prompt_seen = True
                             log.warning(
-                                "Choke-point lazy unlock failed (%s); "
-                                "raising SessionError before spawning '%s'.",
-                                unlock_error_code, verb)
+                                "Choke-point lazy unlock failed (%s; "
+                                "bootstrap stage=%s); raising SessionError "
+                                "before spawning '%s'.",
+                                unlock_error_code,
+                                unlock_bootstrap_stage or "unlock/unknown",
+                                verb)
                             key = None
                 if key:
                     merged["BW_SESSION"] = key
@@ -546,6 +677,27 @@ class BwCli:
                     # actionable bootstrap hint. The raw "? Master password:"
                     # prompt text NEVER reaches this message, any log line,
                     # or the tool response.
+                    #
+                    # v0.7.2 (first-burst bootstrap fix, CHANGE 3 — error
+                    # mapping accuracy): a LOGIN / server-config stage
+                    # failure is checked FIRST and must NOT blame
+                    # master_password — the credential was never even used
+                    # at that stage. "verify master_password in
+                    # secrets.yaml" stays reserved for genuine UNLOCK-stage
+                    # failures (login succeeded, unlock rejected).
+                    if unlock_bootstrap_stage == "login":
+                        raise errors.SessionError(
+                            f"Vault profile not yet bootstrapped — server "
+                            f"not configured or not logged in ('{verb}'); "
+                            f"bootstrap was attempted.",
+                            suggestion="The isolated bw profile could not be "
+                                       "bootstrapped (server configuration or "
+                                       "apikey login stage — the master "
+                                       "password was NOT the problem). Verify "
+                                       "server_url and client_id in "
+                                       "config.yaml and the client_secret in "
+                                       "$HERMES_HOME/plugins/vaultwarden/"
+                                       "secrets.yaml (chmod 600), then retry.")
                     if unlock_prompt_seen or unlock_error_code == "AUTH_ERROR":
                         raise errors.SessionError(
                             f"Non-interactive unlock failed — verify "
@@ -663,6 +815,13 @@ class BwCli:
         v0.6.4: BW_SESSION is guaranteed for session-requiring commands via
         :meth:`_ensure_session_env` (see the hotfix docstring there).
         """
+        # v0.7.2 (first-burst bootstrap fix, CHANGE 1): the choke point is
+        # the single spawn gate for every bw invocation — run the deferred
+        # VWP-11 version probe here exactly once (register() performs zero
+        # subprocesses), BEFORE any session-requiring command may execute.
+        # Non-session commands (e.g. the FSM's own `bw status` probe) also
+        # trigger it, so a too-old bw fails closed before the first burst.
+        self._ensure_version_checked()
         full_env = self._ensure_session_env(args, env)
         cmd = [self.bw_path, *args]
         # v0.7.2 (lazy-unlock prompt hardening, CHANGE 1): every bw call that
@@ -835,8 +994,26 @@ class BwCli:
                 "non-interactively. Verify master_password in secrets.yaml "
                 "and re-bootstrap.")
         env = {"BW_MP": master_password}
-        key = self.run(["unlock", "--passwordenv", "BW_MP", "--raw", "--nointeraction"],
-                       env=env, raw=True, retryable=False)
+        try:
+            key = self.run(["unlock", "--passwordenv", "BW_MP", "--raw",
+                            "--nointeraction"],
+                           env=env, raw=True, retryable=False)
+        except errors.VaultwardenError as exc:
+            # v0.7.2 (first-burst bootstrap fix, CHANGE 3): structured stage
+            # attribution at the source. When `bw unlock` fails because the
+            # profile is NOT LOGGED IN (login-stage prerequisite unmet — e.g.
+            # an un-bootstrapped fresh profile), attach the fixed "login"
+            # stage marker so upstream messages never blame master_password.
+            # A genuine unlock rejection keeps its legitimate
+            # master-password messaging untouched. Detection uses fixed
+            # markers on ALREADY-SANITIZED derived text only; nothing
+            # matched is propagated and no secret value rides this path.
+            probe = (str(exc.message or "") + " " +
+                     str(exc.suggestion or ""))
+            if (_looks_like_login_stage_failure(probe)
+                    and not _looks_like_password_prompt(probe)):
+                exc.bootstrap_stage = "login"
+            raise
         if not key:
             raise errors.AuthError("bw unlock returned an empty session key.")
         return key
@@ -856,11 +1033,76 @@ class BwCli:
         if filters:
             args += filters
         data = self.run(args, env={"BW_SESSION": session_key})
+        items = self._extract_items(data)
+        # v0.7.2 (first-burst bootstrap fix, CHANGE 5): read blind-spot
+        # defense — see _reconcile_empty_read().
+        if not items:
+            retry = self._reconcile_empty_read(args, session_key)
+            if retry is not None:
+                items = retry
+        return items
+
+    @staticmethod
+    def _extract_items(data: Any) -> list[dict]:
         if isinstance(data, list):
             return data
         if isinstance(data, dict) and "data" in data:
             return data["data"]
         return []
+
+    def _reconcile_empty_read(self, args: list[str],
+                              session_key: str) -> list[dict] | None:
+        """Empty-read reconciliation for the read blind spot (v0.7.2, CHANGE 5).
+
+        A locked/un-bootstrapped profile answers ``bw list`` with exit 0 + an
+        EMPTY payload — error classification never runs and recovery is
+        unreachable for reads. When a read returns empty AND the AuthManager
+        state is NOT UNLOCKED, the result is SUSPECT, not a genuine empty
+        vault: reconcile by running the full ``ensure_authenticated()`` FSM,
+        then retry the read EXACTLY ONCE with the confirmed session key. If
+        the retry still comes back empty while the state IS UNLOCKED, accept
+        it as a genuinely empty vault (return None → caller keeps []).
+
+        Guards:
+          * NO extra subprocess when the state is already UNLOCKED (the
+            common healthy path pays nothing);
+          * only triggered when the caller's key differs from the freshly
+            reconciled key (a stale/adopted key) — an in-sync UNLOCKED
+            manager never re-spawns;
+          * duck-typed managers without ``get_session_key`` /
+            ``ensure_authenticated`` skip the defense entirely;
+          * reconciliation failures degrade to the original empty result
+            (no behavior change on the error path);
+          * NEVER logs or surfaces any secret value.
+        """
+        auth = get_auth_manager()
+        if auth is None:
+            return None
+        try:
+            if auth.get_session_key() is not None:
+                # State is UNLOCKED with a valid key — the empty read came
+                # from a live session: accept it as genuinely empty.
+                return None
+        except Exception:  # noqa: BLE001 - defense-in-depth, degrade silently
+            return None
+        # Non-UNLOCKED (or expired) with an empty read => suspect. Reconcile
+        # through the full FSM (idempotent fast path when already valid).
+        try:
+            auth.ensure_authenticated()
+            fresh_key = auth.get_session_key()
+        except Exception as exc:  # noqa: BLE001 - keep original empty result
+            log.warning(
+                "Empty read reconciliation failed (%s); accepting empty "
+                "result.", compat.get_error_code(exc))
+            return None
+        if not fresh_key or fresh_key == session_key:
+            # Still no usable session after reconciliation, or the caller
+            # already used the confirmed key — nothing left to retry.
+            return None
+        log.info("Suspect empty read in non-UNLOCKED state; retrying once "
+                 "after authentication reconciliation.")
+        data = self.run(args, env={"BW_SESSION": fresh_key})
+        return self._extract_items(data)
 
     def item_get(self, session_key: str, query: str) -> dict:
         data = self.run(["get", "item", query], env={"BW_SESSION": session_key})

@@ -277,6 +277,18 @@ def test_malformed_json_falls_back_to_raw(fake_bw, appdata, monkeypatch):
         return m
 
     monkeypatch.setattr(sp, "run", bad_run)
+    # v0.7.2 (deferred version probe): the --version check now runs lazily at
+    # the choke point INSIDE run(), so it must pass through bad_run too.
+    _orig_bad_run = bad_run
+
+    def bad_run_2(cmd, *a, **k):
+        _cmd = cmd if cmd is not None else (a[0] if a else k.get("cmd"))
+        if _cmd is not None and str(_cmd[0]) == fake_bw \
+                and list(_cmd[1:]) == ["--version"]:
+            return real_run(_cmd, *a, **k)
+        return _orig_bad_run(cmd, *a, **k)
+
+    monkeypatch.setattr(sp, "run", bad_run_2)
     cli = BwCli(fake_bw, appdata)
     # non-list payload degrades to [] in list_items — no exception raised
     assert cli.list_items("sess") == []
@@ -567,7 +579,16 @@ class TestErrorClassification:
         m.returncode = 7
         m.stdout = ""
         m.stderr = "some random failure detail"
-        monkeypatch.setattr(sp, "run", lambda *a, **k: m)
+        vmock = MagicMock(returncode=0, stdout="2026.9.1", stderr="")
+
+        def patched_run(*a, **k):
+            # v0.7.2: run() lazily probes `bw --version` before the first
+            # real command; let that through with a valid version.
+            cmd = a[0] if a else k.get("cmd")
+            if cmd is not None and list(cmd)[1:] == ["--version"]:
+                return vmock
+            return m
+        monkeypatch.setattr(sp, "run", patched_run)
         monkeypatch.delenv("BW_TEST_FORCE_STDERR", raising=False)
         with caplog.at_level("DEBUG"), pytest.raises(errors.VaultwardenError):
             bw_cli.run(["report", "xyz"])
@@ -585,7 +606,15 @@ class TestErrorClassification:
 
 def _mk_run(version_stdout="2026.9.1", cmd_results=None, default_rc=0,
             default_out="", default_err=""):
-    """subprocess.run stand-in: first call = bw --version, then sequenced."""
+    """subprocess.run stand-in: --version answers itself, then sequenced.
+
+    v0.7.2 (deferred version probe): run() lazily executes `bw --version` at
+    the choke point BEFORE the real command. The fake detects the version
+    probe by its argv and answers it directly WITHOUT consuming the
+    cmd_results sequence, so callers' results map 1:1 onto the actual
+    commands under test — even when several instances each defer their own
+    probe (register-time constructor probes are gone).
+    """
     from unittest.mock import MagicMock
 
     seq = list(cmd_results or [])
@@ -653,9 +682,14 @@ class TestExponentialBackoff:
         # v0.7.2: the choke point now fails closed (pre-flight SessionError)
         # when NO session is available — register a key-bearing dummy so the
         # command actually spawns and the injected _SESS_ERR stderr drives
-        # the classification under test.
+        # the classification under test. The dummy also exposes get_session()
+        # returning its key, so the lazy-bootstrap branch is a no-op (the
+        # fake subprocess.run would otherwise mis-sequence FSM commands).
         class DummyAuth:
             def get_session_key(self):
+                return "DUMMY-SESSION-KEY"
+
+            def get_session(self):
                 return "DUMMY-SESSION-KEY"
 
         mod.register_auth_manager(DummyAuth())
@@ -664,11 +698,11 @@ class TestExponentialBackoff:
             monkeypatch.setattr(sp, "run", fake_run)
             sleeps: list[float] = []
             monkeypatch.setattr("time.sleep", lambda s=None, *_: sleeps.append(s))
-            cli = BwCli(fake_bw, appdata)
+            cli = BwCli(fake_bw, appdata, check_version=False)
             with pytest.raises(errors.SessionError):
                 cli.run(["list", "items"])
             assert sleeps == []           # session errors never retried
-            assert len(calls) == 2        # version check + single attempt
+            assert len(calls) == 2        # lazy version probe + single attempt
         finally:
             mod.register_auth_manager(None)
 
@@ -678,11 +712,11 @@ class TestExponentialBackoff:
         monkeypatch.setattr(sp, "run", fake_run)
         sleeps: list[float] = []
         monkeypatch.setattr("time.sleep", lambda s=None, *_: sleeps.append(s))
-        cli = BwCli(fake_bw, appdata)
+        cli = BwCli(fake_bw, appdata, check_version=False)
         with pytest.raises(errors.NetworkError):
             cli.run(["status"], retryable=False)
         assert sleeps == []           # retryable=False → no retry at all
-        assert len(calls) == 2
+        assert len(calls) == 2        # lazy version probe + 1 initial
 
     def test_max_retries_respected(self, fake_bw, appdata, monkeypatch):
         import subprocess as sp
@@ -691,10 +725,13 @@ class TestExponentialBackoff:
         monkeypatch.setattr(sp, "run", fake_run)
         sleeps: list[float] = []
         monkeypatch.setattr("time.sleep", lambda s=None, *_: sleeps.append(s))
-        cli = BwCli(fake_bw, appdata, max_retries=3)
+        cli = BwCli(fake_bw, appdata, check_version=False, max_retries=3)
         with pytest.raises(errors.NetworkError):
             cli.run(["status"])
-        assert len(calls) == 5        # version + 1 initial + 3 retries
+        assert len(calls) == 5        # lazy version probe + 1 initial + 3 retries
+        # (v0.7.2: the --version probe is deferred into run(); _mk_run
+        # answers it inline without consuming a cmd_results slot, so the
+        # sequenced results still map 1:1 onto the real commands.)
         assert len(sleeps) == 3
 
     def test_retry_succeeds_after_transient_network_error(self, fake_bw, appdata, monkeypatch):
@@ -728,11 +765,11 @@ class TestExponentialBackoff:
         monkeypatch.setattr(sp, "run", fake_run)
         sleeps: list[float] = []
         monkeypatch.setattr("time.sleep", lambda s=None, *_: sleeps.append(s))
-        cli = BwCli(fake_bw, appdata)
+        cli = BwCli(fake_bw, appdata, check_version=False)
         with pytest.raises(errors.NetworkError):
             call_fn(cli)
         assert sleeps == []           # VWP-10: never retried
-        assert len(calls) == 2        # version check + exactly one attempt
+        assert len(calls) == 2        # lazy version probe + exactly one attempt
 
     @pytest.mark.parametrize("call_fn", [
         pytest.param(lambda cli: cli.status(), id="status"),
@@ -744,10 +781,10 @@ class TestExponentialBackoff:
         monkeypatch.setattr(sp, "run", fake_run)
         sleeps: list[float] = []
         monkeypatch.setattr("time.sleep", lambda s=None, *_: sleeps.append(s))
-        cli = BwCli(fake_bw, appdata)
+        cli = BwCli(fake_bw, appdata, check_version=False)
         call_fn(cli)
         assert len(sleeps) == 1       # retried once, then succeeded
-        assert len(calls) == 3        # version + initial + retry
+        assert len(calls) == 3        # lazy version probe + initial + retry
 
     def test_rate_limit_not_retried(self, fake_bw, appdata, monkeypatch):
         import subprocess as sp
@@ -755,7 +792,7 @@ class TestExponentialBackoff:
         monkeypatch.setattr(sp, "run", fake_run)
         sleeps: list[float] = []
         monkeypatch.setattr("time.sleep", lambda s=None, *_: sleeps.append(s))
-        cli = BwCli(fake_bw, appdata)
+        cli = BwCli(fake_bw, appdata, check_version=False)
         with pytest.raises(errors.RateLimitError):
             cli.run(["status"])
         assert sleeps == []           # raised immediately, never retried
@@ -806,15 +843,15 @@ class TestDeleteItemPermanentSyncRetry:
                                                dict(_OK),
                                                dict(_DELETED_OK)])
         monkeypatch.setattr(sp, "run", fake_run)
-        cli = BwCli(fake_bw, appdata)
+        cli = BwCli(fake_bw, appdata, check_version=False)
         out = cli.delete_item("sess", "abc123", permanent=True)
         assert "has been deleted" in out
         cmds = [c[1:] for c in calls]
-        assert cmds[0] == ["--version"]
+        assert cmds[0] == ["--version"]     # lazy VWP-11 probe (deferred into run)
         assert cmds[1] == ["delete", "item", "abc123", "--permanent"]
         assert cmds[2] == ["sync"]          # REAL sync — NOT ["sync", "--last"]
         assert cmds[3] == ["delete", "item", "abc123", "--permanent"]
-        assert len(calls) == 4              # exactly one retry
+        assert len(calls) == 4              # probe + exactly one retry
 
     def test_permanent_not_found_twice_raises_item_id_message(self, fake_bw,
                                                               appdata,

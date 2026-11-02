@@ -13,6 +13,8 @@ v0.2.8 error taxonomy additions:
 """
 from __future__ import annotations
 
+from typing import Any
+
 
 class VaultwardenError(Exception):
     """Base class for all plugin errors."""
@@ -22,7 +24,7 @@ class VaultwardenError(Exception):
     suggestion = ""
 
     def __init__(self, message: str = "", *, suggestion: str | None = None,
-                 code: str | None = None):
+                 code: str | None = None, **attrs: Any):
         super().__init__(message)
         self.message = message or self.__doc__ or "Unknown plugin error"
         if suggestion is not None:
@@ -32,6 +34,19 @@ class VaultwardenError(Exception):
         # subclassing for every call site.
         if code is not None:
             self.code = code
+        # v0.7.2 (first-burst bootstrap fix, CHANGE 3): structured, sanitized
+        # metadata attributes (e.g. bootstrap_stage="login") attachable to
+        # any error WITHOUT changing the public to_dict() response shape —
+        # consumers (the bw_cli choke point) read them via getattr. Values
+        # must be fixed stage identifiers / booleans, NEVER secret material.
+        for _k, _v in attrs.items():
+            setattr(self, _k, _v)
+
+    #: v0.7.2 (first-burst bootstrap fix, CHANGE 3): allowlist of structured
+    #: metadata attributes that may ride into the operator-facing to_dict()
+    #: response. Values are FIXED identifiers only (e.g. "login"/"unlock"),
+    #: NEVER secret material — attaching them never leaks credentials.
+    _TO_DICT_ATTRS = ("bootstrap_stage",)
 
     def to_dict(self) -> dict:
         resp = {
@@ -41,6 +56,14 @@ class VaultwardenError(Exception):
         }
         if self.suggestion:
             resp["suggestion"] = self.suggestion
+        # CHANGE 3: surface the sanitized bootstrap STAGE so consumers and
+        # tests can verify a login-stage failure was never blamed on
+        # master_password. Shape for all pre-existing errors is unchanged
+        # (attribute absent => no new keys).
+        for _k in self._TO_DICT_ATTRS:
+            _v = getattr(self, _k, None)
+            if isinstance(_v, str) and _v:
+                resp[_k] = _v
         return resp
 
 

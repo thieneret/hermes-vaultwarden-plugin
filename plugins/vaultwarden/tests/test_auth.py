@@ -88,7 +88,11 @@ def test_lock_clears_session(bw_cli):
     assert mgr.session_key
     mgr.lock()
     assert mgr.session_key is None
-    assert mgr.state is AuthState.LOGGED_IN
+    # v0.7.2 (first-burst bootstrap fix, CHANGE 5): lock() demotes to
+    # LOGGED_OUT — the in-memory key is gone, so claiming a re-authenticatable
+    # LOGGED_IN profile would mis-route get_session() into the unlock-only
+    # branch (which cannot succeed without a key).
+    assert mgr.state is AuthState.LOGGED_OUT
 
 
 def test_status_snapshot_has_no_secrets(bw_cli):

@@ -95,6 +95,10 @@ class AuthManager:
         # session-requiring commands (defense-in-depth against a dropped key).
         from . import bw_cli as _bw_cli
         _bw_cli.register_auth_manager(self)
+        # v0.7.2 (first-burst bootstrap fix, CHANGE 1/2): let the choke
+        # point run THIS FSM for commands issued through our own wrappers
+        # (see _attach_bootstrap_secrets_to_bw).
+        self._attach_bootstrap_secrets_to_bw()
         # Plan §5 state machine: the manager starts UNINITIALIZED and only
         # becomes CONFIGURED once configure_server_if_needed() has run (the
         # register(ctx) bootstrap flow). is_available()/check_fn therefore
@@ -104,6 +108,13 @@ class AuthManager:
         self._session_created_at: float = 0.0
         self._last_sync: float = 0.0
         self._lock = threading.RLock()
+        # v0.7.2 (first-burst bootstrap fix, CHANGE 1): observability pin —
+        # counts how many times the FULL bootstrap body of
+        # ensure_authenticated() actually RAN (i.e. past the idempotency fast
+        # path, spawning status/config/login/unlock subprocesses). Tests use
+        # it to prove concurrent first calls bootstrap EXACTLY once. No
+        # secret material involved; plain int under the existing lock.
+        self._full_bootstrap_count: int = 0
 
     # ------------------------------------------------------------ properties
     @property
@@ -174,6 +185,14 @@ class AuthManager:
         the vault comes up on demand instead. A manager that was never
         bootstrapped (state UNINITIALIZED) stays gated off, exactly like
         before v0.1.9.
+
+        v0.7.2 (first-burst bootstrap fix, CHANGE 4): bootstrap failures are
+        no longer swallowed silently. The return value keeps its graceful-
+        degradation contract (False), but WHY the bootstrap failed is now
+        recorded at WARNING level — sanitized error code + bootstrap STAGE
+        only (never exception text, never a secret value), so operators can
+        distinguish "login/server-config stage" from "unlock stage" in the
+        logs without any leakage.
         """
         # NOTE: deliberately NOT taking self._lock here — ensure_authenticated
         # acquires it and RLock is only re-entrant on the owning thread; a
@@ -188,8 +207,12 @@ class AuthManager:
             except Exception as exc:  # noqa: BLE001 - degrade gracefully
                 # VWP-17: error-code extraction centralized in compat.py
                 code = compat.get_error_code(exc)
-                log.warning("Lazy authentication failed (%s); vault unavailable.",
-                            code)
+                # CHANGE 4: record WHY the bootstrap failed — sanitized code +
+                # stage attribution (see _stage_from_code); never exc text.
+                stage = self._stage_from_code(code)
+                log.warning(
+                    "Lazy authentication failed (%s; bootstrap stage=%s); "
+                    "vault unavailable.", code, stage)
                 return False
             return self._state is AuthState.UNLOCKED
 
@@ -254,6 +277,24 @@ class AuthManager:
         """
         log.info("Checking authentication status...")
         with self._lock:
+            # v0.7.2 (first-burst bootstrap fix, CHANGE 1): IDEMPOTENCY fast
+            # path — when this process already holds a VALID (unexpired)
+            # in-memory session, the FSM is by construction already past
+            # config-server + login + unlock, so return WITHOUT spawning any
+            # subprocess. This makes repeated ensure_authenticated() calls
+            # (check_fn -> tool call -> choke-point lazy unlock) cheap and
+            # keeps concurrent first callers from re-running the bootstrap.
+            if self._session_valid_locked():
+                log.debug("Already authenticated and unlocked; "
+                          "ensure_authenticated() no-op.")
+                return
+            # v0.7.2 (first-burst bootstrap fix, CHANGE 1): we are past the
+            # idempotency fast path — this call runs the FULL bootstrap body
+            # (status probe + config server + login + unlock). Count it under
+            # the lock so tests can pin "concurrent first calls bootstrap
+            # EXACTLY once" deterministically.
+            self._full_bootstrap_count = getattr(
+                self, "_full_bootstrap_count", 0) + 1
             # Step 1: current session snapshot.
             status = self.probe_status()
             current_status = self._session_state(status)
@@ -395,10 +436,15 @@ class AuthManager:
         except errors.VaultwardenError as exc:
             # Invalid master password: clear error, NO retry, value never logged.
             if exc.code in ("AUTH_ERROR", "PLUGIN_ERROR"):
-                raise errors.AuthError(
+                # v0.7.2 (first-burst fix, CHANGE 3): mark this as a genuine
+                # UNLOCK-stage failure so callers/choke point may accurately
+                # reference master_password here — and only here.
+                _err = errors.AuthError(
                     "Unlock failed: master password was rejected.",
                     suggestion="Check the master_password in your "
-                               "secrets.yaml file (chmod 600).") from exc
+                               "secrets.yaml file (chmod 600).")
+                _err.bootstrap_stage = "unlock"
+                raise _err from exc
             raise
         self._session_key = key
         self._session_created_at = time.time()
@@ -414,8 +460,64 @@ class AuthManager:
         log.info("Vault unlocked; session key held in plugin memory only.")
 
     # -------------------------------------------------------- session mgmt
+    def _stage_from_code(self, code: str | None) -> str:
+        """Map a sanitized error code to the bootstrap STAGE that failed.
+
+        v0.7.2 (first-burst bootstrap fix, CHANGE 3): stage attribution keeps
+        choke-point / caller messages accurate — a LOGIN or server-CONFIG
+        failure must never be reported as a master-password problem. Only the
+        unlock stage legitimately points at ``master_password``. Classification
+        uses the sanitized CODE alone (never raw exception text), so no secret
+        material can ride this path into a message or log line.
+        """
+        if code == "NETWORK_ERROR":
+            return "network"
+        if code in ("AUTH_ERROR", "PLUGIN_ERROR"):
+            # AuthError is raised by _do_login (login rejected) AND by
+            # _do_unlock (MP rejected / falsy-MP fail-closed); PluginError
+            # wraps `bw config server` failures (_configure_server). The
+            # profile state disambiguates: still CONFIGURED/LOGGED_OUT means
+            # login/config never succeeded; LOGGED_IN means login succeeded
+            # and the UNLOCK stage failed.
+            with self._lock:
+                if self._state in (AuthState.CONFIGURED, AuthState.LOGGED_OUT,
+                                   AuthState.UNINITIALIZED):
+                    return "login"
+            return "unlock"
+        return "unknown"
+
     def get_session(self) -> str:
-        """Return a usable session key, auto-recovering per plan §5."""
+        """Return a usable session key, auto-recovering per plan §5.
+
+        v0.7.2 (first-burst bootstrap fix, CHANGE 1 — PRIMARY): the
+        CONFIGURED/LOGGED_OUT branch no longer calls a bare ``_do_login()``.
+        On a FRESH deferred-auth profile ``bw login --apikey`` FAILS unless
+        the server URL was configured first (``bw config server``), and the
+        ONLY code path performing the full bootstrap sequence
+        (``bw status`` -> config server -> login -> unlock -> verification)
+        was ``ensure_authenticated()`` — reachable solely via
+        ``is_available()``/``check_fn`` or the swallowed-failure fallback in
+        ``vaultwarden_status``. Every read/write tool goes through THIS
+        method (directly or via ``run_with_recovery``), so the first burst on
+        a fresh profile died at login and — thanks to its side effects — the
+        second burst worked. Now CONFIGURED routes through the full FSM:
+
+          * logic reused from ``ensure_authenticated()`` — NOT duplicated;
+          * idempotent: an already-UNLOCKED manager returns immediately
+            (fast path below + inside ensure_authenticated — no extra
+            subprocesses once bootstrapped);
+          * serialized under ``self._lock`` (RLock): concurrent first calls
+            bootstrap EXACTLY once — the loser of the lock race sees a valid
+            session on entry and takes the fast path;
+          * deferred startup preserved: this runs on the FIRST TOOL CALL,
+            never at register() (v0.1.9 Hermes 10s load-timeout constraint).
+
+        A bootstrap that fails at the login/config stage raises a sanitized
+        SessionError carrying an explicit ``bootstrap_stage`` marker so the
+        choke point can describe it accurately instead of blaming
+        master_password (CHANGE 3). Genuine unlock failures keep their
+        original AuthError (master-password hint legitimate there).
+        """
         with self._lock:
             if self.is_unlocked():
                 assert self._session_key is not None
@@ -424,8 +526,61 @@ class AuthManager:
                 self._clear_session_locked()
                 self._state = AuthState.LOGGED_IN
             if self._state in (AuthState.CONFIGURED, AuthState.LOGGED_OUT):
-                self._do_login()
-            if self._state is AuthState.LOGGED_IN:
+                # Full FSM bootstrap (status probe + config server + login +
+                # unlock + server/account verification). Re-entrant RLock:
+                # ensure_authenticated() re-acquires it on this thread.
+                try:
+                    self.ensure_authenticated()
+                except errors.VaultwardenError as exc:
+                    if exc.code in ("NETWORK_ERROR", "PARSE_ERROR"):
+                        raise
+                    # CHANGE 3: propagate any structured stage marker that the
+                    # source (e.g. BwCli.unlock_passwordenv) attached to the
+                    # ORIGINAL exception, and use it as the primary stage
+                    # signal — fixed identifiers only, never exception text.
+                    _src_stage = getattr(exc, "bootstrap_stage", None)
+                    if _src_stage == "login":
+                        stage = "login"
+                    elif (_src_stage is None
+                          and self._state in (AuthState.CONFIGURED,
+                                              AuthState.LOGGED_OUT)):
+                        # The FSM never advanced past CONFIGURED: login itself
+                        # failed, so even an unlock-LOOKING code (AUTH_ERROR /
+                        # PLUGIN_ERROR mapped by _stage_from_code via the
+                        # state) belongs to the LOGIN stage. A genuine unlock
+                        # failure implies LOGGED_IN state with a source-
+                        # attached "unlock" marker — never this branch.
+                        stage = "login"
+                    else:
+                        stage = self._stage_from_code(exc.code)
+                    if stage == "login":
+                        # CHANGE 3: attach the structured stage marker to
+                        # the ORIGINAL exception too, so callers that catch
+                        # AuthError/PluginError directly (and the choke
+                        # point's getattr probe on re-raised instances) can
+                        # attribute the failure accurately without parsing
+                        # any text. Fixed identifier only — never secret
+                        # material; to_dict() shape is unchanged.
+                        exc.bootstrap_stage = "login"
+                        raise errors.SessionError(
+                            "Vault profile bootstrap failed during login/"
+                            "server configuration; verify client_id and "
+                            "server_url.",
+                            suggestion="The isolated bw profile could not be "
+                                       "bootstrapped (server config or apikey "
+                                       "login stage). Check server_url/"
+                                       "client_id in config.yaml and the "
+                                       "client_secret in secrets.yaml "
+                                       "(chmod 600).",
+                            bootstrap_stage="login",
+                        ) from exc
+                    raise
+                if self._state is AuthState.UNLOCKED and self._session_key:
+                    return self._session_key
+            elif self._state is AuthState.LOGGED_IN:
+                # Lighter recovery for an already-bootstrapped profile:
+                # unlock only (no login needed); _do_unlock keeps the
+                # master-password-specific messaging.
                 self._do_unlock()
             if self._state is AuthState.UNLOCKED and self._session_key:
                 return self._session_key
@@ -458,6 +613,28 @@ class AuthManager:
             return fn(session)
 
     # ------------------------------------------------------------- operations
+    def _attach_bootstrap_secrets_to_bw(self) -> None:
+        """Give the BwCli instance a capability to re-bootstrap via THIS FSM.
+
+        v0.7.2 (first-burst bootstrap fix, CHANGE 1/2): the subprocess-env
+        choke point (:meth:`BwCli._ensure_session_env`) must be able to run
+        the FULL ``ensure_authenticated()`` FSM for every session-requiring
+        command — including calls made through the AuthManager's own command
+        wrappers, which pass an explicit (possibly expired) BW_SESSION.
+        Without that, a stale key injected by e.g. ``run_with_recovery``
+        would spawn `bw list` against a locked/un-bootstrapped profile —
+        exactly the read blind spot this closes. The closure is set only on
+        instances constructed by the real AuthManager; duck-typed test
+        doubles and bare BwCli instances never get it, so their explicit
+        keys stay trusted as-is (zero extra subprocesses on healthy paths).
+        No secret material crosses this boundary — the closure takes and
+        returns nothing sensitive beyond what the FSM already holds.
+        """
+        try:
+            self._bw._bootstrap_via_auth_manager = self.ensure_authenticated
+        except AttributeError:  # pragma: no cover - exotic non-writable obj
+            pass
+
     def sync(self, force: bool = False) -> dict:
         """`bw sync`; with auto_sync also refreshes when the cache is stale."""
         now = time.time()
@@ -612,13 +789,22 @@ class AuthManager:
         self._session_created_at = 0.0
 
     def lock(self) -> None:
-        """Best-effort `bw lock` on the isolated profile + clear memory."""
+        """Best-effort `bw lock` on the isolated profile + clear memory.
+
+        v0.7.2 (first-burst bootstrap fix, CHANGE 5): demote to LOGGED_OUT —
+        NOT LOGGED_IN. The in-memory session key is cleared here, so after a
+        lock there is NO usable session at all; LOGGED_IN would wrongly claim
+        a re-authenticatable (login-succeeded) profile and route
+        get_session() down the unlock-only branch, which cannot succeed
+        without a key. LOGGED_OUT keeps every recovery path on the full-FSM
+        branch (status probe reconciles the real bw login state anyway).
+        """
         with self._lock:
             key = self._session_key
             if key:
                 self._bw.lock(key)
             self._clear_session_locked()
-            self._state = AuthState.LOGGED_IN
+            self._state = AuthState.LOGGED_OUT
             log.info("Vault locked; session cleared from plugin memory.")
 
     def shutdown(self, *, keep_appdata: bool = True) -> None:

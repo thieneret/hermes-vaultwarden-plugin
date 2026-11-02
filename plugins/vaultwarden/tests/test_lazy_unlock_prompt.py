@@ -259,7 +259,7 @@ class TestChokePointPromptHardening:
         the raw '? Master password:' text NEVER appears."""
         auth = self._auth_raising(
             lambda: errors.VaultwardenError(
-                f"bw unlock failed (exit 1).",
+                "bw unlock failed (exit 1).",
                 suggestion=f"Run 'vaultwarden_status' for details. "
                            f"bw stderr: {PROMPT_TEXT}"))
         register_auth_manager(auth)
