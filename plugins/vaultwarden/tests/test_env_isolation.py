@@ -24,10 +24,12 @@ class TestEnvIsolation:
         monkeypatch.setenv("SENSITIVE_VAR", "should_not_leak")
 
         bw = BwCli(fake_bw, appdata)
+        # v0.7.2 (deferred version probe): the VWP-11 `bw --version` check
+        # now runs lazily inside run(); mark it done so the mock below only
+        # captures the actual `bw status` spawn under test.
+        bw._version_checked = True
 
-        # Mock subprocess.run to capture the env passed to it. The constructor
-        # already ran one real `bw --version` check (VWP-11), so reset the
-        # call counter before exercising run().
+        # Mock subprocess.run to capture the env passed to it.
         with patch("subprocess.run") as mock_run:
             mock_run.reset_mock()
             mock_run.return_value = MagicMock(
