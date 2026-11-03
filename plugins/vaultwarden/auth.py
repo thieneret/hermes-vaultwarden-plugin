@@ -17,6 +17,7 @@ Session key rules:
 """
 from __future__ import annotations
 
+import atexit
 import enum
 import json
 import os
@@ -24,6 +25,11 @@ import re
 import threading
 import time
 from pathlib import Path
+
+try:  # v0.7.7 Phase 1: POSIX advisory locking (fcntl is Unix-only).
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platform fallback
+    fcntl = None  # type: ignore[assignment]
 
 from . import compat, errors
 from .bw_cli import BwCli
