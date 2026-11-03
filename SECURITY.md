@@ -1,6 +1,6 @@
 # Security Model â€” hermes-vaultwarden-plugin
 
-**Applies to:** v0.7.3
+**Applies to:** v0.7.4
 
 ## Threat Model
 
@@ -103,8 +103,11 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     `vaultwarden_status` misleadingly reported `operational: true`. Mitigated
     by v0.7.3 defense-in-depth: bounded retry loop for initial sync (max 3
     attempts, 10s interval, transient NetworkError only), full-vs-delta sync
-    verb selection (`bw sync` when no prior sync exists in this process,
-    `bw sync --last` only for incremental refresh), empty-read defense that
+    verb selection (corrected in v0.7.4: `bw sync --force` when no prior sync
+    exists in this process to guarantee a full vault download, plain
+    `bw sync` for incremental refresh; the previously used `bw sync --last`
+    only prints the last sync date and does NOT sync — removed from all sync
+    code paths), empty-read defense that
     detects an unpopulated cache on an empty read and forces one full sync +
     single retry, structured INFO/WARNING logging on every sync outcome, and
     status honesty (`operational` now requires both a valid session AND a
