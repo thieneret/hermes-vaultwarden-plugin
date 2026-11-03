@@ -220,7 +220,7 @@ The plugin exposes 12 tools to the Hermes agent. The LLM constructs the exact to
 
 | Tool | Purpose | Requires `allow_write` |
 | --- | --- | :-: |
-| `vaultwarden_status` | Plugin health: auth state, session, server config, plugin version. Distinguishes the plugin's actual operational capability (`operational`, `session_key_available`) from the Bitwarden CLI persistent-profile state (`bw_profile_state`, which normally reads `locked` by design). Since v0.7.3 also reports cache freshness: `cache_populated` (bool) — whether the local vault cache has been populated at least once; `initial_sync_completed` (bool) — whether the initial sync succeeded. `operational` is `true` only when BOTH the session is valid AND the cache is populated | ❌ |
+| `vaultwarden_status` | Plugin health: auth state, session, server config, plugin version. Distinguishes the plugin's actual operational capability (`operational`, `session_key_available`) from the Bitwarden CLI persistent-profile state (`bw_profile_state`, which normally reads `locked` by design). Reports cache freshness: `cache_populated` (bool) — whether the local vault cache has been populated at least once; `initial_sync_completed` (bool) — whether the initial sync succeeded. `operational` is `true` only when BOTH the session is valid AND the cache is populated | ❌ |
 | `vaultwarden_sync` | Sync vault (`force=true` bypasses auto-sync interval) | ❌ |
 | `vaultwarden_list` | List items — metadata only | ❌ |
 | `vaultwarden_search` | Search items by name/username/uri — metadata only | ❌ |
@@ -252,7 +252,7 @@ On the **READ path** (vault → agent), raw secrets are never exposed to the age
 - The placeholder reference MUST be double-quoted (or unquoted) — never single quotes — so the shell expands the `$(< path)` substitution.
 - If a command references the same placeholder multiple times, the middleware resolves it exactly once and creates a single temp file.
 
-> **EXCEPTION — WRITE path (agent → vault):** when the LLM supplies a raw secret directly to `vaultwarden_store` / `vaultwarden_update` (or their SSH variants) via the `password` / `pass` parameters, that secret DOES enter the LLM context and chat history. See [Secret input channels](#secret-input-channels) below for the secure alternatives.
+> **EXCEPTION — WRITE path (agent → vault):** when the LLM supplies a raw secret directly to `vaultwarden_store` / `vaultwarden_update` (or their SSH variants) via the `password` / `pass` parameters, that secret DOES enter the LLM context and chat history. See Secret input channels below for the secure alternatives.
 
 ## SSH Key Management
 
@@ -269,7 +269,7 @@ When creating or updating secrets (passwords or SSH passphrases), the LLM can su
 1. **Owner-only file (Secure):** A path to a file holding the secret (`password_file` / `pass_file`). The file must be readable only by the owner (`chmod 600`). The secret is read directly from disk and never enters the LLM context or chat history.
 2. **Raw value (Insecure):** The secret is passed directly as a string. The plugin accepts it but emits a strict security warning in both the logs and the tool response, instructing the agent to warn the user.
 
-> **Note:** This is the only path where a secret can enter the LLM context. On the READ path (vault → agent), secrets never enter the context window — see [Placeholder Injection](#placeholder-injection-security-model) above.
+> **Note:** This is the only path where a secret can enter the LLM context. On the READ path (vault → agent), secrets never enter the context window — see Placeholder Injection above.
 
 ## Filesystem Security Requirements
 
@@ -319,7 +319,7 @@ mkdir -m 700 /path/to/real-dir
 | --- | --- |
 | Placeholder injection | Secrets never enter the context window |
 | Subprocess env isolation | All `bw` calls run with a minimal, controlled environment |
-| Session key in memory only | Bitwarden session key is never written to disk. Since v0.6.4 the `BW_SESSION` environment variable is guaranteed at the single subprocess-env choke point for all session-requiring `bw` commands (list/get/create/edit/delete), so vault operations can no longer silently run against a locked vault (v0.6.3 regression: empty `vaultwarden_list`, exit 1 on `vaultwarden_store`). Since v0.7.2 the choke point adds a pre-flight validity check with synchronous lazy-unlock: if no valid (non-expired) session key is available, the plugin re-unlocks on demand before spawning `bw`, and raises a sanitized `SessionError` if re-unlock fails — session-requiring commands can never run against a locked profile with a stale or missing key. Also since v0.7.2 the lazy-unlock is prompt-hardened: every bw invocation without a payload runs with stdin=DEVNULL, and a falsy master password fails closed with a sanitized AUTH error before any unlock is spawned, so the bw CLI can never fall back to an interactive master-password prompt. Also since v0.7.2 the first tool call on a fresh profile performs the full auth bootstrap (config server + login + unlock) before any read/write, so reads/writes work on the first burst and vault operations can never run against an un-bootstrapped profile. Locked/expired sessions now surface as `SESSION_ERROR` / `SESSION_EXPIRED` with sanitized stderr and a re-unlock suggestion — never the raw session key. |
+| Session key in memory only | Bitwarden session key is never written to disk. The `BW_SESSION` environment variable is guaranteed at the single subprocess-env choke point for all session-requiring `bw` commands (list/get/create/edit/delete), so vault operations can no longer silently run against a locked vault. The choke point adds a pre-flight validity check with synchronous lazy-unlock: if no valid (non-expired) session key is available, the plugin re-unlocks on demand before spawning `bw`, and raises a sanitized `SessionError` if re-unlock fails — session-requiring commands can never run against a locked profile with a stale or missing key. The lazy-unlock is prompt-hardened: every bw invocation without a payload runs with stdin=DEVNULL, and a falsy master password fails closed with a sanitized AUTH error before any unlock is spawned, so the bw CLI can never fall back to an interactive master-password prompt. The first tool call on a fresh profile performs the full auth bootstrap (config server + login + unlock) before any read/write, so reads/writes work on the first burst and vault operations can never run against an un-bootstrapped profile. Locked/expired sessions now surface as `SESSION_ERROR` / `SESSION_EXPIRED` with sanitized stderr and a re-unlock suggestion — never the raw session key. |
 | RedactingFilter | All secrets registered; redacted from logs and errors |
 | SSH passphrase delivery | Via the `SSH_ASKPASS` mechanism (env var only, never stdin/argv). Helper script removed in `finally` block. |
 | SSH key temp file | `tempfile.mkstemp()` (atomic), `0600` perms, deleted in `finally` |
@@ -368,7 +368,7 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **440 tests** — including positive-control suites for:
+Current suite: **797 tests** — including positive-control suites for:
 
 - Placeholder lifecycle (single-use, expiry, replay rejection)
 - Fail-closed behaviour (missing hooks, broken config, refused loads)
