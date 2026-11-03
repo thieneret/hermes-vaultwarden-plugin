@@ -1163,6 +1163,17 @@ class AuthManager:
         # capability whenever a stale key lingered in LOGGED_IN state or the
         # session had expired; both cases now correctly read False.
         session_key_available = usable
+        # Phase 4 (v0.7.3 status honesty): cache freshness is now part of the
+        # operational predicate. A valid session with a never-populated cache
+        # (_last_sync == 0.0) previously reported operational=true while every
+        # read returned empty — the exact contradiction behind the first-burst
+        # bug. session_active / session_key_available semantics are unchanged
+        # (session-key-only predicates); the new fields are additive.
+        cache_populated = self._last_sync > 0.0
+        if session_key_available and not cache_populated:
+            log.warning(
+                "Status inconsistency: session active but cache never populated"
+            )
         return {
             "plugin": "vaultwarden",
             "enabled": self._config.enabled,
@@ -1187,10 +1198,17 @@ class AuthManager:
             # the authoritative gate — i.e. the plugin CAN perform read/write
             # operations right now.
             "session_key_available": session_key_available,
-            # Overall operational capability: same predicate as above; kept
-            # separate so operators can distinguish "usable session" from the
-            # raw FSM state without inferring across fields.
-            "operational": session_key_available,
+            # Overall operational capability. Phase 4 (v0.7.3): requires BOTH
+            # a usable session AND a populated cache — a valid session against
+            # a never-synced profile is NOT fully operational. Type unchanged
+            # (bool) for backward compatibility.
+            "operational": session_key_available and cache_populated,
+            # ---- additive fields (Phase 4, v0.7.3 status honesty).
+            # True iff at least one sync has completed in this process.
+            "cache_populated": cache_populated,
+            # True iff the bounded initial-sync retry loop (Phase 2) has
+            # succeeded exactly once. Consumed by diagnostics.
+            "initial_sync_completed": self._initial_sync_completed,
             # Verbatim persistent-session state reported by `bw status` for
             # the isolated profile — informational fidelity, NOT capability.
             # Unchanged by design (Phase-2B CHANGE 3): legitimately "locked"

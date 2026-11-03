@@ -119,6 +119,10 @@ def test_bw_locked_but_key_available_top_level_is_operational():
     mgr = _mocked_manager(
         AuthState.UNLOCKED, "SKEY-injected-3",
         {"status": "locked", "serverUrl": "https://vault.example.com"})
+    # v0.7.3 Phase 4: `operational` now additionally requires a populated
+    # cache; this fixture isolates the bw persistent-profile-state leg, so
+    # simulate at least one completed sync.
+    mgr._last_sync = time.time() - 1.0
     snap = mgr.status_snapshot()
     # Top-level capability fields: plugin CAN operate (per-command injection).
     assert snap["operational"] is True
@@ -312,6 +316,9 @@ def test_h_status_graceful_when_recovery_fails(bw_cli, monkeypatch):
 def test_bw_profile_state_independent_of_capability():
     mgr = _mocked_manager(AuthState.UNLOCKED, "SKEY-2b-independent",
                           {"status": "locked", "serverUrl": "https://vault.example.com"})
+    # v0.7.3 Phase 4: capability assertions here target the session-key leg;
+    # mark the cache populated so `operational` reflects it (see CHANGE 2).
+    mgr._last_sync = time.time() - 1.0
     snap = mgr.status_snapshot()
     assert snap["operational"] is True
     assert snap["session_key_available"] is True
