@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.7.6
+**Applies to:** v0.7.7
 
 ## Threat Model
 
@@ -135,6 +135,26 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     with sanitized status/error codes only � the session key value is never
     passed to `bw status`'s command line (env-only), never logged, and never
     written to disk.)
+20. **Multi-process session invalidation — unlock race (v0.7.7)** (multiple
+    AuthManager instances — e.g., dashboard + gateway processes — share the
+    same `.bw-data` profile directory; each `bw unlock` invalidates the
+    previous session key (`bw` supports exactly ONE session key per profile),
+    causing an infinite loop of empty reads and re-unlocks: the v0.7.6
+    defense detects invalidation and re-unlocks, but the other process
+    immediately unlocks again and invalidates the fresh key. Control:
+    `SessionLockManager` acquires an exclusive `fcntl.flock()` on
+    `.bw-data/.unlock.lck` before `bw unlock`, ensuring only one process
+    unlocks at a time. Lock acquisition timeout is configurable via
+    `session_lock_timeout_seconds` (default 5.0, bounded [0, 30]); on
+    timeout the unlock fails gracefully with a sanitized `AuthError`
+    (no crash, no secret values in logs or messages). The lock is released
+    on `lock()`/`shutdown()` and via `atexit` cleanup on process exit.
+    Degraded mode (`_NullSessionLock`) applies when the appdata dir is
+    unusable or `fcntl` is unavailable (non-POSIX). The lock file is a pure
+    coordination primitive: named `.unlock.lck` (deliberately avoids the
+    "session" substring so the session-key-persistence security guard stays
+    meaningful), created mode 0600, and always zero bytes — the session key
+    and master password remain memory-only and are NEVER written to disk.)
 
 ## Primary Security Controls
 
