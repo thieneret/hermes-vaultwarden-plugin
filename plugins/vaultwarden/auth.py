@@ -18,7 +18,9 @@ Session key rules:
 from __future__ import annotations
 
 import enum
+import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -30,6 +32,39 @@ from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
 from .security import get_logger, get_redacting_filter
 
 log = get_logger("auth")
+
+
+def _initial_sync_failure_summary(exc: BaseException) -> str:
+    """Sanitized single-line failure summary for initial-sync logs (Phase 2).
+
+    Hardening rule: log lines carry ONLY sanitized error codes from
+    errors.py — never raw exception text or values. Exception messages in
+    this codebase can transitively contain secret material (session key,
+    client_secret, master password — see the production redaction audit),
+    so raw ``str(exc)`` must NEVER reach a log record. We extract only:
+
+      * the sanitized error code constant, and
+      * an optional safe context substring (hostname / numeric ids) taken
+        from a strict allowlist of characters. Anything that could be a
+        credential, URL userinfo, or free-form server text is dropped.
+    """
+    code = compat.get_error_code(exc)
+    parts = [code]
+    msg = str(exc)
+    # "server <url>" context: reduce to scheme://hostname via the existing
+    # HVA-02 sanitizer (strips userinfo/path/query — never credentials).
+    m = re.search(r"server\s+([A-Za-z][A-Za-z0-9+.-]*://[^\s]+)", msg)
+    if m:
+        try:
+            parts.append(f"server {_sanitize_url_for_logging(m.group(1))}")
+        except Exception:  # noqa: BLE001 - diagnostics only, never raise
+            pass
+    else:
+        # Safe scalar contexts only: numeric ids / bounded integers.
+        m2 = re.search(r"\b(?:status|code)[ =]+(\d{3})\b", msg)
+        if m2:
+            parts.append(f"status={m2.group(1)}")
+    return " ".join(parts)
 
 
 class AuthState(str, enum.Enum):
@@ -107,6 +142,11 @@ class AuthManager:
         self._state = AuthState.UNINITIALIZED
         self._session_created_at: float = 0.0
         self._last_sync: float = 0.0
+        # v0.7.3 (Phase 3): bounded item count from the most recent SUCCESSFUL
+        # sync — internal hand-off for BwCli's empty-read defense log line
+        # only. A plain int (never vault content, never a secret). None until
+        # a sync reports a parseable count. NOT part of status_snapshot().
+        self._last_sync_item_count: int | None = None
         self._lock = threading.RLock()
         # v0.7.2 (first-burst bootstrap fix, CHANGE 1): observability pin —
         # counts how many times the FULL bootstrap body of
@@ -115,8 +155,34 @@ class AuthManager:
         # it to prove concurrent first calls bootstrap EXACTLY once. No
         # secret material involved; plain int under the existing lock.
         self._full_bootstrap_count: int = 0
+        # v0.7.3 (Phase 2, CHANGE 2): initial-sync state tracking for
+        # downstream consumers (Phase 3 empty-read defense, Phase 4 status
+        # honesty). _initial_sync_completed flips True exactly once — when
+        # the FIRST post-auth sync attempt succeeds. _initial_sync_failed
+        # flips True only after the bounded retry loop EXHAUSTS its attempts
+        # (or a non-retryable error aborts it) without ever succeeding.
+        # Plain bools under the existing RLock; no secret material involved.
+        self._initial_sync_completed: bool = False
+        self._initial_sync_failed: bool = False
+        # v0.7.3 (Phase 2): WARNING-budget flag — _maybe_initial_sync() sets
+        # this around its sync() calls so per-attempt failures log at INFO
+        # only (spec); direct sync() callers never see it set and keep the
+        # Phase 1 "Sync failed (...)" WARNING unchanged.
+        self._sync_warn_suppressed: bool = False
 
     # ------------------------------------------------------------ properties
+    @property
+    def initial_sync_completed(self) -> bool:
+        """True once the first post-auth sync has succeeded (v0.7.3 Phase 2)."""
+        with self._lock:
+            return self._initial_sync_completed
+
+    @property
+    def initial_sync_failed(self) -> bool:
+        """True when the bounded initial-sync retry loop gave up (Phase 2)."""
+        with self._lock:
+            return self._initial_sync_failed
+
     @property
     def state(self) -> AuthState:
         with self._lock:
@@ -175,6 +241,17 @@ class AuthManager:
     def last_sync(self) -> float:
         with self._lock:
             return self._last_sync
+
+    @property
+    def last_sync_result(self) -> int | None:
+        """Bounded item count of the most recent successful sync (Phase 3).
+
+        Internal hand-off consumed by ``BwCli._forced_full_sync_retry()`` so
+        its "Forced full sync completed (<N> items)" line can carry the count.
+        Plain int or None — never vault content, never a secret. Duck-typed
+        test managers without this property are handled via getattr default.
+        """
+        return getattr(self, "_last_sync_item_count", None)
 
     def is_available(self) -> bool:
         """check_fn passed to ctx.register_tool — graceful degradation gate.
@@ -390,12 +467,138 @@ class AuthManager:
         self._do_unlock()
 
     def _maybe_initial_sync(self) -> None:
-        """Best-effort first sync after authentication (auto_sync only)."""
-        if self._config.auto_sync and self._last_sync == 0.0:
-            try:
-                self.sync(force=False)
-            except errors.VaultwardenError as exc:
-                log.warning("Initial sync failed (%s); continuing.", exc.code)
+        """First sync after authentication, with bounded retry (auto_sync only).
+
+        v0.7.3 (Phase 2, CHANGE 1): converted from single-shot to a BOUNDED
+        retry loop. Root cause of the production incident (2026-11-02): a
+        transient NetworkError during a Docker container's 1-2 minute network
+        cold-start window was swallowed by the single attempt, leaving
+        ``_last_sync == 0.0`` and an unpopulated cache for the whole process
+        lifetime ("first-burst empty vault").
+
+        Retry policy:
+        - Max attempts / inter-attempt delay come from PluginConfig
+          (defaults: 3 attempts x 10s; hard-capped so total sleep <= 20s —
+          well under the 30s plugin-load timeout ceiling).
+        - ONLY ``errors.NetworkError`` is retried (cold-start DNS/TLS
+          transients). ``AuthError``/``SessionError`` are NOT transient here:
+          they abort the loop immediately with the same WARNING wording.
+        - On success: ``_initial_sync_completed = True`` (sync() itself sets
+          ``_last_sync``); INFO logs identify the winning attempt.
+        - On exhaustion/non-retryable failure: ``_initial_sync_failed = True``
+          and ONE WARNING (individual retry failures are INFO — expected
+          during cold-start; only the final outcome is WARNING).
+
+        Phase 1 logging (attempt/success/failure lines) is preserved verbatim
+        for backward compatibility. Log lines never contain secret values or
+        raw exception text — sanitized error codes from errors.py only.
+        """
+        if not self._config.auto_sync or self._last_sync != 0.0:
+            return
+        # Already completed in this process (idempotency guard; also keeps a
+        # re-entry after a successful loop from re-spawning subprocesses).
+        with self._lock:
+            if self._initial_sync_completed:
+                return
+
+        max_attempts = int(getattr(self._config, "initial_sync_max_attempts", 3))
+        delay = float(getattr(self._config, "initial_sync_retry_delay_seconds",
+                              10.0))
+
+        log.info("Initial sync started")
+        if max_attempts > 1:
+            log.info("Initial sync retry loop started (max %d attempts, %.1fs "
+                     "interval)", max_attempts, delay)
+        started = time.monotonic()
+
+        # Defense-in-depth for the WARNING-budget invariant (spec: individual
+        # retry-attempt failures are INFO; only the FINAL outcome is WARNING):
+        # suppress sync()'s own Phase 1 failure WARNING while this loop owns
+        # the outcome reporting, and emit exactly ONE WARNING per terminal
+        # path below. We deliberately do NOT mutate _last_sync/_state here —
+        # sync()'s fresh-process full-vs-delta verb decision must stay
+        # intact (Phase 1 semantics). Direct callers of sync() (tool
+        # handlers, auto-sync refresh) never enter this context manager and
+        # keep their full Phase 1 WARNING — no observability regression.
+        class _SyncWarningBudget:
+            def __init__(self, manager: "AuthManager") -> None:
+                self._mgr = manager
+                self._saved = None
+
+            def __enter__(self) -> "_SyncWarningBudget":
+                self._saved = self._mgr._sync_warn_suppressed
+                self._mgr._sync_warn_suppressed = True
+                return self
+
+            def __exit__(self, *exc_info) -> bool:
+                self._mgr._sync_warn_suppressed = self._saved
+                return False
+
+        with _SyncWarningBudget(self):
+            last_summary = "UNKNOWN_ERROR"
+            for attempt in range(1, max_attempts + 1):
+                # v0.7.3 Phase 2: track the LAST failure summary (sanitized
+                # error code + safe context only — never raw exception text)
+                # so the exhaustion WARNING can carry the real reason
+                # instead of a bare count.
+                try:
+                    result = self.sync(force=False)
+                except errors.NetworkError as exc:
+                    # VWP-17 centralized extraction; exc.code is already a
+                    # sanitized constant from errors.py — never message text.
+                    code = compat.get_error_code(exc)
+                    last_summary = _initial_sync_failure_summary(exc)
+                    if attempt < max_attempts:
+                        # INFO, not WARNING: transient failures are EXPECTED
+                        # during a container network cold-start window.
+                        log.info("Initial sync attempt %d/%d failed (%s), "
+                                 "retrying in %.1fs", attempt, max_attempts,
+                                 code, delay)
+                        time.sleep(delay)
+                        continue
+                    with self._lock:
+                        self._initial_sync_failed = True
+                    # ONE WARNING on exhaustion (spec wording, extended with
+                    # the sanitized last-failure summary).
+                    log.warning("Initial sync failed after %d attempts (%s); "
+                                "cache unpopulated, will retry on first read",
+                                max_attempts, last_summary)
+                    return
+                except errors.VaultwardenError as exc:
+                    # AuthError / SessionError / anything else: NOT transient
+                    # — no retry, immediate WARNING (single-shot wording kept).
+                    code = compat.get_error_code(exc)
+                    with self._lock:
+                        self._initial_sync_failed = True
+                    log.warning("Initial sync failed (%s); cache unpopulated, "
+                                "will retry on first read", code)
+                    return
+
+                if result.get("synced"):
+                    duration = time.monotonic() - started
+                    count = result.get("item_count")
+                    with self._lock:
+                        self._initial_sync_completed = True
+                    # Phase 1 summary line (kept for compatibility): sync()
+                    # already logged the item count when parseable; this
+                    # mirrors it (count omitted when not parseable).
+                    if count is None:
+                        log.info("Initial sync completed (%.1fs)", duration)
+                    else:
+                        log.info("Initial sync completed (%d items, %.1fs)",
+                                 int(count), duration)
+                    # Phase 2 retry-lifecycle line (only when a retry was
+                    # actually needed — happy path stays quiet per spec).
+                    if attempt > 1:
+                        if count is None:
+                            log.info("Initial sync succeeded on attempt %d",
+                                     attempt)
+                        else:
+                            log.info("Initial sync succeeded on attempt %d "
+                                     "(%d items)", attempt, int(count))
+                    return
+                # sync() skipped (cache fresh / not stale): nothing left to do.
+                return
 
     # ---------------------------------------------------------------- login
     def _do_login(self) -> None:
@@ -636,18 +839,108 @@ class AuthManager:
             pass
 
     def sync(self, force: bool = False) -> dict:
-        """`bw sync`; with auto_sync also refreshes when the cache is stale."""
+        """`bw sync`; with auto_sync also refreshes when the cache is stale.
+
+        v0.7.3 (Phase 1, CHANGE 1/2):
+        - SYNC VERB SELECTION: when ``_last_sync == 0.0`` this process has
+          never completed a sync, so the profile's FULL snapshot may not
+          exist locally. ``bw sync --last`` is a DELTA pull keyed to the
+          CLI's own server-side sync timestamp — on a never-fully-synced
+          profile it can report success while pulling NOTHING, leaving an
+          empty cache behind a ``{"synced": true}`` response (production
+          incident 2026-11-02). Plain ``bw sync`` (full pull) is used for
+          the first sync; ``--last`` only for incremental refreshes.
+        - OBSERVABILITY: every outcome (verb decision, success, skip,
+          failure) is logged at INFO/WARNING. Log lines carry ONLY
+          sanitized error codes from errors.py, epoch timestamps, item
+          counts and durations — never a secret value or raw exception
+          text.
+        """
         now = time.time()
         stale = (now - self.last_sync) > self._config.sync_interval_seconds
         if not force and not (self._config.auto_sync and stale):
+            log.info("Sync skipped: cache fresh (last_sync=%.1f, age=%.1fs)",
+                     self._last_sync, max(0.0, now - self._last_sync))
             return {"synced": False, "timestamp": self._last_sync, "skipped": "cache fresh"}
 
+        with self._lock:
+            last_sync_snapshot = self._last_sync
+        full_sync = last_sync_snapshot == 0.0
+        if full_sync:
+            log.info("Running full sync (no prior sync in this process)")
+        else:
+            log.info("Running delta sync --last (last_sync=%.1f)",
+                     last_sync_snapshot)
+
         # run_with_recovery already wraps fn in SESSION_ERROR retry logic.
-        self.run_with_recovery(
-            lambda s: self._rate_limited(lambda: self._bw.sync(s)))
+        started = time.monotonic()
+        try:
+            result = self.run_with_recovery(
+                lambda s: self._rate_limited(
+                    lambda: self._bw.sync(s, full=full_sync)))
+        except Exception as exc:  # noqa: BLE001 - observability path, re-raised below
+            # VWP-17: sanitized code only (never raw exception text/values).
+            code = compat.get_error_code(exc)
+            with self._lock:
+                populated = self._last_sync > 0.0
+            # v0.7.3 Phase 2: when _maybe_initial_sync() drives the call it
+            # owns the WARNING budget for this outcome (per-attempt failures
+            # are INFO by spec; only its final line is WARNING). The loop
+            # sets _sync_warn_suppressed around its sync() calls; direct
+            # callers (tool handlers, auto-sync refresh) never do and keep
+            # the full Phase 1 WARNING — no observability regression.
+            if not getattr(self, "_sync_warn_suppressed", False):
+                log.warning("Sync failed (%s); cache state: %s",
+                            code, "populated" if populated else "unpopulated")
+            raise
+        duration = time.monotonic() - started
         with self._lock:
             self._last_sync = time.time()
-        return {"synced": True, "timestamp": self._last_sync}
+        count = self._parse_sync_item_count(result)
+        if count is None:
+            log.info("Sync completed (%.1fs)", duration)
+        else:
+            log.info("Sync completed (%d items, %.1fs)", count, duration)
+        out: dict = {"synced": True, "timestamp": self._last_sync}
+        if count is not None:
+            # Internal hand-off for _maybe_initial_sync()'s summary line;
+            # contains only a bounded integer — never vault content.
+            out["item_count"] = count
+            # v0.7.3 Phase 3: same hand-off for BwCli's empty-read defense
+            # ("Forced full sync completed (<N> items)"). Bounded int only.
+            self._last_sync_item_count = count
+        return out
+
+    @staticmethod
+    def _parse_sync_item_count(result: object) -> int | None:
+        """Best-effort item count from ``bw sync`` output (v0.7.3 Phase 1).
+
+        Returns None whenever the output is not parseable — per the logging
+        spec the item count is then OMITTED from the success line. Never
+        raises, never logs; the raw output may contain encrypted vault
+        material, so only a bounded integer is ever extracted from it.
+        """
+        if isinstance(result, list):
+            return len(result)
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, list):
+                return len(data)
+            return None
+        if isinstance(result, str):
+            text = result.strip()
+            if not text:
+                return None
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                return len(parsed)
+            m = re.search(r"\b(\d{1,9})\s+items?\b", text.lower())
+            if m:
+                return int(m.group(1))
+        return None
 
     @staticmethod
     def _rate_limited(fn):
@@ -870,6 +1163,17 @@ class AuthManager:
         # capability whenever a stale key lingered in LOGGED_IN state or the
         # session had expired; both cases now correctly read False.
         session_key_available = usable
+        # Phase 4 (v0.7.3 status honesty): cache freshness is now part of the
+        # operational predicate. A valid session with a never-populated cache
+        # (_last_sync == 0.0) previously reported operational=true while every
+        # read returned empty — the exact contradiction behind the first-burst
+        # bug. session_active / session_key_available semantics are unchanged
+        # (session-key-only predicates); the new fields are additive.
+        cache_populated = self._last_sync > 0.0
+        if session_key_available and not cache_populated:
+            log.warning(
+                "Status inconsistency: session active but cache never populated"
+            )
         return {
             "plugin": "vaultwarden",
             "enabled": self._config.enabled,
@@ -894,10 +1198,17 @@ class AuthManager:
             # the authoritative gate — i.e. the plugin CAN perform read/write
             # operations right now.
             "session_key_available": session_key_available,
-            # Overall operational capability: same predicate as above; kept
-            # separate so operators can distinguish "usable session" from the
-            # raw FSM state without inferring across fields.
-            "operational": session_key_available,
+            # Overall operational capability. Phase 4 (v0.7.3): requires BOTH
+            # a usable session AND a populated cache — a valid session against
+            # a never-synced profile is NOT fully operational. Type unchanged
+            # (bool) for backward compatibility.
+            "operational": session_key_available and cache_populated,
+            # ---- additive fields (Phase 4, v0.7.3 status honesty).
+            # True iff at least one sync has completed in this process.
+            "cache_populated": cache_populated,
+            # True iff the bounded initial-sync retry loop (Phase 2) has
+            # succeeded exactly once. Consumed by diagnostics.
+            "initial_sync_completed": self._initial_sync_completed,
             # Verbatim persistent-session state reported by `bw status` for
             # the isolated profile — informational fidelity, NOT capability.
             # Unchanged by design (Phase-2B CHANGE 3): legitimately "locked"

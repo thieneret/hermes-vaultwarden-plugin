@@ -1024,9 +1024,22 @@ class BwCli:
         except errors.VaultwardenError as exc:
             log.warning("bw lock failed (%s); clearing local session anyway.", exc.code)
 
-    def sync(self, session_key: str, force: bool = False) -> Any:
-        args = ["sync"] + (["--last"] if force else [])
-        return self.run(args, env={"BW_SESSION": session_key}, raw=force)
+    def sync(self, session_key: str, force: bool = False, *,
+             full: bool | None = None) -> Any:
+        """Run ``bw sync``; delta (``--last``) vs full pull is explicit.
+
+        v0.7.3 (Phase 1, CHANGE 1): ``full`` selects the sync VERB explicitly.
+        ``full=True`` -> plain ``bw sync`` (FULL snapshot pull);
+        ``full=False`` -> ``bw sync --last`` (delta pull keyed to the CLI's
+        own server-side sync timestamp). When ``full`` is None the legacy
+        ``force`` mapping is preserved (force -> delta), so existing callers
+        (e.g. the permanent-delete not_found recovery below, which needs a
+        real FULL sync) keep their exact v0.4.8 semantics.
+        """
+        if full is None:
+            full = not force
+        args = ["sync"] + ([] if full else ["--last"])
+        return self.run(args, env={"BW_SESSION": session_key}, raw=not full)
 
     def list_items(self, session_key: str, filters: list[str] | None = None) -> list[dict]:
         args = ["list", "items", "--pretty"]
@@ -1079,11 +1092,36 @@ class BwCli:
         if auth is None:
             return None
         try:
-            if auth.get_session_key() is not None:
-                # State is UNLOCKED with a valid key — the empty read came
-                # from a live session: accept it as genuinely empty.
-                return None
+            key_valid = auth.get_session_key() is not None
         except Exception:  # noqa: BLE001 - defense-in-depth, degrade silently
+            return None
+        if key_valid:
+            # v0.7.3 (Phase 3, CHANGE 1): SECOND suspect condition. An
+            # UNLOCKED session with a valid key is NOT proof of a populated
+            # cache: when this process never completed a sync
+            # (``last_sync == 0.0``) even ``bw list`` against a healthy
+            # session legitimately answers exit 0 + [] because the local
+            # snapshot does not exist yet (production first-burst bug,
+            # second leg). Force ONE FULL sync (never ``--last`` — Phase 1
+            # verb selection guarantees plain ``bw sync`` while
+            # ``_last_sync == 0.0``) and retry the read exactly once.
+            last_sync = getattr(auth, "last_sync", None)
+            if last_sync is None:
+                return None  # duck-typed manager without sync state
+            try:
+                suspect = float(last_sync) == 0.0
+            except (TypeError, ValueError):
+                return None
+            if suspect:
+                # Re-entrancy guard (see _forced_full_sync_retry): the retry
+                # read must NEVER re-trigger the defense — one forced sync
+                # + one retry max per original read.
+                if getattr(self, "_empty_read_reconciling", False):
+                    self._empty_read_reconciling = False
+                    return None
+                return self._forced_full_sync_retry(args, session_key, auth)
+            # Cache was populated at some point (last_sync > 0.0): an empty
+            # payload is a GENUINELY empty vault — no subprocess.
             return None
         # Non-UNLOCKED (or expired) with an empty read => suspect. Reconcile
         # through the full FSM (idempotent fast path when already valid).
@@ -1103,6 +1141,94 @@ class BwCli:
                  "after authentication reconciliation.")
         data = self.run(args, env={"BW_SESSION": fresh_key})
         return self._extract_items(data)
+
+    def _forced_full_sync_retry(self, args: list[str], session_key: str,
+                                auth) -> list[dict] | None:
+        """Forced FULL sync + single read retry for an unpopulated cache.
+
+        v0.7.3 (Phase 3, CHANGE 1/2): second leg of the first-burst empty
+        vault defense. The empty read came from a VALID UNLOCKED session but
+        ``auth.last_sync == 0.0`` — this process never completed a sync, so
+        the local snapshot may not exist and exit 0 + [] is NOT proof of a
+        genuinely empty vault.
+
+        Guarantees:
+          * ONE full sync only: routed through ``AuthManager.sync(force=True)``
+            which, after Phase 1 verb selection, issues plain ``bw sync``
+            while ``_last_sync == 0.0`` (never ``--last``). Duck-typed
+            managers without ``sync()`` fall back to ``BwCli.sync(full=True)``.
+          * ONE read retry max — if the retry still returns [], the result is
+            accepted as genuinely empty (no loop; a successful sync moves
+            ``last_sync`` > 0.0 so later reads short-circuit).
+          * Log lines carry ONLY sanitized error codes / item counts — never
+            secret values or raw exception text.
+        """
+        log.warning("Empty read detected with unpopulated cache "
+                    "(last_sync=0.0)")
+        log.info("Triggering forced full sync (prior sync never completed)")
+        try:
+            mgr_sync = getattr(auth, "sync", None)
+            if callable(mgr_sync):
+                # AuthManager.sync(force=True) skips the freshness gate and
+                # picks the FULL verb because last_sync is still 0.0 (Phase 1).
+                result = mgr_sync(force=True)
+            else:
+                result = self.sync(session_key, full=True)
+        except Exception as exc:  # noqa: BLE001 - degrade to the empty result
+            code = compat.get_error_code(exc)
+            log.warning("Forced full sync failed (%s); returning empty list",
+                        code)
+            return None
+        # Item-count source: AuthManager.sync() returns the bounded count in
+        # its dict result ("item_count", Phase 3 hand-off); prefer that, fall
+        # back to the last_sync_result property, then parse the raw payload.
+        # Duck-typed managers expose neither — the count is simply omitted.
+        count = None
+        if isinstance(result, dict):
+            c = result.get("item_count")
+            if isinstance(c, int) and not isinstance(c, bool):
+                count = c
+        if count is None:
+            count = self._extract_item_count(getattr(auth, "last_sync_result",
+                                                     None))
+        if count is None:
+            count = self._extract_item_count(result)
+        if count is None:
+            log.info("Forced full sync completed")
+        else:
+            log.info("Forced full sync completed (%d items)", count)
+        data = self.run(args, env={"BW_SESSION": session_key})
+        items = self._extract_items(data)
+        # v0.7.3 Phase 3 RE-ENTRANCY GUARD: the retry read runs with a real
+        # UNLOCKED session key; if it comes back empty while the manager's
+        # last_sync is still 0.0 (e.g. a duck-typed manager that does not
+        # advance sync state, or a sync that pulled nothing), re-entering the
+        # second suspect leg would force ANOTHER sync + retry — an infinite
+        # loop. The defense is limited to ONE forced sync + ONE retry per
+        # original read; a still-empty retry is accepted as genuinely empty.
+        if not items:
+            self._empty_read_reconciling = True
+        log.info("Read retry after forced sync returned %d items",
+                 len(items))
+        return items
+
+    @staticmethod
+    def _extract_item_count(result: object) -> int | None:
+        """Best-effort item count from a sync payload (v0.7.3 Phase 3).
+
+        Mirrors ``AuthManager._parse_sync_item_count`` semantics at the CLI
+        layer: returns None whenever the value is not parseable so the item
+        count is simply OMITTED from the log line. Never raises, never logs;
+        only a bounded integer is ever extracted — vault content itself is
+        never surfaced.
+        """
+        if isinstance(result, list):
+            return len(result)
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, list):
+                return len(data)
+        return None
 
     def item_get(self, session_key: str, query: str) -> dict:
         data = self.run(["get", "item", query], env={"BW_SESSION": session_key})

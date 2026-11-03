@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.7.2
+**Applies to:** v0.7.3
 
 ## Threat Model
 
@@ -94,6 +94,24 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     secret material. Mitigated by shared fail-closed filesystem validation:
     security-sensitive paths are validated before use and rejected if they are
     symlinks, have unsafe ownership, or have unsafe permissions.)
+18. **Transient network failure during container cold-start leaves cache
+    unpopulated** (a failed initial `bw sync` — e.g. DNS warm-up or TLS
+    handshake failure against a remote Vaultwarden host in the first 1-2
+    minutes of a Docker container's life — previously left `_last_sync=0.0`
+    with no log evidence. Reads then returned exit 0 + empty list against the
+    unpopulated cache ("first-burst empty vault"), writes could fail, and
+    `vaultwarden_status` misleadingly reported `operational: true`. Mitigated
+    by v0.7.3 defense-in-depth: bounded retry loop for initial sync (max 3
+    attempts, 10s interval, transient NetworkError only), full-vs-delta sync
+    verb selection (`bw sync` when no prior sync exists in this process,
+    `bw sync --last` only for incremental refresh), empty-read defense that
+    detects an unpopulated cache on an empty read and forces one full sync +
+    single retry, structured INFO/WARNING logging on every sync outcome, and
+    status honesty (`operational` now requires both a valid session AND a
+    populated cache; new `cache_populated` / `initial_sync_completed` fields;
+    WARNING on the session-active-but-cache-unpopulated contradiction). All
+    log messages carry sanitized error codes only — never secret values or
+    raw exception text.)
 
 ## Primary Security Controls
 
