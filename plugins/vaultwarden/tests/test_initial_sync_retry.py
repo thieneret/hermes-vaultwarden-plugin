@@ -67,6 +67,7 @@ def mgr(fake_bw, appdata, plugin_config) -> AuthManager:
     m._last_sync = 0.0
     m._initial_sync_completed = False
     m._initial_sync_failed = False
+    m._sync_warn_suppressed = False
     return m
 
 
@@ -202,7 +203,9 @@ class TestRetryExhaustion:
 
     def test_exhaustion_sets_failed_and_warns_once(self, mgr, monkeypatch,
                                                    caplog):
-        boom = errors.NetworkError("Vaultwarden server appears unreachable.")
+        boom = errors.NetworkError(
+            "bw sync failed: could not reach server "
+            "https://vault.example.com (DNS warm-up during cold start)")
         sleeps: list[float] = []
         _install_outcomes(mgr, monkeypatch, [boom, boom, boom], sleeps)
 
@@ -219,13 +222,13 @@ class TestRetryExhaustion:
         infos = _auth_messages(caplog)
         assert sum(1 for m in infos if "retrying in" in m) == 2, infos
         warns = [r.getMessage() for r in _auth_records(caplog, logging.WARNING)]
-        assert any(m.startswith("Initial sync failed after 3 attempts; "
-                                "cache unpopulated, will retry on first read")
-                   for m in warns), warns
-        # Only ONE WARNING record on the exhaustion path (the per-attempt
-        # failures were INFO); the sanitized-code line doubles as the
-        # Phase 1-compat final-failure WARNING.
+        # Exactly ONE WARNING on the exhaustion path; wording starts with
+        # the spec prefix and carries the sanitized failure summary.
         assert len(warns) == 1, warns
+        assert warns[0].startswith("Initial sync failed after 3 attempts"), \
+            warns[0]
+        assert "cache unpopulated, will retry on first read" in warns[0], \
+            warns[0]
         assert "NETWORK_ERROR" in warns[0], warns[0]
 
 

@@ -34,6 +34,39 @@ from .security import get_logger, get_redacting_filter
 log = get_logger("auth")
 
 
+def _initial_sync_failure_summary(exc: BaseException) -> str:
+    """Sanitized single-line failure summary for initial-sync logs (Phase 2).
+
+    Hardening rule: log lines carry ONLY sanitized error codes from
+    errors.py — never raw exception text or values. Exception messages in
+    this codebase can transitively contain secret material (session key,
+    client_secret, master password — see the production redaction audit),
+    so raw ``str(exc)`` must NEVER reach a log record. We extract only:
+
+      * the sanitized error code constant, and
+      * an optional safe context substring (hostname / numeric ids) taken
+        from a strict allowlist of characters. Anything that could be a
+        credential, URL userinfo, or free-form server text is dropped.
+    """
+    code = compat.get_error_code(exc)
+    parts = [code]
+    msg = str(exc)
+    # "server <url>" context: reduce to scheme://hostname via the existing
+    # HVA-02 sanitizer (strips userinfo/path/query — never credentials).
+    m = re.search(r"server\s+([A-Za-z][A-Za-z0-9+.-]*://[^\s]+)", msg)
+    if m:
+        try:
+            parts.append(f"server {_sanitize_url_for_logging(m.group(1))}")
+        except Exception:  # noqa: BLE001 - diagnostics only, never raise
+            pass
+    else:
+        # Safe scalar contexts only: numeric ids / bounded integers.
+        m2 = re.search(r"\b(?:status|code)[ =]+(\d{3})\b", msg)
+        if m2:
+            parts.append(f"status={m2.group(1)}")
+    return " ".join(parts)
+
+
 class AuthState(str, enum.Enum):
     UNINITIALIZED = "uninitialized"
     CONFIGURED = "configured"
@@ -126,6 +159,11 @@ class AuthManager:
         # Plain bools under the existing RLock; no secret material involved.
         self._initial_sync_completed: bool = False
         self._initial_sync_failed: bool = False
+        # v0.7.3 (Phase 2): WARNING-budget flag — _maybe_initial_sync() sets
+        # this around its sync() calls so per-attempt failures log at INFO
+        # only (spec); direct sync() callers never see it set and keep the
+        # Phase 1 "Sync failed (...)" WARNING unchanged.
+        self._sync_warn_suppressed: bool = False
 
     # ------------------------------------------------------------ properties
     @property
@@ -457,63 +495,94 @@ class AuthManager:
                      "interval)", max_attempts, delay)
         started = time.monotonic()
 
-        for attempt in range(1, max_attempts + 1):
-            try:
-                result = self.sync(force=False)
-            except errors.NetworkError as exc:
-                # VWP-17 centralized extraction; exc.code is already a
-                # sanitized constant from errors.py — never message text.
-                code = compat.get_error_code(exc)
-                if attempt < max_attempts:
-                    # INFO, not WARNING: transient failures are EXPECTED
-                    # during a container network cold-start window.
-                    log.info("Initial sync attempt %d/%d failed (%s), "
-                             "retrying in %.1fs", attempt, max_attempts,
-                             code, delay)
-                    time.sleep(delay)
-                    continue
-                with self._lock:
-                    self._initial_sync_failed = True
-                log.warning("Initial sync failed (%s); cache unpopulated, "
-                            "will retry on first read", code)
-                log.warning("Initial sync failed after %d attempts; cache "
-                            "unpopulated, will retry on first read",
-                            max_attempts)
-                return
-            except errors.VaultwardenError as exc:
-                # AuthError / SessionError / anything else: NOT transient —
-                # no retry, immediate WARNING (single-shot behaviour kept).
-                code = compat.get_error_code(exc)
-                with self._lock:
-                    self._initial_sync_failed = True
-                log.warning("Initial sync failed (%s); cache unpopulated, "
-                            "will retry on first read", code)
-                return
+        # Defense-in-depth for the WARNING-budget invariant (spec: individual
+        # retry-attempt failures are INFO; only the FINAL outcome is WARNING):
+        # suppress sync()'s own Phase 1 failure WARNING while this loop owns
+        # the outcome reporting, and emit exactly ONE WARNING per terminal
+        # path below. We deliberately do NOT mutate _last_sync/_state here —
+        # sync()'s fresh-process full-vs-delta verb decision must stay
+        # intact (Phase 1 semantics). Direct callers of sync() (tool
+        # handlers, auto-sync refresh) never enter this context manager and
+        # keep their full Phase 1 WARNING — no observability regression.
+        class _SyncWarningBudget:
+            def __init__(self, manager: "AuthManager") -> None:
+                self._mgr = manager
+                self._saved = None
 
-            if result.get("synced"):
-                duration = time.monotonic() - started
-                count = result.get("item_count")
-                with self._lock:
-                    self._initial_sync_completed = True
-                # Phase 1 summary line (kept for compatibility): sync()
-                # already logged the item count when parseable; this mirrors
-                # it (count omitted when not parseable).
-                if count is None:
-                    log.info("Initial sync completed (%.1fs)", duration)
-                else:
-                    log.info("Initial sync completed (%d items, %.1fs)",
-                             int(count), duration)
-                # Phase 2 retry-lifecycle line.
-                if attempt > 1:
+            def __enter__(self) -> "_SyncWarningBudget":
+                self._saved = self._mgr._sync_warn_suppressed
+                self._mgr._sync_warn_suppressed = True
+                return self
+
+            def __exit__(self, *exc_info) -> bool:
+                self._mgr._sync_warn_suppressed = self._saved
+                return False
+
+        with _SyncWarningBudget(self):
+            last_summary = "UNKNOWN_ERROR"
+            for attempt in range(1, max_attempts + 1):
+                # v0.7.3 Phase 2: track the LAST failure summary (sanitized
+                # error code + safe context only — never raw exception text)
+                # so the exhaustion WARNING can carry the real reason
+                # instead of a bare count.
+                try:
+                    result = self.sync(force=False)
+                except errors.NetworkError as exc:
+                    # VWP-17 centralized extraction; exc.code is already a
+                    # sanitized constant from errors.py — never message text.
+                    code = compat.get_error_code(exc)
+                    last_summary = _initial_sync_failure_summary(exc)
+                    if attempt < max_attempts:
+                        # INFO, not WARNING: transient failures are EXPECTED
+                        # during a container network cold-start window.
+                        log.info("Initial sync attempt %d/%d failed (%s), "
+                                 "retrying in %.1fs", attempt, max_attempts,
+                                 code, delay)
+                        time.sleep(delay)
+                        continue
+                    with self._lock:
+                        self._initial_sync_failed = True
+                    # ONE WARNING on exhaustion (spec wording, extended with
+                    # the sanitized last-failure summary).
+                    log.warning("Initial sync failed after %d attempts (%s); "
+                                "cache unpopulated, will retry on first read",
+                                max_attempts, last_summary)
+                    return
+                except errors.VaultwardenError as exc:
+                    # AuthError / SessionError / anything else: NOT transient
+                    # — no retry, immediate WARNING (single-shot wording kept).
+                    code = compat.get_error_code(exc)
+                    with self._lock:
+                        self._initial_sync_failed = True
+                    log.warning("Initial sync failed (%s); cache unpopulated, "
+                                "will retry on first read", code)
+                    return
+
+                if result.get("synced"):
+                    duration = time.monotonic() - started
+                    count = result.get("item_count")
+                    with self._lock:
+                        self._initial_sync_completed = True
+                    # Phase 1 summary line (kept for compatibility): sync()
+                    # already logged the item count when parseable; this
+                    # mirrors it (count omitted when not parseable).
                     if count is None:
-                        log.info("Initial sync succeeded on attempt %d",
-                                 attempt)
+                        log.info("Initial sync completed (%.1fs)", duration)
                     else:
-                        log.info("Initial sync succeeded on attempt %d "
-                                 "(%d items)", attempt, int(count))
+                        log.info("Initial sync completed (%d items, %.1fs)",
+                                 int(count), duration)
+                    # Phase 2 retry-lifecycle line (only when a retry was
+                    # actually needed — happy path stays quiet per spec).
+                    if attempt > 1:
+                        if count is None:
+                            log.info("Initial sync succeeded on attempt %d",
+                                     attempt)
+                        else:
+                            log.info("Initial sync succeeded on attempt %d "
+                                     "(%d items)", attempt, int(count))
+                    return
+                # sync() skipped (cache fresh / not stale): nothing left to do.
                 return
-            # sync() skipped (cache fresh / not stale): nothing left to do.
-            return
 
     # ---------------------------------------------------------------- login
     def _do_login(self) -> None:
@@ -798,8 +867,15 @@ class AuthManager:
             code = compat.get_error_code(exc)
             with self._lock:
                 populated = self._last_sync > 0.0
-            log.warning("Sync failed (%s); cache state: %s",
-                        code, "populated" if populated else "unpopulated")
+            # v0.7.3 Phase 2: when _maybe_initial_sync() drives the call it
+            # owns the WARNING budget for this outcome (per-attempt failures
+            # are INFO by spec; only its final line is WARNING). The loop
+            # sets _sync_warn_suppressed around its sync() calls; direct
+            # callers (tool handlers, auto-sync refresh) never do and keep
+            # the full Phase 1 WARNING — no observability regression.
+            if not getattr(self, "_sync_warn_suppressed", False):
+                log.warning("Sync failed (%s); cache state: %s",
+                            code, "populated" if populated else "unpopulated")
             raise
         duration = time.monotonic() - started
         with self._lock:
