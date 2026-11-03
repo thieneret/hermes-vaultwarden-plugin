@@ -1024,9 +1024,22 @@ class BwCli:
         except errors.VaultwardenError as exc:
             log.warning("bw lock failed (%s); clearing local session anyway.", exc.code)
 
-    def sync(self, session_key: str, force: bool = False) -> Any:
-        args = ["sync"] + (["--last"] if force else [])
-        return self.run(args, env={"BW_SESSION": session_key}, raw=force)
+    def sync(self, session_key: str, force: bool = False, *,
+             full: bool | None = None) -> Any:
+        """Run ``bw sync``; delta (``--last``) vs full pull is explicit.
+
+        v0.7.3 (Phase 1, CHANGE 1): ``full`` selects the sync VERB explicitly.
+        ``full=True`` -> plain ``bw sync`` (FULL snapshot pull);
+        ``full=False`` -> ``bw sync --last`` (delta pull keyed to the CLI's
+        own server-side sync timestamp). When ``full`` is None the legacy
+        ``force`` mapping is preserved (force -> delta), so existing callers
+        (e.g. the permanent-delete not_found recovery below, which needs a
+        real FULL sync) keep their exact v0.4.8 semantics.
+        """
+        if full is None:
+            full = not force
+        args = ["sync"] + ([] if full else ["--last"])
+        return self.run(args, env={"BW_SESSION": session_key}, raw=not full)
 
     def list_items(self, session_key: str, filters: list[str] | None = None) -> list[dict]:
         args = ["list", "items", "--pretty"]

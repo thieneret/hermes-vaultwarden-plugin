@@ -18,7 +18,9 @@ Session key rules:
 from __future__ import annotations
 
 import enum
+import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -390,12 +392,36 @@ class AuthManager:
         self._do_unlock()
 
     def _maybe_initial_sync(self) -> None:
-        """Best-effort first sync after authentication (auto_sync only)."""
+        """Best-effort first sync after authentication (auto_sync only).
+
+        v0.7.3 (Phase 1, CHANGE 3): every outcome is now visible — INFO on
+        attempt/success, WARNING on failure with the sanitized error code
+        and cache state. Retry behaviour is UNCHANGED (still a single
+        best-effort attempt; Phase 2 owns any retry semantics change).
+        Log lines never contain secret values or raw exception text.
+        """
         if self._config.auto_sync and self._last_sync == 0.0:
+            log.info("Initial sync started")
+            started = time.monotonic()
             try:
-                self.sync(force=False)
+                result = self.sync(force=False)
             except errors.VaultwardenError as exc:
-                log.warning("Initial sync failed (%s); continuing.", exc.code)
+                # VWP-17 centralized extraction; exc.code is already a
+                # sanitized constant from errors.py — never message text.
+                code = compat.get_error_code(exc)
+                log.warning("Initial sync failed (%s); cache unpopulated, "
+                            "will retry on first read", code)
+                return
+            if result.get("synced"):
+                # sync() already logged the item count when parseable; this
+                # summary mirrors it (count omitted when not parseable).
+                duration = time.monotonic() - started
+                count = result.get("item_count")
+                if count is None:
+                    log.info("Initial sync completed (%.1fs)", duration)
+                else:
+                    log.info("Initial sync completed (%d items, %.1fs)",
+                             int(count), duration)
 
     # ---------------------------------------------------------------- login
     def _do_login(self) -> None:
@@ -636,18 +662,98 @@ class AuthManager:
             pass
 
     def sync(self, force: bool = False) -> dict:
-        """`bw sync`; with auto_sync also refreshes when the cache is stale."""
+        """`bw sync`; with auto_sync also refreshes when the cache is stale.
+
+        v0.7.3 (Phase 1, CHANGE 1/2):
+        - SYNC VERB SELECTION: when ``_last_sync == 0.0`` this process has
+          never completed a sync, so the profile's FULL snapshot may not
+          exist locally. ``bw sync --last`` is a DELTA pull keyed to the
+          CLI's own server-side sync timestamp — on a never-fully-synced
+          profile it can report success while pulling NOTHING, leaving an
+          empty cache behind a ``{"synced": true}`` response (production
+          incident 2026-11-02). Plain ``bw sync`` (full pull) is used for
+          the first sync; ``--last`` only for incremental refreshes.
+        - OBSERVABILITY: every outcome (verb decision, success, skip,
+          failure) is logged at INFO/WARNING. Log lines carry ONLY
+          sanitized error codes from errors.py, epoch timestamps, item
+          counts and durations — never a secret value or raw exception
+          text.
+        """
         now = time.time()
         stale = (now - self.last_sync) > self._config.sync_interval_seconds
         if not force and not (self._config.auto_sync and stale):
+            log.info("Sync skipped: cache fresh (last_sync=%.1f, age=%.1fs)",
+                     self._last_sync, max(0.0, now - self._last_sync))
             return {"synced": False, "timestamp": self._last_sync, "skipped": "cache fresh"}
 
+        with self._lock:
+            last_sync_snapshot = self._last_sync
+        full_sync = last_sync_snapshot == 0.0
+        if full_sync:
+            log.info("Running full sync (no prior sync in this process)")
+        else:
+            log.info("Running delta sync --last (last_sync=%.1f)",
+                     last_sync_snapshot)
+
         # run_with_recovery already wraps fn in SESSION_ERROR retry logic.
-        self.run_with_recovery(
-            lambda s: self._rate_limited(lambda: self._bw.sync(s)))
+        started = time.monotonic()
+        try:
+            result = self.run_with_recovery(
+                lambda s: self._rate_limited(
+                    lambda: self._bw.sync(s, full=full_sync)))
+        except Exception as exc:  # noqa: BLE001 - observability path, re-raised below
+            # VWP-17: sanitized code only (never raw exception text/values).
+            code = compat.get_error_code(exc)
+            with self._lock:
+                populated = self._last_sync > 0.0
+            log.warning("Sync failed (%s); cache state: %s",
+                        code, "populated" if populated else "unpopulated")
+            raise
+        duration = time.monotonic() - started
         with self._lock:
             self._last_sync = time.time()
-        return {"synced": True, "timestamp": self._last_sync}
+        count = self._parse_sync_item_count(result)
+        if count is None:
+            log.info("Sync completed (%.1fs)", duration)
+        else:
+            log.info("Sync completed (%d items, %.1fs)", count, duration)
+        out: dict = {"synced": True, "timestamp": self._last_sync}
+        if count is not None:
+            # Internal hand-off for _maybe_initial_sync()'s summary line;
+            # contains only a bounded integer — never vault content.
+            out["item_count"] = count
+        return out
+
+    @staticmethod
+    def _parse_sync_item_count(result: object) -> int | None:
+        """Best-effort item count from ``bw sync`` output (v0.7.3 Phase 1).
+
+        Returns None whenever the output is not parseable — per the logging
+        spec the item count is then OMITTED from the success line. Never
+        raises, never logs; the raw output may contain encrypted vault
+        material, so only a bounded integer is ever extracted from it.
+        """
+        if isinstance(result, list):
+            return len(result)
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, list):
+                return len(data)
+            return None
+        if isinstance(result, str):
+            text = result.strip()
+            if not text:
+                return None
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                return len(parsed)
+            m = re.search(r"\b(\d{1,9})\s+items?\b", text.lower())
+            if m:
+                return int(m.group(1))
+        return None
 
     @staticmethod
     def _rate_limited(fn):
