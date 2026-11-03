@@ -838,7 +838,7 @@ class TestDeleteItemPermanentSyncRetry:
                                                           appdata,
                                                           monkeypatch):
         import subprocess as sp
-        # call order after --version: delete(not_found), sync(ok), delete(ok)
+        # call order after --version: delete(not_found), sync --force(ok), delete(ok)
         fake_run, calls = _mk_run(cmd_results=[dict(_NOT_FOUND_ERR),
                                                dict(_OK),
                                                dict(_DELETED_OK)])
@@ -849,7 +849,9 @@ class TestDeleteItemPermanentSyncRetry:
         cmds = [c[1:] for c in calls]
         assert cmds[0] == ["--version"]     # lazy VWP-11 probe (deferred into run)
         assert cmds[1] == ["delete", "item", "abc123", "--permanent"]
-        assert cmds[2] == ["sync"]          # REAL sync — NOT ["sync", "--last"]
+        # v0.7.4: REAL FULL sync — `bw sync --force` (never the no-op
+        # ["sync", "--last"] date query of v0.7.3)
+        assert cmds[2] == ["sync", "--force"]
         assert cmds[3] == ["delete", "item", "abc123", "--permanent"]
         assert len(calls) == 4              # probe + exactly one retry
 
@@ -868,7 +870,11 @@ class TestDeleteItemPermanentSyncRetry:
         assert "abc123" in msg
         assert "--permanent" not in msg     # never args[-1]
         cmds = [c[1:] for c in calls]
-        assert cmds.count(["sync"]) == 1    # sync ran exactly once
+        # v0.7.4: the recovery sync is the FULL verb (`bw sync --force`) —
+        # pinned explicitly so a regression to a bare/`--last` sync fails.
+        assert cmds.count(["sync", "--force"]) == 1    # sync ran exactly once
+        assert cmds.count(["sync"]) == 0               # never a bare sync
+        assert ["sync", "--last"] not in cmds         # never the no-op date query
         # only ONE retry of the delete (no infinite loop)
         assert cmds.count(["delete", "item", "abc123", "--permanent"]) == 2
 

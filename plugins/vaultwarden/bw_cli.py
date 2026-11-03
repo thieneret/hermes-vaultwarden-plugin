@@ -1026,20 +1026,28 @@ class BwCli:
 
     def sync(self, session_key: str, force: bool = False, *,
              full: bool | None = None) -> Any:
-        """Run ``bw sync``; delta (``--last``) vs full pull is explicit.
+        """Run ``bw sync``; full (--force) vs incremental pull is explicit.
 
-        v0.7.3 (Phase 1, CHANGE 1): ``full`` selects the sync VERB explicitly.
-        ``full=True`` -> plain ``bw sync`` (FULL snapshot pull);
-        ``full=False`` -> ``bw sync --last`` (delta pull keyed to the CLI's
-        own server-side sync timestamp). When ``full`` is None the legacy
-        ``force`` mapping is preserved (force -> delta), so existing callers
-        (e.g. the permanent-delete not_found recovery below, which needs a
-        real FULL sync) keep their exact v0.4.8 semantics.
+        v0.7.4 (sync verb correction, CHANGE 1): ``full`` selects the sync
+        VERB explicitly.
+        ``full=True``  -> ``bw sync --force`` (FULL snapshot pull — forces a
+        complete re-download into the local SQLite cache);
+        ``full=False`` -> ``bw sync`` (incremental pull of the latest vault
+        data from the server).
+        The v0.7.3 ``--last`` delta verb is REMOVED entirely: per
+        ``bw sync --help``, ``--last`` ONLY prints the last sync date and
+        performs NO synchronization at all — every code path that routed to
+        it silently skipped syncing. When ``full`` is None the legacy
+        ``force`` parameter maps directly onto the verb (force=True ->
+        ``bw sync --force``); the v0.7.3 inverted mapping (force -> delta
+        ``--last``) was part of the bug. Both verbs parse output as JSON
+        (raw mode removed): neither ``bw sync`` nor ``bw sync --force``
+        produces meaningful raw stdout that callers depend on.
         """
         if full is None:
-            full = not force
-        args = ["sync"] + ([] if full else ["--last"])
-        return self.run(args, env={"BW_SESSION": session_key}, raw=not full)
+            full = force  # force=True -> full=True -> bw sync --force
+        args = ["sync", "--force"] if full else ["sync"]
+        return self.run(args, env={"BW_SESSION": session_key}, raw=False)
 
     def list_items(self, session_key: str, filters: list[str] | None = None) -> list[dict]:
         args = ["list", "items", "--pretty"]
@@ -1102,8 +1110,9 @@ class BwCli:
             # (``last_sync == 0.0``) even ``bw list`` against a healthy
             # session legitimately answers exit 0 + [] because the local
             # snapshot does not exist yet (production first-burst bug,
-            # second leg). Force ONE FULL sync (never ``--last`` — Phase 1
-            # verb selection guarantees plain ``bw sync`` while
+            # second leg). Force ONE FULL sync (v0.7.4: ``bw sync --force``;
+            # the old ``--last`` "delta" verb never synced at all — Phase 1
+            # verb selection guarantees the full pull while
             # ``_last_sync == 0.0``) and retry the read exactly once.
             last_sync = getattr(auth, "last_sync", None)
             if last_sync is None:
@@ -1154,9 +1163,11 @@ class BwCli:
 
         Guarantees:
           * ONE full sync only: routed through ``AuthManager.sync(force=True)``
-            which, after Phase 1 verb selection, issues plain ``bw sync``
-            while ``_last_sync == 0.0`` (never ``--last``). Duck-typed
-            managers without ``sync()`` fall back to ``BwCli.sync(full=True)``.
+            which, after the v0.7.4 verb correction, issues
+            ``bw sync --force`` while ``_last_sync == 0.0`` (never the
+            no-op ``--last`` date query). Duck-typed managers without
+            ``sync()`` fall back to ``BwCli.sync(full=True)``, which also
+            produces ``bw sync --force``.
           * ONE read retry max — if the retry still returns [], the result is
             accepted as genuinely empty (no loop; a successful sync moves
             ``last_sync`` > 0.0 so later reads short-circuit).
@@ -1338,8 +1349,12 @@ class BwCli:
         # v0.4.8 (BUGFIX, Defect 3): a permanent delete can hit not_found
         # when the item is already in the trash and invisible in a stale
         # local cache. On NotFoundError with permanent=True, run a REAL
-        # `bw sync` (NOT sync(force=True), which maps to `bw sync --last`)
-        # and retry the delete exactly once. The final error message names
+        # FULL sync and retry the delete exactly once. v0.7.4 (CHANGE 3):
+        # the recovery sync EXPLICITLY requests the full verb
+        # (``bw sync --force``) — relying on the legacy default mapping is
+        # fragile, and the old "plain bw sync" wording predates the fact
+        # that only --force guarantees a complete re-download of the vault
+        # into the local SQLite cache. The final error message names
         # the item_id — never args[-1] ("--permanent"), which produced the
         # misleading "No matching item for query '--permanent'".
         try:
@@ -1351,7 +1366,7 @@ class BwCli:
                     f"No item matching id '{item_id}'.")
             log.info("Permanent delete of %s returned not_found; "
                      "syncing vault and retrying once.", item_id)
-            self.sync(session_key)
+            self.sync(session_key, full=True)
             try:
                 return self.run(args, env={"BW_SESSION": session_key},
                                 raw=True, retryable=False)

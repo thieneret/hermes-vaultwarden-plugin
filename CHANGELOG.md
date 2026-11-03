@@ -5,6 +5,26 @@ Author: **thieneret**
 
 ---
 
+## v0.7.4 (2026-11-03)
+
+### Fixed
+- Sync verb correction: `bw sync --last` only retrieves the last sync
+  date and does NOT perform synchronization — removed from all sync
+  code paths
+- Initial sync now uses `bw sync --force` to guarantee full vault
+  download into the local SQLite cache
+- Incremental sync uses plain `bw sync` (pull latest changes)
+- Fixed inverted `force` parameter mapping in `BwCli.sync()`:
+  `force=True` now correctly maps to full sync (`--force` flag)
+- Permanent-delete recovery sync now explicitly uses full sync verb
+
+### Changed
+- `BwCli.sync()` output parsing: both full and incremental sync
+  parse output as JSON (removed raw mode for sync)
+
+### Tests
+- Added `test_sync_verb.py` regression suite (10 scenarios)
+
 ## v0.7.3 (2026-11-03)
 
 ### Fixed
