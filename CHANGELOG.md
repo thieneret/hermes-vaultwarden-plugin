@@ -5,6 +5,28 @@ Author: **thieneret**
 
 ---
 
+## v0.7.6 (2026-11-04)
+
+### Fixed
+- Session invalidation defense: extended `_reconcile_empty_read()` with
+  a third suspect condition that detects externally invalidated session
+  keys (e.g., when a second AuthManager process unlocks with a different
+  key, invalidating the first). The defense verifies session validity
+  via `bw status`, forces re-unlock, and retries the read once.
+
+### Added
+- `BwCli.verify_session()`: calls `bw status` with BW_SESSION to check
+  if a session key is still valid (returns "unlocked", "locked", or
+  "unauthenticated")
+- Third suspect condition regression suite in
+  `test_empty_read_defense.py` (22 new scenarios covering
+  `verify_session()` unit behavior, the externally-invalidated-session
+  recovery path, acceptance/degradation semantics, and precedence
+  boundaries against conditions 1 & 2)
+
+### Tests
+- Total test count: 827 (was 805)
+
 ## v0.7.5 (2026-11-03)
 
 ### Fixed
