@@ -950,6 +950,37 @@ class BwCli:
             return {}
         return {"status": "unauthenticated", "message": str(data)}
 
+    def verify_session(self, session_key: str) -> str:
+        """Verify a session key is still valid by calling ``bw status`` with it.
+
+        v0.7.6 (Phase 1, CHANGE 1): session-invalidation defense. bw supports
+        exactly ONE session key per profile — when a second AuthManager (e.g.
+        the gateway process alongside the dashboard process) unlocks the same
+        profile, the first manager's BW_SESSION is invalidated EXTERNALLY while
+        its local state still reports UNLOCKED. This probe asks the binary
+        directly whether the key still authenticates.
+
+        Returns the status string ("unlocked", "locked", "unauthenticated").
+        Returns "locked" on any error (conservative — triggers re-unlock).
+        Never logs the session key value.
+
+        The verification call MUST carry the key under test via BW_SESSION —
+        the persistent profile state always reports "locked" by design, so a
+        session-less ``status()`` could never detect external invalidation.
+        ``run()`` gives explicit caller env precedence over the choke point's
+        fallback injection, so exactly this key is verified.
+        """
+        try:
+            result = self.run(["status"], env={"BW_SESSION": session_key})
+            if isinstance(result, dict):
+                return str(result.get("status") or result.get("state")
+                           or "unknown")
+            return "unknown"
+        except errors.SessionError:
+            return "locked"  # session key is invalid
+        except errors.VaultwardenError:
+            return "unknown"  # network/parse error — conservative
+
     def logout(self) -> bool:
         """`bw logout`. Returns True on success or when already logged out."""
         try:
@@ -1129,9 +1160,80 @@ class BwCli:
                     self._empty_read_reconciling = False
                     return None
                 return self._forced_full_sync_retry(args, session_key, auth)
-            # Cache was populated at some point (last_sync > 0.0): an empty
-            # payload is a GENUINELY empty vault — no subprocess.
-            return None
+
+            # v0.7.6 (Phase 1, CHANGE 2): THIRD suspect condition. The cache
+            # WAS populated (last_sync > 0.0) and this manager still reports
+            # a valid UNLOCKED key — but bw supports exactly ONE session key
+            # per profile, so ANOTHER AuthManager (dashboard process + gateway
+            # process loading the plugin twice) that unlocked later silently
+            # INVALIDATED our key externally. Neither condition 1 (key_valid)
+            # nor condition 2 (last_sync > 0.0) can see this, and the empty
+            # payload was previously accepted as a "genuinely empty vault"
+            # while the real cause was a locked vault answering exit 0 + [].
+            # Verify the key itself with ONE extra `bw status` call carrying
+            # BW_SESSION — the persistent profile state always reports
+            # "locked" by design, only the key answers honestly.
+            if getattr(self, "_empty_read_reconciling", False):
+                # Re-entrancy guard (same flag as condition 2): a retry read
+                # from ANY defense leg must never re-trigger the defense —
+                # at most ONE verification + ONE re-unlock + ONE retry per
+                # original read. Consume the flag and accept the result.
+                self._empty_read_reconciling = False
+                return None
+            try:
+                status = self.verify_session(session_key)
+            except Exception:  # noqa: BLE001 - degrade silently
+                return None
+
+            if status == "unlocked":
+                # Key is valid and the vault reports unlocked, yet the list
+                # is empty: genuinely an empty vault (or a server-side issue
+                # beyond our control). Accept the empty result.
+                return None
+
+            # Session key was externally invalidated (status == "locked" or
+            # "unauthenticated" despite our key_valid == True). Demote the
+            # local state FIRST: get_session()'s UNLOCKED fast path would
+            # otherwise hand back the very same dead key and the recovery
+            # could never re-unlock.
+            log.warning(
+                "Empty read with externally invalidated session key "
+                "(bw status=%s); forcing re-unlock", status)
+            demote = getattr(auth, "invalidate_session", None)
+            if callable(demote):
+                try:
+                    demote()
+                except Exception as exc:  # noqa: BLE001 - best effort
+                    log.warning(
+                        "Local session invalidation failed (%s); "
+                        "attempting re-unlock anyway",
+                        compat.get_error_code(exc))
+
+            # Re-unlock via AuthManager to get a fresh session key
+            # (routes through the FSM/_do_unlock once the stale key is gone).
+            try:
+                fresh_key = auth.get_session()
+            except Exception as exc:  # noqa: BLE001 - degrade to empty result
+                log.warning(
+                    "Re-unlock after external invalidation failed (%s); "
+                    "returning empty list", compat.get_error_code(exc))
+                return None
+
+            if not fresh_key or fresh_key == session_key:
+                # Re-unlock didn't produce a new key — nothing left to retry
+                return None
+
+            log.info("Session re-established after external invalidation; "
+                     "retrying read once")
+
+            # Retry the read with the fresh key. If it comes back empty
+            # again, arm the re-entrancy guard so the nested defense pass
+            # consumes it and accepts the result — no loop.
+            data = self.run(args, env={"BW_SESSION": fresh_key})
+            items = self._extract_items(data)
+            if not items:
+                self._empty_read_reconciling = True
+            return items
         # Non-UNLOCKED (or expired) with an empty read => suspect. Reconcile
         # through the full FSM (idempotent fast path when already valid).
         try:
