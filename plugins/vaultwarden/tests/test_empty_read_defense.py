@@ -105,13 +105,18 @@ class SpyCli(BwCli):
     sync VERB (full vs --last) and the BW_SESSION header contents.
     """
 
-    def __init__(self, list_payloads, sync_exc=None, owner=None):
+    def __init__(self, list_payloads, sync_exc=None, owner=None,
+                 sync_result=None):
         # Intentionally skip BwCli.__init__: no binary, no version probe.
         self.bw_path = "/nonexistent/bw"
         self.appdata_dir = "/nonexistent/appdata"
         self.timeout = 30
         self.list_payloads = list(list_payloads)
         self.sync_exc = sync_exc
+        # Scripted bw-sync payload; None -> [] like the real "no changes"
+        # JSON answer. Tests pass a non-list (e.g. a bare string) to pin
+        # the item-count-omitted logging path.
+        self.sync_result = [] if sync_result is None else sync_result
         self.calls: list[tuple[list, dict]] = []
         if owner is not None:
             owner.cli = self  # let the stub record its verb at this layer
@@ -147,7 +152,7 @@ class SpyCli(BwCli):
         self.calls.append((args, {"BW_SESSION": session_key}))
         if self.sync_exc is not None:
             raise self.sync_exc
-        return []
+        return self.sync_result
 
     def synced_args(self):
         return [c[0] for c in self.calls if c[0][:1] == ["sync"]]
@@ -247,10 +252,13 @@ class TestSecondSuspectConditionFires:
                    for m in _messages(caplog))
 
     def test_item_count_omitted_when_unparseable(self, caplog):
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0,
-                        sync_result="No sync needed")
+        # NOTE: no sync_result — with an owner-wired cli, StubAuth.sync()
+        # delegates to SpyCli.sync(), which returns the unparseable string
+        # payload (a plain list of items would parse as a count).
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], []], owner=auth)
+        cli = SpyCli(list_payloads=[[], []], sync_result="No sync needed",
+                     owner=auth)
         auth.cli = cli
 
         with caplog.at_level("INFO"):
@@ -394,32 +402,43 @@ class TestWritesUnaffected:
     def test_delete_recovery_uses_full_sync_not_the_read_defense(self):
         """Permanent-delete not_found recovery (v0.4.8) keeps its own FULL
         `bw sync` path; the empty-read defense is read-only."""
-        calls: list[list] = []
 
         class WriteCli(SpyCli):
-            # Mirror SpyCli.run's EXACT keyword-only signature: delete_item()
-            # calls run(..., raw=True, retryable=False); swallowing those in a
-            # **kwargs would bypass the inherited read defense entirely.
-            def run(self, args, **kw):
+            # delete_item() calls run(..., raw=True, retryable=False); the
+            # v0.4.8 not_found recovery calls self.sync(session_key). Record
+            # EVERY plan in self.calls (SpyCli.sync override + SpyCli.run)
+            # plus a local delete log; assert on both views.
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.delete_log: list[list] = []
+
+            def run(self, args, *, env=None, raw=False, timeout=None,
+                    _retry_count=0, retryable=True):
+                args = list(args)
                 if args[:1] == ["delete"]:
-                    calls.append(list(args))
-                    if not any(c[:1] == ["sync"] for c in calls):
+                    self.delete_log.append(args)
+                    if not any(c[0][:1] == ["sync"] for c in self.calls):
                         # First attempt fails against the stale cache; the
                         # v0.4.8 not_found recovery syncs and retries once.
                         raise errors.NotFoundError("not in stale cache")
                     return "deleted"
-                return super().run(args, **kw)
+                return super().run(args, env=env, raw=raw, timeout=timeout,
+                                   _retry_count=_retry_count,
+                                   retryable=retryable)
 
         auth = StubAuth(session_key=None, last_sync=0.0)
         register_auth_manager(auth)
+        # owner NOT wired: write-recovery sync must hit this cli's run()/
+        # sync() directly (StubAuth.sync delegating to a cli would consult
+        # the read-defense layer instead of the delete path under test).
         cli = WriteCli(list_payloads=[])
 
         out = cli.delete_item(SESSION_KEY, "item-1", permanent=True)
 
         assert "deleted" in out
-        syncs = [c for c in calls if c[:1] == ["sync"]]
+        syncs = [c[0] for c in cli.calls if c[0][:1] == ["sync"]]
         assert syncs == [["sync"]], "write recovery: full sync, no --last"
-        lists = [c for c in calls if c[:2] == ["list", "items"]]
+        lists = cli.list_args()
         assert lists == [], "write path must never hit the read defense"
 
     def test_reconcile_hook_is_only_wired_into_list_items(self):
