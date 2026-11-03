@@ -401,8 +401,17 @@ class TestNoSecretsInLogs:
             auto_sync = True
             sync_interval_seconds = 300
             session_timeout_seconds = 14400
+            # Phase 2: single attempt so the manual-state test exercises the
+            # exhaustion WARNING without sleeping between retries.
+            initial_sync_max_attempts = 1
+            initial_sync_retry_delay_seconds = 0.0
 
         failing._config = _Cfg()
+        # The manually-assembled manager bypasses AuthManager.__init__'s
+        # Phase 2 state fields; restore them so _maybe_initial_sync() works.
+        failing._initial_sync_completed = False
+        failing._initial_sync_failed = False
+        failing._sync_warn_suppressed = False
 
         class _FailingBw:
             def sync(self, session_key, force=False, *, full=None):
