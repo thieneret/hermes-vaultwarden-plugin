@@ -117,8 +117,29 @@ class AuthManager:
         # it to prove concurrent first calls bootstrap EXACTLY once. No
         # secret material involved; plain int under the existing lock.
         self._full_bootstrap_count: int = 0
+        # v0.7.3 (Phase 2, CHANGE 2): initial-sync state tracking for
+        # downstream consumers (Phase 3 empty-read defense, Phase 4 status
+        # honesty). _initial_sync_completed flips True exactly once — when
+        # the FIRST post-auth sync attempt succeeds. _initial_sync_failed
+        # flips True only after the bounded retry loop EXHAUSTS its attempts
+        # (or a non-retryable error aborts it) without ever succeeding.
+        # Plain bools under the existing RLock; no secret material involved.
+        self._initial_sync_completed: bool = False
+        self._initial_sync_failed: bool = False
 
     # ------------------------------------------------------------ properties
+    @property
+    def initial_sync_completed(self) -> bool:
+        """True once the first post-auth sync has succeeded (v0.7.3 Phase 2)."""
+        with self._lock:
+            return self._initial_sync_completed
+
+    @property
+    def initial_sync_failed(self) -> bool:
+        """True when the bounded initial-sync retry loop gave up (Phase 2)."""
+        with self._lock:
+            return self._initial_sync_failed
+
     @property
     def state(self) -> AuthState:
         with self._lock:
@@ -392,36 +413,107 @@ class AuthManager:
         self._do_unlock()
 
     def _maybe_initial_sync(self) -> None:
-        """Best-effort first sync after authentication (auto_sync only).
+        """First sync after authentication, with bounded retry (auto_sync only).
 
-        v0.7.3 (Phase 1, CHANGE 3): every outcome is now visible — INFO on
-        attempt/success, WARNING on failure with the sanitized error code
-        and cache state. Retry behaviour is UNCHANGED (still a single
-        best-effort attempt; Phase 2 owns any retry semantics change).
-        Log lines never contain secret values or raw exception text.
+        v0.7.3 (Phase 2, CHANGE 1): converted from single-shot to a BOUNDED
+        retry loop. Root cause of the production incident (2026-11-02): a
+        transient NetworkError during a Docker container's 1-2 minute network
+        cold-start window was swallowed by the single attempt, leaving
+        ``_last_sync == 0.0`` and an unpopulated cache for the whole process
+        lifetime ("first-burst empty vault").
+
+        Retry policy:
+        - Max attempts / inter-attempt delay come from PluginConfig
+          (defaults: 3 attempts x 10s; hard-capped so total sleep <= 20s —
+          well under the 30s plugin-load timeout ceiling).
+        - ONLY ``errors.NetworkError`` is retried (cold-start DNS/TLS
+          transients). ``AuthError``/``SessionError`` are NOT transient here:
+          they abort the loop immediately with the same WARNING wording.
+        - On success: ``_initial_sync_completed = True`` (sync() itself sets
+          ``_last_sync``); INFO logs identify the winning attempt.
+        - On exhaustion/non-retryable failure: ``_initial_sync_failed = True``
+          and ONE WARNING (individual retry failures are INFO — expected
+          during cold-start; only the final outcome is WARNING).
+
+        Phase 1 logging (attempt/success/failure lines) is preserved verbatim
+        for backward compatibility. Log lines never contain secret values or
+        raw exception text — sanitized error codes from errors.py only.
         """
-        if self._config.auto_sync and self._last_sync == 0.0:
-            log.info("Initial sync started")
-            started = time.monotonic()
+        if not self._config.auto_sync or self._last_sync != 0.0:
+            return
+        # Already completed in this process (idempotency guard; also keeps a
+        # re-entry after a successful loop from re-spawning subprocesses).
+        with self._lock:
+            if self._initial_sync_completed:
+                return
+
+        max_attempts = int(getattr(self._config, "initial_sync_max_attempts", 3))
+        delay = float(getattr(self._config, "initial_sync_retry_delay_seconds",
+                              10.0))
+
+        log.info("Initial sync started")
+        if max_attempts > 1:
+            log.info("Initial sync retry loop started (max %d attempts, %.1fs "
+                     "interval)", max_attempts, delay)
+        started = time.monotonic()
+
+        for attempt in range(1, max_attempts + 1):
             try:
                 result = self.sync(force=False)
-            except errors.VaultwardenError as exc:
+            except errors.NetworkError as exc:
                 # VWP-17 centralized extraction; exc.code is already a
                 # sanitized constant from errors.py — never message text.
                 code = compat.get_error_code(exc)
+                if attempt < max_attempts:
+                    # INFO, not WARNING: transient failures are EXPECTED
+                    # during a container network cold-start window.
+                    log.info("Initial sync attempt %d/%d failed (%s), "
+                             "retrying in %.1fs", attempt, max_attempts,
+                             code, delay)
+                    time.sleep(delay)
+                    continue
+                with self._lock:
+                    self._initial_sync_failed = True
+                log.warning("Initial sync failed (%s); cache unpopulated, "
+                            "will retry on first read", code)
+                log.warning("Initial sync failed after %d attempts; cache "
+                            "unpopulated, will retry on first read",
+                            max_attempts)
+                return
+            except errors.VaultwardenError as exc:
+                # AuthError / SessionError / anything else: NOT transient —
+                # no retry, immediate WARNING (single-shot behaviour kept).
+                code = compat.get_error_code(exc)
+                with self._lock:
+                    self._initial_sync_failed = True
                 log.warning("Initial sync failed (%s); cache unpopulated, "
                             "will retry on first read", code)
                 return
+
             if result.get("synced"):
-                # sync() already logged the item count when parseable; this
-                # summary mirrors it (count omitted when not parseable).
                 duration = time.monotonic() - started
                 count = result.get("item_count")
+                with self._lock:
+                    self._initial_sync_completed = True
+                # Phase 1 summary line (kept for compatibility): sync()
+                # already logged the item count when parseable; this mirrors
+                # it (count omitted when not parseable).
                 if count is None:
                     log.info("Initial sync completed (%.1fs)", duration)
                 else:
                     log.info("Initial sync completed (%d items, %.1fs)",
                              int(count), duration)
+                # Phase 2 retry-lifecycle line.
+                if attempt > 1:
+                    if count is None:
+                        log.info("Initial sync succeeded on attempt %d",
+                                 attempt)
+                    else:
+                        log.info("Initial sync succeeded on attempt %d "
+                                 "(%d items)", attempt, int(count))
+                return
+            # sync() skipped (cache fresh / not stale): nothing left to do.
+            return
 
     # ---------------------------------------------------------------- login
     def _do_login(self) -> None:

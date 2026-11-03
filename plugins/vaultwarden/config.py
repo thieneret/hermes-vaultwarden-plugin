@@ -63,6 +63,12 @@ _DEFAULTS: dict[str, Any] = {
     # placeholder model is the only supported path for secret access.
     "auto_sync": True,
     "sync_interval_seconds": 300,
+    # v0.7.3 (Phase 2): bounded retry for the FIRST sync after auth. Default
+    # budget = 3 attempts x 10s delay = 20s total sleep — well under the 30s
+    # plugin-load timeout ceiling. Only NetworkError-classified failures are
+    # retried; AuthError/SessionError fail fast.
+    "initial_sync_max_attempts": 3,
+    "initial_sync_retry_delay_seconds": 10.0,
     "session_timeout_seconds": 14400,
     "placeholder_ttl_seconds": 300,
     "max_placeholders": 50,
@@ -249,6 +255,21 @@ class PluginConfig:
     @property
     def sync_interval_seconds(self) -> int:
         return _as_int(self._raw("sync_interval_seconds"), 300)
+
+    # v0.7.3 (Phase 2): bounded initial-sync retry knobs. Hard ceiling of 3
+    # attempts is enforced here so a hostile/typo config can never push the
+    # retry loop past the 30s plugin-load timeout budget.
+    @property
+    def initial_sync_max_attempts(self) -> int:
+        return max(1, min(_as_int(self._raw("initial_sync_max_attempts"), 3), 3))
+
+    @property
+    def initial_sync_retry_delay_seconds(self) -> float:
+        try:
+            value = float(self._raw("initial_sync_retry_delay_seconds"))
+        except (TypeError, ValueError):
+            value = 10.0
+        return max(0.0, min(value, 10.0))
 
     @property
     def session_timeout_seconds(self) -> int:
