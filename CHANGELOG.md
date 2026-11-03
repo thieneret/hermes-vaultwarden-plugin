@@ -27,15 +27,18 @@ Author: **thieneret**
 - 5 new `verify_session()` test scenarios in `test_bw_cli.py`
 
 ### Notes
-- The Phase 1 snapshot additionally extended `test_empty_read_defense.py`
+- The Phase 1 snapshot had additionally extended `test_empty_read_defense.py`
   with 22 mock-based scenarios for the same defense. The Phase 2 suite
-  (`test_session_invalidation_defense.py`) supersedes those as the
-  canonical regression suite mandated by the v0.7.6 hotfix prompt; the
-  overlapping tests remain green as defense-in-depth (no production-code
-  duplication was introduced).
+  (`test_session_invalidation_defense.py`) is the canonical regression suite
+  mandated by the v0.7.6 hotfix prompt, so those 22 overlapping tests were
+  removed from `test_empty_read_defense.py`, which is restored to its
+  pre-v0.7.6 state (the 16 v0.7.3-era empty-read-defense scenarios). No
+  production code changed in this reconciliation.
 
 ### Tests
-- Total test count: 854 (was 805)
+- Total test count: 832 (was 805) — net +27 from the canonical Phase 2
+  suite (22 scenarios) plus the 5 `verify_session()` scenarios added to
+  `test_bw_cli.py`
 
 ## v0.7.5 (2026-11-03)
 

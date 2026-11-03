@@ -18,17 +18,6 @@ Fixes pinned by this file:
             Phase 1 verb selection; routed through AuthManager.sync(force=True).
   CHANGE 3  this regression suite (8 mandated scenarios).
 
-v0.7.6 (Phase 1, session invalidation defense) EXTENSION pinned here too:
-  CHANGE 1  BwCli.verify_session(): asks ``bw status`` WITH BW_SESSION
-            whether a key still authenticates (the persistent profile
-            always reports "locked", so only the key answers honestly);
-            SessionError -> "locked", other VaultwardenError -> "unknown".
-  CHANGE 2  THIRD suspect condition: items == [] AND key_valid AND
-            last_sync > 0.0 -> verify the key; on "locked"/
-            "unauthenticated" force ONE re-unlock + ONE retry (multi-
-            AuthManager scenario: another process's unlock invalidated
-            our key). "unlocked" -> genuinely empty vault, accepted.
-
 Hard boundaries pinned here too:
   * NO false positives: last_sync > 0.0 (populated cache) or non-empty
     reads never spawn extra subprocesses;
@@ -70,22 +59,12 @@ class StubAuth:
     """
 
     def __init__(self, *, session_key=None, last_sync=0.0,
-                 sync_result=None, sync_exc=None, fresh_key=None,
-                 get_session_exc=None):
+                 sync_result=None, sync_exc=None):
         self._session_key = session_key
         self.last_sync = last_sync
         self.sync_payload = sync_result
         self._sync_exc = sync_exc
         self.sync_calls: list[bool] = []
-        # v0.7.6 (Phase 1) third-condition plumbing: get_session() models
-        # AuthManager.get_session() — by default it hands back the CURRENT
-        # key (the fast path), which the defense treats as "re-unlock
-        # produced nothing new". ``fresh_key`` scripts a successful
-        # re-unlock; ``get_session_exc`` scripts a failed one.
-        self._fresh_key = fresh_key
-        self._get_session_exc = get_session_exc
-        self.get_session_calls = 0
-        self.invalidate_calls = 0
         self.cli = None  # test wires a SpyCli to observe the verb
 
     def get_session_key(self):
@@ -93,22 +72,6 @@ class StubAuth:
 
     def ensure_authenticated(self):
         pass
-
-    def invalidate_session(self):
-        # Models the local-state demotion the defense performs BEFORE
-        # re-unlocking (a real AuthManager clears its stale key so the
-        # FSM fast path cannot hand the dead key back).
-        self.invalidate_calls += 1
-        self._session_key = None
-
-    def get_session(self):
-        self.get_session_calls += 1
-        if self._get_session_exc is not None:
-            raise self._get_session_exc
-        if self._fresh_key is not None:
-            self._session_key = self._fresh_key
-            return self._fresh_key
-        return self._session_key
 
     def sync(self, force=False):
         self.sync_calls.append(bool(force))
@@ -145,7 +108,7 @@ class SpyCli(BwCli):
     """
 
     def __init__(self, list_payloads, sync_exc=None, owner=None,
-                 sync_result=None, status_payload=None):
+                 sync_result=None):
         # Intentionally skip BwCli.__init__: no binary, no version probe.
         self.bw_path = "/nonexistent/bw"
         self.appdata_dir = "/nonexistent/appdata"
@@ -156,14 +119,6 @@ class SpyCli(BwCli):
         # JSON answer. Tests pass a non-list (e.g. a bare string) to pin
         # the item-count-omitted logging path.
         self.sync_result = [] if sync_result is None else sync_result
-        # v0.7.6 (Phase 1): scripted `bw status` payload for the third
-        # suspect condition's verify_session() probe. The default models
-        # the production invalidation scenario: the key under test NO
-        # LONGER authenticates (bw exits non-zero with a locked-status
-        # payload). Pass a dict ({"status": "unlocked", ...}) to script
-        # a still-valid key.
-        self.status_payload = ({"status": "locked"}
-                               if status_payload is None else status_payload)
         self.calls: list[tuple[list, dict]] = []
         if owner is not None:
             owner.cli = self  # let the stub record its verb at this layer
@@ -183,10 +138,6 @@ class SpyCli(BwCli):
             if self.list_payloads:
                 return self.list_payloads.pop(0)
             return []
-        if args[:1] == ["status"]:
-            if isinstance(self.status_payload, Exception):
-                raise self.status_payload
-            return self.status_payload
         return []
 
     def sync(self, session_key, force=False, full=None):
@@ -211,10 +162,6 @@ class SpyCli(BwCli):
 
     def list_args(self):
         return [c[0] for c in self.calls if c[0][:2] == ["list", "items"]]
-
-    def status_calls(self):
-        """Every (args, env) pair of recorded ``bw status`` invocations."""
-        return [(c[0], c[1]) for c in self.calls if c[0][:1] == ["status"]]
 
 
 def _messages(caplog):
@@ -560,348 +507,3 @@ class TestNoSecretsInLogs:
         # ...but no log line may echo it.
         joined = "\n".join(_messages(caplog))
         assert SESSION_KEY not in joined
-
-
-# ===========================================================================
-# v0.7.6 (Phase 1, session invalidation defense) — CHANGE 1: verify_session()
-# ===========================================================================
-
-FRESH_KEY = "ffffffff99998888-externally-invalidated-FRESHKEY"
-
-
-class TestVerifySessionUnit:
-    """BwCli.verify_session(): one `bw status` call carrying BW_SESSION."""
-
-    def test_unlocked_payload_returns_unlocked(self):
-        cli = SpyCli(list_payloads=[],
-                     status_payload={"status": "unlocked", "hasMasterPassword": True})
-        assert cli.verify_session(SESSION_KEY) == "unlocked"
-        # exactly ONE subprocess plan, with the key under test in env
-        assert cli.calls == [(["status"], {"BW_SESSION": SESSION_KEY})]
-
-    def test_locked_payload_returns_locked(self):
-        cli = SpyCli(list_payloads=[], status_payload={"status": "locked"})
-        assert cli.verify_session(SESSION_KEY) == "locked"
-
-    def test_state_key_fallback_supported(self):
-        # defensive shape: some payloads report the state under "state"
-        cli = SpyCli(list_payloads=[], status_payload={"state": "unlocked"})
-        assert cli.verify_session(SESSION_KEY) == "unlocked"
-
-    def test_non_dict_payload_returns_unknown(self):
-        cli = SpyCli(list_payloads=[], status_payload="not-a-dict")
-        assert cli.verify_session(SESSION_KEY) == "unknown"
-
-    def test_session_error_maps_to_locked(self):
-        # bw exits non-zero on an invalid key -> SessionError -> "locked"
-        # (conservative: triggers the re-unlock path).
-        cli = SpyCli(list_payloads=[],
-                     status_payload=errors.SessionError("vault is locked"))
-        assert cli.verify_session(SESSION_KEY) == "locked"
-
-    def test_network_error_maps_to_unknown(self):
-        # transport-level failure must NOT be misread as invalidation;
-        # "unknown" keeps the caller's conservative branch honest.
-        cli = SpyCli(list_payloads=[],
-                     status_payload=errors.NetworkError("connection refused"))
-        assert cli.verify_session(SESSION_KEY) == "unknown"
-
-    def test_verify_session_never_logs_the_key(self, caplog):
-        cli = SpyCli(list_payloads=[], status_payload={"status": "locked"})
-        with caplog.at_level("DEBUG"):
-            cli.verify_session(SESSION_KEY)
-        assert SESSION_KEY not in "\n".join(_messages(caplog))
-
-
-# ===========================================================================
-# v0.7.6 Phase 1 — CHANGE 2/3: third suspect condition in the read defense
-# ===========================================================================
-
-class TestThirdSuspectConditionFires:
-    """items == [] AND key_valid AND last_sync > 0.0 -> verify the key.
-
-    Production scenario (2026-11-03 17:41): two AuthManagers load the plugin
-    twice; the second unlock invalidates the first manager's BW_SESSION
-    EXTERNALLY while its local state still reports UNLOCKED with a populated
-    cache. Neither condition 1 nor 2 can see it — only `bw status` can.
-    """
-
-    def test_invalidated_key_reunlocks_and_retries_once(self, caplog):
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5,
-                        fresh_key=FRESH_KEY)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A), dict(ITEM_B)]],
-                     status_payload={"status": "locked"}, owner=auth)
-        auth.cli = cli
-
-        with caplog.at_level("INFO"):
-            items = cli.list_items(SESSION_KEY)
-
-        assert items == [ITEM_A, ITEM_B], "retry result must be returned"
-        # exactly ONE verification + ONE retry, NO sync (cache was populated)
-        assert len(cli.status_calls()) == 1
-        assert len(cli.list_args()) == 2
-        assert cli.synced_args() == [], "condition 3 never forces a sync"
-        # re-unlock went through the manager exactly once
-        assert auth.get_session_calls == 1
-        # CHANGE 3 logging spec: WARNING detection + INFO recovery
-        msgs = _messages(caplog)
-        warn = [m for m in msgs
-                if "Empty read with externally invalidated session key" in m]
-        assert len(warn) == 1
-        assert warn[0].endswith("(bw status=locked); forcing re-unlock")
-        assert any(r.levelname == "WARNING" for r in caplog.records
-                   if "externally invalidated" in r.getMessage())
-        assert any("Session re-established after external invalidation; "
-                   "retrying read once" in m for m in msgs)
-        assert any(r.levelname == "INFO" for r in caplog.records
-                   if "Session re-established" in r.getMessage())
-
-    def test_verification_carries_bw_session_env(self):
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5,
-                        fresh_key=FRESH_KEY)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]],
-                    status_payload={"status": "locked"}, owner=auth)
-        auth.cli = cli
-
-        cli.list_items(SESSION_KEY)
-
-        # the probe MUST use BW_SESSION (the persistent profile always
-        # reports "locked" by design and could never detect this)
-        status_args, status_env = cli.status_calls()[0]
-        assert status_args == ["status"]
-        assert status_env.get("BW_SESSION") == SESSION_KEY
-        # the retry read runs with the FRESH key, not the dead one
-        retry_env = cli.calls[-1][1]
-        assert retry_env.get("BW_SESSION") == FRESH_KEY
-
-    def test_unauthenticated_status_also_triggers_reunlock(self, caplog):
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5,
-                        fresh_key=FRESH_KEY)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]],
-                    status_payload={"status": "unauthenticated"}, owner=auth)
-        auth.cli = cli
-
-        with caplog.at_level("INFO"):
-            items = cli.list_items(SESSION_KEY)
-
-        assert items == [ITEM_A]
-        assert any("(bw status=unauthenticated)" in m for m in _messages(caplog))
-
-    def test_local_state_demoted_before_reunlock(self):
-        # get_session()'s UNLOCKED fast path would hand back the SAME dead
-        # key unless the defense demotes local state first — pin the order.
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5,
-                        fresh_key=FRESH_KEY)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]],
-                    status_payload={"status": "locked"}, owner=auth)
-        auth.cli = cli
-
-        cli.list_items(SESSION_KEY)
-
-        assert auth.invalidate_calls == 1
-        assert auth.get_session_calls == 1
-
-    def test_retry_still_empty_accepted_no_loop(self, caplog):
-        """Retry also empty -> accept; EXACTLY one verification + one retry."""
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5,
-                        fresh_key=FRESH_KEY)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], []],
-                    status_payload={"status": "locked"}, owner=auth)
-        auth.cli = cli
-
-        with caplog.at_level("INFO"):
-            items = cli.list_items(SESSION_KEY)
-
-        assert items == []
-        assert len(cli.list_args()) == 2, "one original + one retry, no more"
-        assert len(cli.status_calls()) == 1, "no second verification"
-        assert auth.get_session_calls == 1, "no second re-unlock"
-
-
-class TestThirdConditionAcceptanceAndDegradation:
-
-    def test_valid_key_empty_vault_accepted_quietly(self, caplog):
-        """status == "unlocked" -> genuinely empty vault: accept, no re-unlock."""
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[]],
-                    status_payload={"status": "unlocked"}, owner=auth)
-        auth.cli = cli
-
-        with caplog.at_level("INFO"):
-            items = cli.list_items(SESSION_KEY)
-
-        assert items == []
-        assert len(cli.status_calls()) == 1, "verification DID run"
-        assert len(cli.list_args()) == 1, "no retry read"
-        assert auth.get_session_calls == 0, "no re-unlock"
-        assert _messages(caplog) == [], "healthy empty vault stays silent"
-
-    def test_reunlock_failure_degrades_to_empty_with_warning(self, caplog):
-        exc = errors.AuthError("master password unavailable")
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5,
-                        get_session_exc=exc)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[]],
-                    status_payload={"status": "locked"}, owner=auth)
-        auth.cli = cli
-
-        with caplog.at_level("INFO"):
-            items = cli.list_items(SESSION_KEY)
-
-        assert items == [], "re-unlock failure degrades to the empty read"
-        assert len(cli.list_args()) == 1, "no retry without a fresh key"
-        msgs = _messages(caplog)
-        fail = [m for m in msgs
-                if "Re-unlock after external invalidation failed" in m]
-        assert len(fail) == 1
-        assert "AUTH_ERROR" in fail[0], "sanitized code required"
-        assert "returning empty list" in fail[0]
-        assert all(r.levelname == "WARNING" for r in caplog.records
-                   if "Re-unlock after external invalidation failed"
-                   in r.getMessage())
-
-    def test_same_key_after_reunlock_gives_up_without_retry(self):
-        """Re-unlock handing back the SAME key -> nothing left to retry."""
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5)  # no fresh_key
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[]],
-                    status_payload={"status": "locked"}, owner=auth)
-        auth.cli = cli
-
-        items = cli.list_items(SESSION_KEY)
-
-        assert items == []
-        assert auth.get_session_calls == 1
-        assert len(cli.list_args()) == 1, "no retry with the dead key"
-
-    def test_unknown_status_still_forces_reunlock_conservatively(self, caplog):
-        """Non-"unlocked" statuses (incl. "unknown") take the recovery leg."""
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5,
-                        fresh_key=FRESH_KEY)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]],
-                    status_payload="garbage-not-json", owner=auth)
-        auth.cli = cli
-
-        with caplog.at_level("INFO"):
-            items = cli.list_items(SESSION_KEY)
-
-        assert items == [ITEM_A]
-        assert any("(bw status=unknown)" in m for m in _messages(caplog))
-
-    def test_verify_session_crash_degrades_silently(self, caplog):
-        """A broken verify_session never crashes the read path."""
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[]], owner=auth)
-        auth.cli = cli
-
-        def boom(_key):
-            raise RuntimeError("unexpected internal fault")
-
-        cli.verify_session = boom
-        with caplog.at_level("INFO"):
-            items = cli.list_items(SESSION_KEY)
-
-        assert items == []
-        assert len(cli.list_args()) == 1
-        assert _messages(caplog) == [], "silent degrade — no noisy false alarm"
-
-
-class TestThirdConditionPrecedenceAndBoundaries:
-
-    def test_condition_2_preempts_condition_3_no_status_probe(self, caplog):
-        """last_sync == 0.0 (condition 2) is cheaper/more specific: the
-        `bw status` probe must NOT run when the forced-sync leg fires."""
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]], owner=auth)
-        auth.cli = cli
-
-        with caplog.at_level("INFO"):
-            items = cli.list_items(SESSION_KEY)
-
-        assert items == [ITEM_A]
-        assert len(cli.synced_args()) == 1, "condition 2 fired"
-        assert cli.status_calls() == [], "condition 3 must not also fire"
-
-    def test_condition_1_preemption_nonunlocked_skips_probe(self):
-        """session_key=None (condition 1) routes to the FSM reconcile leg;
-        the third-condition probe never runs."""
-        auth = StubAuth(session_key=None, last_sync=1234.5)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[]], owner=auth)
-        auth.cli = cli
-
-        items = cli.list_items(SESSION_KEY)
-
-        assert items == []
-        assert cli.status_calls() == []
-        assert auth.get_session_calls == 0
-
-    def test_nonempty_reads_pay_zero_overhead(self, caplog):
-        """The check MUST NOT run on non-empty reads (happy path)."""
-        auth = StubAuth(session_key=SESSION_KEY, last_sync=1234.5)
-        register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[dict(ITEM_A), dict(ITEM_B)]], owner=auth)
-        auth.cli = cli
-
-        with caplog.at_level("INFO"):
-            items = cli.list_items(SESSION_KEY)
-
-        assert len(items) == 2
-        assert cli.status_calls() == [], "zero extra subprocesses"
-        assert len(cli.list_args()) == 1
-        assert _messages(caplog) == []
-
-    def test_duck_typed_manager_without_last_sync_skips_probe(self):
-        """Managers lacking last_sync stay outside BOTH legs (unchanged)."""
-        class LegacyStub:
-            def get_session_key(self):
-                return SESSION_KEY
-
-        register_auth_manager(LegacyStub())
-        cli = SpyCli(list_payloads=[[]])
-
-        items = cli.list_items(SESSION_KEY)
-
-        assert items == []
-        assert cli.status_calls() == []
-
-    def test_third_condition_logs_no_secrets(self, caplog):
-        secrets = (SESSION_KEY, FRESH_KEY, CS_SECRET, MP_SECRET)
-
-        # Path A: successful recovery
-        auth_ok = StubAuth(session_key=SESSION_KEY, last_sync=1234.5,
-                           fresh_key=FRESH_KEY)
-        register_auth_manager(auth_ok)
-        cli_ok = SpyCli(list_payloads=[[], [dict(ITEM_A)]],
-                       status_payload={"status": "locked"}, owner=auth_ok)
-        auth_ok.cli = cli_ok
-        with caplog.at_level("INFO"):
-            cli_ok.list_items(SESSION_KEY)
-
-        # Path B: failed re-unlock
-        auth_bad = StubAuth(session_key=SESSION_KEY, last_sync=1234.5,
-                            get_session_exc=errors.SessionError(
-                                "raw text with mp-secret-value-ABC inside"))
-        register_auth_manager(auth_bad)
-        cli_bad = SpyCli(list_payloads=[[]],
-                        status_payload={"status": "locked"}, owner=auth_bad)
-        auth_bad.cli = cli_bad
-        with caplog.at_level("INFO"):
-            cli_bad.list_items(SESSION_KEY)
-
-        joined = "\n".join(_messages(caplog))
-        for s in secrets:
-            assert s not in joined
-        # positive control: both defense legs actually logged
-        assert "externally invalidated session key" in joined
-        assert "Re-unlock after external invalidation failed" in joined
-        assert "SESSION_ERROR" in joined, "sanitized code, never raw text"
