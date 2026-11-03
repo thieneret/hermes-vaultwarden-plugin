@@ -5,6 +5,30 @@ Author: **thieneret**
 
 ---
 
+## v0.7.3 (2026-11-03)
+
+### Fixed
+- Sync semantics: use full `bw sync` when no prior sync exists in this
+  process; `bw sync --last` only for incremental refresh (Phase 1)
+- Initial sync: bounded retry loop (max 3 attempts, 10s interval) for
+  transient network failures during container cold-start (Phase 2)
+- Empty-read defense: detect unpopulated cache (`last_sync==0.0`) on
+  empty read, force full sync, and retry once (Phase 3)
+- Status honesty: `operational` now requires both valid session AND
+  populated cache; new `cache_populated` and `initial_sync_completed`
+  fields in `vaultwarden_status` (Phase 4)
+
+### Added
+- Structured sync logging: INFO on success/skip, WARNING on failure
+- Initial sync state tracking (`_initial_sync_completed`)
+- Status contradiction WARNING when session active but cache unpopulated
+
+### Tests
+- Added `test_sync_semantics.py` regression suite (8 scenarios)
+- Added `test_initial_sync_retry.py` regression suite (7 scenarios)
+- Added `test_empty_read_defense.py` regression suite (8 scenarios)
+- Added `test_status_honesty.py` regression suite (8 scenarios)
+
 ## v0.7.2
 
 ### Fixed
