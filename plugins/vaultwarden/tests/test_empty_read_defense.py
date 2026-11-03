@@ -1,0 +1,425 @@
+"""v0.7.3 Phase 3 regression suite: empty-read defense EXTENSION.
+
+Second leg of the first-burst empty vault bug (production 2026-11-02):
+the v0.7.2 CHANGE 5 blind-spot defense only fired when
+``get_session_key()`` returned None (non-UNLOCKED state). When the session
+WAS valid but this process never completed a sync (``last_sync == 0.0``),
+``bw list items`` legitimately answers exit 0 + ``[]`` against an
+unpopulated local cache — and the empty result was silently accepted as a
+"genuinely empty vault".
+
+Fixes pinned by this file:
+  CHANGE 1  second suspect condition: items == [] AND last_sync == 0.0
+            (while UNLOCKED) -> forced FULL sync + exactly ONE read retry,
+            with WARNING on suspicion and INFO on trigger/result lines.
+  CHANGE 2  the forced sync uses the FULL verb (plain ``bw sync``, never
+            ``--last``) — consistent with the Phase 1 verb selection;
+            routed through AuthManager.sync(force=True).
+  CHANGE 3  this regression suite (8 mandated scenarios).
+
+Hard boundaries pinned here too:
+  * NO false positives: last_sync > 0.0 (populated cache) or non-empty
+    reads never spawn extra subprocesses;
+  * graceful degradation: sync failure returns the original empty list;
+    a still-empty retry is accepted (no infinite loop);
+  * write operations are NOT reconciled (defense is read-path only);
+  * no secret value ever appears in any log line.
+
+All managers are duck-typed stubs registered via
+``register_auth_manager()`` (weakref holders clear between registrations,
+so tests that must see "no manager" simply construct a fresh BwCli AFTER
+registering a throwaway double).
+"""
+from __future__ import annotations
+
+import pytest
+
+from vaultwarden import errors
+from vaultwarden.bw_cli import BwCli, get_auth_manager, register_auth_manager
+
+SESSION_KEY = "abcdef0123456789-sessionkey-FEEDFACE"
+CS_SECRET = "cs-secret-value-XYZ"      # fixture client secret (fake)
+MP_SECRET = "mp-secret-value-ABC"      # fixture master password (fake)
+
+ITEM_A = {"id": "aaaa1111-0000-0000-0000-000000000001", "name": "Postgres prod"}
+ITEM_B = {"id": "aaaa1111-0000-0000-0000-000000000002", "name": "Grafana"}
+
+
+# ---------------------------------------------------------------------------
+# Test doubles
+# ---------------------------------------------------------------------------
+
+class StubAuth:
+    """Duck-typed AuthManager stand-in for the bw_cli-side defense.
+
+    ``session_key`` models get_session_key(): None means the NON-UNLOCKED
+    leg (v0.7.2 CHANGE 5 reconcile path); a value means UNLOCKED, where the
+    Phase 3 second suspect condition (last_sync == 0.0) applies.
+    """
+
+    def __init__(self, *, session_key=None, last_sync=0.0,
+                 sync_result=None, sync_exc=None):
+        self._session_key = session_key
+        self.last_sync = last_sync
+        self.last_sync_result = sync_result
+        self._sync_exc = sync_exc
+        self.sync_calls: list[bool] = []
+
+    def get_session_key(self):
+        return self._session_key
+
+    def ensure_authenticated(self):
+        pass
+
+    def sync(self, force=False):
+        self.sync_calls.append(bool(force))
+        if self._sync_exc is not None:
+            raise self._sync_exc
+        return {"synced": True, "timestamp": 1.0}
+
+
+class SpyCli(BwCli):
+    """BwCli whose run() NEVER spawns: scripted payloads + full call log.
+
+    Records every run() invocation (args + env) so tests can assert the
+    exact subprocess plan the defense would have executed — including the
+    sync VERB (full vs --last) and the BW_SESSION header contents.
+    """
+
+    def __init__(self, list_payloads, sync_exc=None):
+        # Intentionally skip BwCli.__init__: no binary, no version probe.
+        self.bw_path = "/nonexistent/bw"
+        self.appdata_dir = "/nonexistent/appdata"
+        self.timeout = 30
+        self.list_payloads = list(list_payloads)
+        self.sync_exc = sync_exc
+        self.calls: list[tuple[list, dict]] = []
+
+    def _ensure_version_checked(self):
+        pass
+
+    def run(self, args, *, env=None, raw=False, timeout=None,
+            _retry_count=0, retryable=True):
+        # NOTE: BwCli.run()'s real body routes through _ensure_session_env
+        # (the v0.7.2 pre-flight lock check), which lazy-unlocks via the
+        # registered manager BEFORE spawning. The defense is tested at the
+        # SUBPROCESS-PLAN level here: args + caller-supplied env only.
+        args = list(args)
+        self.calls.append((args, dict(env or {})))
+        if args[:1] == ["sync"]:
+            if self.sync_exc is not None:
+                raise self.sync_exc
+            return []
+        if args[:2] == ["list", "items"]:
+            if self.list_payloads:
+                return self.list_payloads.pop(0)
+            return []
+        return []
+
+    def synced_args(self):
+        return [c[0] for c in self.calls if c[0][:1] == ["sync"]]
+
+    def list_args(self):
+        return [c[0] for c in self.calls if c[0][:2] == ["list", "items"]]
+
+
+def _messages(caplog):
+    return [r.getMessage() for r in caplog.records]
+
+
+@pytest.fixture(autouse=True)
+def _clear_registry():
+    yield
+    register_auth_manager(None)
+
+
+# ---------------------------------------------------------------------------
+# Scenario 1: empty read + last_sync == 0.0 -> forced full sync + retry
+# ---------------------------------------------------------------------------
+
+class TestSecondSuspectConditionFires:
+
+    def test_forced_full_sync_and_retry_with_warning(self, caplog):
+        auth = StubAuth(session_key=None, last_sync=0.0)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+
+        with caplog.at_level("INFO"):
+            items = cli.list_items(SESSION_KEY)
+
+        assert items == [ITEM_A], "retry result must be returned"
+        # WARNING on suspicion (intentional per spec — operators must see it)
+        warns = [m for m in _messages(caplog)
+                 if "Empty read detected with unpopulated cache" in m]
+        assert len(warns) == 1 and warns[0].endswith("(last_sync=0.0)")
+        assert any(r.levelname == "WARNING" for r in caplog.records
+                   if "Empty read detected" in r.getMessage())
+        # INFO on trigger and outcome
+        msgs = _messages(caplog)
+        assert any("Triggering forced full sync (prior sync never completed)"
+                   in m for m in msgs)
+        assert any("Forced full sync completed" in m for m in msgs)
+        assert any("Read retry after forced sync returned 1 items" in m
+                   for m in msgs)
+        # exactly ONE sync + TWO list calls (original + single retry)
+        assert len(cli.synced_args()) == 1
+        assert len(cli.list_args()) == 2
+
+    def test_forced_sync_uses_full_verb_never_last(self, caplog):
+        """CHANGE 2: the forced sync MUST be plain `bw sync` (no --last)."""
+        auth = StubAuth(session_key=None, last_sync=0.0)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+
+        with caplog.at_level("INFO"):
+            cli.list_items(SESSION_KEY)
+
+        sync_call = cli.synced_args()[0]
+        assert sync_call == ["sync"], "--last delta pull must never be used"
+        assert "--last" not in sync_call
+
+    def test_routed_through_auth_manager_sync_force_true(self, caplog):
+        """The defense delegates to AuthManager.sync(force=True), which after
+        Phase 1 owns the verb selection (full while _last_sync == 0.0)."""
+        auth = StubAuth(session_key=None, last_sync=0.0)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+
+        with caplog.at_level("INFO"):
+            cli.list_items(SESSION_KEY)
+
+        assert auth.sync_calls == [True], "must force=True (skip freshness gate)"
+
+    def test_item_count_included_when_available(self, caplog):
+        auth = StubAuth(session_key=None, last_sync=0.0, sync_result=2)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A), dict(ITEM_B)]])
+
+        with caplog.at_level("INFO"):
+            items = cli.list_items(SESSION_KEY)
+
+        assert len(items) == 2
+        assert any("Forced full sync completed (2 items)" in m
+                   for m in _messages(caplog))
+
+    def test_item_count_omitted_when_unparseable(self, caplog):
+        auth = StubAuth(session_key=None, last_sync=0.0, sync_result=None)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[], []])
+
+        with caplog.at_level("INFO"):
+            cli.list_items(SESSION_KEY)
+
+        msgs = _messages(caplog)
+        assert any(m.startswith("Forced full sync completed") and
+                   "items" not in m for m in msgs)
+
+
+# ---------------------------------------------------------------------------
+# Scenario 2: empty read + last_sync > 0.0 -> genuinely empty, NO subprocess
+# ---------------------------------------------------------------------------
+
+class TestNoFalsePositives:
+
+    def test_populated_cache_accepts_empty_without_sync(self, caplog):
+        auth = StubAuth(session_key=None, last_sync=1234.5)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[]])
+
+        with caplog.at_level("INFO"):
+            items = cli.list_items(SESSION_KEY)
+
+        assert items == []
+        assert cli.synced_args() == [], "defense must NOT fire when populated"
+        assert len(cli.list_args()) == 1, "no retry read"
+        assert _messages(caplog) == [], "healthy path stays silent"
+
+    def test_scenario_6_nonempty_read_with_zero_last_sync_no_sync(self, caplog):
+        """Non-empty read + last_sync==0.0 -> nothing suspect, no subprocess."""
+        auth = StubAuth(session_key=None, last_sync=0.0)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[dict(ITEM_A), dict(ITEM_B)]])
+
+        with caplog.at_level("INFO"):
+            items = cli.list_items(SESSION_KEY)
+
+        assert len(items) == 2
+        assert cli.synced_args() == []
+        assert len(cli.list_args()) == 1
+        assert _messages(caplog) == []
+
+    def test_duck_typed_manager_without_last_sync_skips_defense(self, caplog):
+        """Managers lacking the last_sync attribute degrade silently (the
+        defense must not crash or spawn on unknown shapes)."""
+        class LegacyStub:
+            def get_session_key(self):
+                return SESSION_KEY
+
+        register_auth_manager(LegacyStub())
+        cli = SpyCli(list_payloads=[[]])
+
+        with caplog.at_level("INFO"):
+            items = cli.list_items(SESSION_KEY)
+
+        assert items == []
+        assert cli.synced_args() == []
+        assert _messages(caplog) == []
+
+    def test_no_manager_registered_returns_empty_quietly(self, caplog):
+        cli = SpyCli(list_payloads=[[]])
+        assert get_auth_manager() is None
+
+        with caplog.at_level("INFO"):
+            items = cli.list_items(SESSION_KEY)
+
+        assert items == []
+        assert cli.synced_args() == []
+        assert _messages(caplog) == []
+
+
+# ---------------------------------------------------------------------------
+# Scenarios 4 & 5: graceful degradation
+# ---------------------------------------------------------------------------
+
+class TestGracefulDegradation:
+
+    def test_forced_sync_failure_returns_empty_with_warning(self, caplog):
+        exc = errors.NetworkError("connection refused")
+        auth = StubAuth(session_key=None, last_sync=0.0)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[]], sync_exc=exc)
+
+        with caplog.at_level("INFO"):
+            items = cli.list_items(SESSION_KEY)
+
+        assert items == [], "sync failure degrades to the original empty read"
+        assert len(cli.list_args()) == 1, "no retry read after failed sync"
+        msgs = _messages(caplog)
+        fail = [m for m in msgs if "Forced full sync failed" in m]
+        assert len(fail) == 1
+        assert "NETWORK_ERROR" in fail[0], "sanitized code required"
+        assert "returning empty list" in fail[0]
+        assert all(r.levelname == "WARNING" for r in caplog.records
+                   if "Forced full sync failed" in r.getMessage())
+
+    def test_generic_exception_logs_code_not_raw_text(self, caplog):
+        """No raw exception text — only the sanitized code from errors.py."""
+        auth = StubAuth(session_key=None, last_sync=0.0)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[]],
+                    sync_exc=ValueError("secret-ish raw text"))
+
+        with caplog.at_level("INFO"):
+            items = cli.list_items(SESSION_KEY)
+
+        assert items == []
+        joined = " | ".join(_messages(caplog))
+        assert "ValueError" in joined  # class-name fallback IS the sanitized code
+        assert "secret-ish raw text" not in joined
+
+    def test_retry_still_empty_accepted_no_loop(self, caplog):
+        """Retry also empty -> accept as genuinely empty; EXACTLY one retry."""
+        auth = StubAuth(session_key=None, last_sync=0.0, sync_result=0)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[], []])
+
+        with caplog.at_level("INFO"):
+            items = cli.list_items(SESSION_KEY)
+
+        assert items == []
+        assert len(cli.list_args()) == 2, "one original + one retry, no more"
+        assert len(cli.synced_args()) == 1, "one forced sync only"
+        assert any("Read retry after forced sync returned 0 items" in m
+                   for m in _messages(caplog))
+
+
+# ---------------------------------------------------------------------------
+# Scenario 7: write operations are NOT reconciled
+# ---------------------------------------------------------------------------
+
+class TestWritesUnaffected:
+
+    def test_delete_recovery_uses_full_sync_not_the_read_defense(self):
+        """Permanent-delete not_found recovery (v0.4.8) keeps its own FULL
+        `bw sync` path; the empty-read defense is read-only."""
+        calls: list[list] = []
+
+        class WriteCli(SpyCli):
+            # Mirror SpyCli.run's EXACT keyword-only signature: delete_item()
+            # calls run(..., raw=True, retryable=False); swallowing those in a
+            # **kwargs would bypass the inherited read defense entirely.
+            def run(self, args, **kw):
+                calls.append(list(args))
+                if args[:1] == ["delete"]:
+                    raise errors.NotFoundError("not in stale cache")
+                return super().run(args, **kw)
+
+        auth = StubAuth(session_key=None, last_sync=0.0)
+        register_auth_manager(auth)
+        cli = WriteCli(list_payloads=[])
+
+        out = cli.delete_item(SESSION_KEY, "item-1", permanent=True)
+
+        assert "deleted" in out
+        syncs = [c for c in calls if c[:1] == ["sync"]]
+        assert syncs == [["sync"]], "write recovery: full sync, no --last"
+        lists = [c for c in calls if c[:2] == ["list", "items"]]
+        assert lists == [], "write path must never hit the read defense"
+
+    def test_reconcile_hook_is_only_wired_into_list_items(self):
+        """Structural pin: create/edit/delete/get_password bodies contain no
+        _reconcile_empty_read call — the defense cannot fire for writes."""
+        import inspect
+
+        for name in ("create_item", "edit_item", "delete_item",
+                     "get_password", "item_get"):
+            src = inspect.getsource(getattr(BwCli, name))
+            assert "_reconcile_empty_read" not in src, name
+        assert "_reconcile_empty_read" in inspect.getsource(BwCli.list_items)
+
+
+# ---------------------------------------------------------------------------
+# Scenario 8: no secret values in any log
+# ---------------------------------------------------------------------------
+
+class TestNoSecretsInLogs:
+
+    def test_all_defense_paths_log_no_secrets(self, caplog):
+        secrets = (SESSION_KEY, CS_SECRET, MP_SECRET, "sup3r-s3cret-pg!")
+
+        # Path A: success + retry with items
+        auth_ok = StubAuth(session_key=None, last_sync=0.0, sync_result=3)
+        register_auth_manager(auth_ok)
+        cli_ok = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+        with caplog.at_level("INFO"):
+            cli_ok.list_items(SESSION_KEY)
+
+        # Path B: forced sync failure
+        auth_bad = StubAuth(session_key=None, last_sync=0.0)
+        register_auth_manager(auth_bad)
+        cli_bad = SpyCli(list_payloads=[[]],
+                         sync_exc=errors.NetworkError("dns warm-up failed"))
+        with caplog.at_level("INFO"):
+            cli_bad.list_items(SESSION_KEY)
+
+        joined = "\n".join(_messages(caplog))
+        for s in secrets:
+            assert s not in joined
+        # positive control: the defense actually logged
+        assert "Empty read detected" in joined
+        assert "NETWORK_ERROR" in joined
+
+    def test_subprocess_env_carries_session_but_logs_do_not(self, caplog):
+        auth = StubAuth(session_key=None, last_sync=0.0)
+        register_auth_manager(auth)
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+
+        with caplog.at_level("INFO"):
+            cli.list_items(SESSION_KEY)
+
+        # The retry read DOES receive BW_SESSION at the subprocess boundary...
+        retry_env = cli.calls[-1][1]
+        assert retry_env.get("BW_SESSION") == SESSION_KEY
+        # ...but no log line may echo it.
+        joined = "\n".join(_messages(caplog))
+        assert SESSION_KEY not in joined

@@ -142,6 +142,11 @@ class AuthManager:
         self._state = AuthState.UNINITIALIZED
         self._session_created_at: float = 0.0
         self._last_sync: float = 0.0
+        # v0.7.3 (Phase 3): bounded item count from the most recent SUCCESSFUL
+        # sync — internal hand-off for BwCli's empty-read defense log line
+        # only. A plain int (never vault content, never a secret). None until
+        # a sync reports a parseable count. NOT part of status_snapshot().
+        self._last_sync_item_count: int | None = None
         self._lock = threading.RLock()
         # v0.7.2 (first-burst bootstrap fix, CHANGE 1): observability pin —
         # counts how many times the FULL bootstrap body of
@@ -236,6 +241,17 @@ class AuthManager:
     def last_sync(self) -> float:
         with self._lock:
             return self._last_sync
+
+    @property
+    def last_sync_result(self) -> int | None:
+        """Bounded item count of the most recent successful sync (Phase 3).
+
+        Internal hand-off consumed by ``BwCli._forced_full_sync_retry()`` so
+        its "Forced full sync completed (<N> items)" line can carry the count.
+        Plain int or None — never vault content, never a secret. Duck-typed
+        test managers without this property are handled via getattr default.
+        """
+        return getattr(self, "_last_sync_item_count", None)
 
     def is_available(self) -> bool:
         """check_fn passed to ctx.register_tool — graceful degradation gate.
@@ -890,6 +906,9 @@ class AuthManager:
             # Internal hand-off for _maybe_initial_sync()'s summary line;
             # contains only a bounded integer — never vault content.
             out["item_count"] = count
+            # v0.7.3 Phase 3: same hand-off for BwCli's empty-read defense
+            # ("Forced full sync completed (<N> items)"). Bounded int only.
+            self._last_sync_item_count = count
         return out
 
     @staticmethod
