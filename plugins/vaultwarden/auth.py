@@ -84,15 +84,21 @@ class SessionLockManager:
     AuthManager instances unlocking independently invalidate each other's
     key in an endless loop (production evidence 2026-11-03 23:01-23:05).
     This manager serializes the unlock critical section with an exclusive
-    advisory lock on ``.bw-data/.session.lock``.
+    advisory lock on ``.bw-data/.unlock.lck``.
 
     Uses ``fcntl.flock()`` with ``LOCK_EX | LOCK_NB`` + polling (non-blocking
     attempts until timeout). The lock file itself contains NO secrets —
     it is a pure coordination primitive (mode 0600, zero bytes written).
+
+    v0.7.7 naming note: the lock file is ``.bw-data/.unlock.lck`` — its name
+    deliberately avoids the substring "session" so it can never be confused
+    with bw's own ``.bw-data/session-*`` key files, and so the security
+    invariant "no session-named file in the profile dir" (test_session_key_
+    not_persisted_to_disk) keeps guarding BW_SESSION persistence.
     """
 
     def __init__(self, appdata_dir: Path, timeout_seconds: float = 5.0):
-        self._lock_path = appdata_dir / ".session.lock"
+        self._lock_path = appdata_dir / ".unlock.lck"
         self._timeout = timeout_seconds
         self._lock_fd: int | None = None
         self._held = False
@@ -322,7 +328,7 @@ class AuthManager:
         # AuthManager instances (e.g. dashboard + gateway) unlocking the same
         # .bw-data dir invalidate each other's key in an endless loop. The
         # lock serializes the unlock critical section via fcntl.flock() on
-        # `.bw-data/.session.lock` (pure coordination primitive; NO secrets
+        # `.bw-data/.unlock.lck` (pure coordination primitive; NO secrets
         # ever written to it).
         #
         # Defensive appdata resolution: test doubles hand us MagicMock
@@ -330,11 +336,24 @@ class AuthManager:
         # TypeError) — in that degraded mode the lock becomes a no-op instead
         # of crashing the constructor. getattr() keeps MagicMock configs from
         # injecting a non-numeric timeout into float().
+        #
+        # Pre-check is_dir(): bw creates `.bw-data` lazily, so at AuthManager
+        # construction time the directory may not exist yet. Locking inside a
+        # nonexistent dir would fail closed on the very first unlock; instead
+        # we degrade to the no-op lock here and keep acquire() semantics
+        # strict (real lock => real failure handling).
         _appdata_for_lock: Path | None
         try:
             _appdata_for_lock = Path(self._bw.appdata_dir)
         except (TypeError, ValueError, OSError):
             _appdata_for_lock = None  # degraded mode: lock disabled
+        if _appdata_for_lock is not None:
+            try:
+                _appdata_is_dir = _appdata_for_lock.is_dir()
+            except OSError:
+                _appdata_is_dir = False
+            if not _appdata_is_dir:
+                _appdata_for_lock = None  # degraded mode: lock disabled
         if _appdata_for_lock is not None and fcntl is not None:
             _lock_timeout_cfg = getattr(
                 self._config, "session_lock_timeout_seconds", 5.0)
