@@ -169,8 +169,9 @@ class TestSyncSuccessLogging:
         # No item count available -> count omitted entirely (spec rule).
         assert "items" not in completions[0], completions[0]
         # Duration rendered with one decimal place + trailing 's'.
-        body = completions[len(completions) - 1][len("Sync completed ("):-1]
-        float(body)  # raises ValueError if not "<n>.<d>"
+        body = completions[len(completions) - 1][len("Sync completed ("):]
+        assert body.endswith("s)")
+        float(body[:-2])  # raises ValueError if not "<n>.<d>"
 
     def test_duration_measured_with_monotonic(self, mgr, monkeypatch, caplog):
         """Duration uses time.monotonic(), not wall-clock time.time()."""
@@ -399,6 +400,7 @@ class TestNoSecretsInLogs:
         class _Cfg:
             auto_sync = True
             sync_interval_seconds = 300
+            session_timeout_seconds = 14400
 
         failing._config = _Cfg()
 
