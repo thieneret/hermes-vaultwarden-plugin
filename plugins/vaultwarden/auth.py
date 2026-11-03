@@ -372,7 +372,17 @@ class AuthManager:
         # v0.7.5 CHANGE 1: deferred-initial-sync flag — set at each of the
         # FOUR former _maybe_initial_sync() call sites below, consumed once
         # after the lock block exits.
-        needs_initial_sync = False
+        #
+        # CRITICAL CONTROL-FLOW NOTE: ``None`` means "no sync requested";
+        # ``False`` is the SENTINEL meaning "sync requested, but this site
+        # leaves via bare ``return``". Python's bare ``return`` inside a
+        # ``with`` block evaluates ``return None`` BEFORE the finally tail of
+        # the method runs, so a plain boolean flag would be silently dropped
+        # on every early-return path (Case A / Case C paths all end in a
+        # bare ``return``). Using the None/False distinction keeps the
+        # deferral observable across those returns; the idempotency fast
+        # path above still sets nothing and stays a true no-op.
+        needs_initial_sync: bool | None = None
         with self._lock:
             # v0.7.2 (first-burst bootstrap fix, CHANGE 1): IDEMPOTENCY fast
             # path — when this process already holds a VALID (unexpired)
@@ -429,16 +439,23 @@ class AuthManager:
                     else:
                         self._adopt_existing_unlocked_session()
                     # v0.7.5 CHANGE 1 (call site 1/4 — Case C/unlocked):
-                    # defer the initial sync until AFTER the lock is released.
-                    needs_initial_sync = True
+                    # defer the initial sync until AFTER the lock is
+                    # released. The False SENTINEL (not True) marks "sync
+                    # requested" because this site leaves via a bare
+                    # ``return`` before the post-lock tail runs; the tail
+                    # detects it via ``is not None`` (see the control-flow
+                    # note at the flag declaration).
+                    needs_initial_sync = False
                     return
                 if current_status == "locked":
                     log.info("Already authenticated but locked, unlocking...")
                     self._state = AuthState.LOGGED_IN
                     self._do_unlock()
                     # v0.7.5 CHANGE 1 (call site 2/4 — Case C/locked):
-                    # defer the initial sync until AFTER the lock is released.
-                    needs_initial_sync = True
+                    # defer the initial sync until AFTER the lock is
+                    # released (False sentinel — same bare-return rationale
+                    # as call site 1/4).
+                    needs_initial_sync = False
                     return
                 # Correct server/account but bw reports unauthenticated
                 # (e.g. inconclusive status payload) — fall through to login.
@@ -457,8 +474,9 @@ class AuthManager:
                 self._do_login()
                 self._do_unlock()
                 # v0.7.5 CHANGE 1 (call site 3/4 — Case A): defer the initial
-                # sync until AFTER the lock is released.
-                needs_initial_sync = True
+                # sync until AFTER the lock is released (False sentinel —
+                # same bare-return rationale as call sites 1/4 and 2/4).
+                needs_initial_sync = False
                 return
 
             # Unreachable in practice; treat as needing full re-auth.
@@ -466,7 +484,9 @@ class AuthManager:
             self._do_login()
             self._do_unlock()
             # v0.7.5 CHANGE 1 (call site 4/4 — unreachable fallback): defer
-            # the initial sync until AFTER the lock is released.
+            # the initial sync until AFTER the lock is released. This site
+            # FALLS THROUGH to the tail, so True works too — both True and
+            # False are consumed by the ``is not None`` guard below.
             needs_initial_sync = True
 
         # ------------------------------------------------------------------
@@ -483,7 +503,7 @@ class AuthManager:
         # _initial_sync_completed guard, so concurrent callers that all set
         # the flag cannot double-sync.
         # ------------------------------------------------------------------
-        if needs_initial_sync:
+        if needs_initial_sync is not None:
             self._maybe_initial_sync()
 
     def _configure_server(self) -> None:
