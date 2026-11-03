@@ -1,6 +1,6 @@
 # Security Model â€” hermes-vaultwarden-plugin
 
-**Applies to:** v0.7.5
+**Applies to:** v0.7.6
 
 ## Threat Model
 
@@ -115,6 +115,26 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     WARNING on the session-active-but-cache-unpopulated contradiction). All
     log messages carry sanitized error codes only â€” never secret values or
     raw exception text.)
+19. **Multi-process session invalidation** (the Hermes Agent can load the
+    vaultwarden plugin TWICE into two separate AuthManager instances — e.g.
+    a dashboard process and a gateway process sharing the same plugin
+    directory. Each AuthManager bootstraps independently, but `bw` supports
+    only ONE session key per profile: the second unlock silently invalidates
+    the first process's `BW_SESSION`. Subsequent reads via the stale key
+    return exit 0 with an empty list against the locked local cache, which
+    the v0.7.3 empty-read defense (conditions 1 & 2) does not catch because
+    the stale manager still reports UNLOCKED with a valid-looking key and a
+    populated sync timestamp. Mitigated by v0.7.6 defense-in-depth: a third
+    suspect condition in `_reconcile_empty_read()` verifies the session key
+    via `BwCli.verify_session()` (`bw status` called with BW_SESSION, never
+    the persistent profile), and on "locked"/"unauthenticated" forces a
+    re-unlock through the AuthManager FSM and retries the read exactly once.
+    Zero overhead on non-empty reads; bounded to one probe + one re-unlock +
+    one retry per original read (no loops); degrades to the original empty
+    result on any failure. Detection and recovery are logged at WARNING/INFO
+    with sanitized status/error codes only — the session key value is never
+    passed to `bw status`'s command line (env-only), never logged, and never
+    written to disk.)
 
 ## Primary Security Controls
 

@@ -5,6 +5,41 @@ Author: **thieneret**
 
 ---
 
+## v0.7.6 (2026-11-04)
+
+### Fixed
+- Session invalidation defense: extended `_reconcile_empty_read()` with
+  a third suspect condition that detects externally invalidated session
+  keys (e.g., when a second AuthManager process unlocks with a different
+  key, invalidating the first). The defense verifies session validity
+  via `bw status`, forces re-unlock, and retries the read once.
+
+### Added
+- `BwCli.verify_session()`: calls `bw status` with BW_SESSION to check
+  if a session key is still valid (returns "unlocked", "locked", or
+  "unauthenticated")
+- `test_session_invalidation_defense.py` regression suite (22
+  scenarios covering all three suspect conditions of
+  `_reconcile_empty_read()`, with focus on condition 3 — externally
+  invalidated session keys — plus end-to-end `verify_session()` tests
+  over a mocked subprocess layer; mocks only, no real `bw` binary or
+  network required)
+- 5 new `verify_session()` test scenarios in `test_bw_cli.py`
+
+### Notes
+- The Phase 1 snapshot had additionally extended `test_empty_read_defense.py`
+  with 22 mock-based scenarios for the same defense. The Phase 2 suite
+  (`test_session_invalidation_defense.py`) is the canonical regression suite
+  mandated by the v0.7.6 hotfix prompt, so those 22 overlapping tests were
+  removed from `test_empty_read_defense.py`, which is restored to its
+  pre-v0.7.6 state (the 16 v0.7.3-era empty-read-defense scenarios). No
+  production code changed in this reconciliation.
+
+### Tests
+- Total test count: 832 (was 805) — net +27 from the canonical Phase 2
+  suite (22 scenarios) plus the 5 `verify_session()` scenarios added to
+  `test_bw_cli.py`
+
 ## v0.7.5 (2026-11-03)
 
 ### Fixed
