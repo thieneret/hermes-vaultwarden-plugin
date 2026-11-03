@@ -18,14 +18,24 @@ Author: **thieneret**
 - `BwCli.verify_session()`: calls `bw status` with BW_SESSION to check
   if a session key is still valid (returns "unlocked", "locked", or
   "unauthenticated")
-- Third suspect condition regression suite in
-  `test_empty_read_defense.py` (22 new scenarios covering
-  `verify_session()` unit behavior, the externally-invalidated-session
-  recovery path, acceptance/degradation semantics, and precedence
-  boundaries against conditions 1 & 2)
+- `test_session_invalidation_defense.py` regression suite (22
+  scenarios covering all three suspect conditions of
+  `_reconcile_empty_read()`, with focus on condition 3 — externally
+  invalidated session keys — plus end-to-end `verify_session()` tests
+  over a mocked subprocess layer; mocks only, no real `bw` binary or
+  network required)
+- 5 new `verify_session()` test scenarios in `test_bw_cli.py`
+
+### Notes
+- The Phase 1 snapshot additionally extended `test_empty_read_defense.py`
+  with 22 mock-based scenarios for the same defense. The Phase 2 suite
+  (`test_session_invalidation_defense.py`) supersedes those as the
+  canonical regression suite mandated by the v0.7.6 hotfix prompt; the
+  overlapping tests remain green as defense-in-depth (no production-code
+  duplication was introduced).
 
 ### Tests
-- Total test count: 827 (was 805)
+- Total test count: 854 (was 805)
 
 ## v0.7.5 (2026-11-03)
 
