@@ -39,6 +39,10 @@ def mgr(bw_cli, plugin_config) -> AuthManager:
                     client_secret=CLIENT_SECRET, master_password=MASTER_PASSWORD)
     m.ensure_authenticated()
     m._last_sync = 0.0
+    # Phase 2: ensure_authenticated() may have run the initial-sync loop;
+    # reset its state so each test exercises _maybe_initial_sync() freshly.
+    m._initial_sync_completed = False
+    m._initial_sync_failed = False
     return m
 
 
@@ -298,14 +302,20 @@ class TestInitialSyncLogging:
             raise boom
 
         monkeypatch.setattr(mgr._bw, "sync", fake_sync)
+        # Single-attempt config: exercise the terminal WARNING immediately
+        # instead of sleeping through the default 3x10s retry loop.
+        # PluginConfig reads these knobs from its backing section dict.
+        mgr._config.section["initial_sync_max_attempts"] = 1
+        mgr._config.section["initial_sync_retry_delay_seconds"] = 0.0
         with caplog.at_level(logging.INFO, logger=AUTH_LOGGER):
             mgr._maybe_initial_sync()   # best-effort: must NOT raise
 
         msgs = _auth_messages(caplog)
         assert any(m == "Initial sync started" for m in msgs), msgs
         warns = [r.getMessage() for r in _auth_records(caplog, logging.WARNING)]
-        assert any("Initial sync failed (NETWORK_ERROR); cache unpopulated, "
-                   "will retry on first read" in w for w in warns), warns
+        assert any("Initial sync failed after 1 attempts (NETWORK_ERROR); "
+                   "cache unpopulated, will retry on first read" in w
+                   for w in warns), warns
         assert mgr.last_sync == 0.0
 
     def test_initial_sync_skips_when_already_synced(self, mgr, monkeypatch, caplog):
@@ -432,4 +442,6 @@ class TestNoSecretsInLogs:
         assert key not in blob
         # Positive control: the sync-path logs really were emitted.
         assert "Sync failed (NETWORK_ERROR)" in blob
-        assert "Initial sync failed (NETWORK_ERROR)" in blob
+        # Phase 2: with max_attempts=1 the loop's terminal path is the
+        # exhaustion WARNING, which carries the sanitized code as a prefix.
+        assert "Initial sync failed after 1 attempts (NETWORK_ERROR)" in blob
