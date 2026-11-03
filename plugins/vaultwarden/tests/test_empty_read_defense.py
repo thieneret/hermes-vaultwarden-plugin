@@ -61,9 +61,10 @@ class StubAuth:
                  sync_result=None, sync_exc=None):
         self._session_key = session_key
         self.last_sync = last_sync
-        self.last_sync_result = sync_result
+        self.sync_payload = sync_result
         self._sync_exc = sync_exc
         self.sync_calls: list[bool] = []
+        self.cli = None  # test wires a SpyCli to observe the verb
 
     def get_session_key(self):
         return self._session_key
@@ -73,9 +74,27 @@ class StubAuth:
 
     def sync(self, force=False):
         self.sync_calls.append(bool(force))
-        if self._sync_exc is not None:
-            raise self._sync_exc
-        return {"synced": True, "timestamp": 1.0}
+        # Mirror AuthManager.sync(): after Phase 1 the manager owns the verb
+        # selection (FULL while _last_sync == 0.0, delta afterwards) and the
+        # _last_sync transition. Delegation to the CLI records the actual
+        # subprocess plan; a failed sync NEVER advances last_sync.
+        if self.cli is not None:
+            result = self.cli.sync(self._session_key or "",
+                                   full=self.last_sync == 0.0)
+        else:
+            if self._sync_exc is not None:
+                raise self._sync_exc
+            result = self.sync_payload
+        self.last_sync = 1.0
+        # Real AuthManager.sync() returns the RAW bw sync payload (via
+        # run_with_recovery); the count extractor runs over that shape.
+        return result
+
+    @property
+    def last_sync_result(self):
+        # Real AuthManager exposes a bounded int/None here; the stub returns
+        # the raw sync payload so BOTH extractor paths stay under test.
+        return self.sync_payload
 
 
 class SpyCli(BwCli):
@@ -86,7 +105,7 @@ class SpyCli(BwCli):
     sync VERB (full vs --last) and the BW_SESSION header contents.
     """
 
-    def __init__(self, list_payloads, sync_exc=None):
+    def __init__(self, list_payloads, sync_exc=None, owner=None):
         # Intentionally skip BwCli.__init__: no binary, no version probe.
         self.bw_path = "/nonexistent/bw"
         self.appdata_dir = "/nonexistent/appdata"
@@ -94,6 +113,8 @@ class SpyCli(BwCli):
         self.list_payloads = list(list_payloads)
         self.sync_exc = sync_exc
         self.calls: list[tuple[list, dict]] = []
+        if owner is not None:
+            owner.cli = self  # let the stub record its verb at this layer
 
     def _ensure_version_checked(self):
         pass
@@ -106,14 +127,26 @@ class SpyCli(BwCli):
         # SUBPROCESS-PLAN level here: args + caller-supplied env only.
         args = list(args)
         self.calls.append((args, dict(env or {})))
-        if args[:1] == ["sync"]:
-            if self.sync_exc is not None:
-                raise self.sync_exc
-            return []
         if args[:2] == ["list", "items"]:
             if self.list_payloads:
                 return self.list_payloads.pop(0)
             return []
+        return []
+
+    def sync(self, session_key, force=False, full=None):
+        """Record the VERB decision without spawning.
+
+        Mirrors BwCli.sync()'s arg construction exactly (full -> plain
+        ``bw sync``; delta -> ``bw sync --last``), so tests can assert the
+        real subprocess plan even when the defense delegates the sync to an
+        AuthManager stub whose own sync() never reaches this layer.
+        """
+        if full is None:
+            full = not force
+        args = ["sync"] + ([] if full else ["--last"])
+        self.calls.append((args, {"BW_SESSION": session_key}))
+        if self.sync_exc is not None:
+            raise self.sync_exc
         return []
 
     def synced_args(self):
@@ -140,9 +173,13 @@ def _clear_registry():
 class TestSecondSuspectConditionFires:
 
     def test_forced_full_sync_and_retry_with_warning(self, caplog):
-        auth = StubAuth(session_key=None, last_sync=0.0)
+        # UNLOCKED session with a valid key + last_sync == 0.0 -> the Phase 3
+        # SECOND suspect condition (session_key=None would take the v0.7.2
+        # non-UNLOCKED reconcile leg instead).
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]], owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             items = cli.list_items(SESSION_KEY)
@@ -167,9 +204,10 @@ class TestSecondSuspectConditionFires:
 
     def test_forced_sync_uses_full_verb_never_last(self, caplog):
         """CHANGE 2: the forced sync MUST be plain `bw sync` (no --last)."""
-        auth = StubAuth(session_key=None, last_sync=0.0)
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]], owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             cli.list_items(SESSION_KEY)
@@ -181,9 +219,10 @@ class TestSecondSuspectConditionFires:
     def test_routed_through_auth_manager_sync_force_true(self, caplog):
         """The defense delegates to AuthManager.sync(force=True), which after
         Phase 1 owns the verb selection (full while _last_sync == 0.0)."""
-        auth = StubAuth(session_key=None, last_sync=0.0)
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]], owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             cli.list_items(SESSION_KEY)
@@ -191,9 +230,14 @@ class TestSecondSuspectConditionFires:
         assert auth.sync_calls == [True], "must force=True (skip freshness gate)"
 
     def test_item_count_included_when_available(self, caplog):
-        auth = StubAuth(session_key=None, last_sync=0.0, sync_result=2)
+        # sync_result models the bw sync PAYLOAD: a list of items (the
+        # count extractor mirrors AuthManager._parse_sync_item_count and
+        # only accepts list / {"data": [...]} shapes).
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0,
+                        sync_result=[dict(ITEM_A), dict(ITEM_B)])
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A), dict(ITEM_B)]])
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A), dict(ITEM_B)]], owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             items = cli.list_items(SESSION_KEY)
@@ -203,9 +247,11 @@ class TestSecondSuspectConditionFires:
                    for m in _messages(caplog))
 
     def test_item_count_omitted_when_unparseable(self, caplog):
-        auth = StubAuth(session_key=None, last_sync=0.0, sync_result=None)
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0,
+                        sync_result="No sync needed")
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], []])
+        cli = SpyCli(list_payloads=[[], []], owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             cli.list_items(SESSION_KEY)
@@ -224,7 +270,8 @@ class TestNoFalsePositives:
     def test_populated_cache_accepts_empty_without_sync(self, caplog):
         auth = StubAuth(session_key=None, last_sync=1234.5)
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[]])
+        cli = SpyCli(list_payloads=[[]], owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             items = cli.list_items(SESSION_KEY)
@@ -236,9 +283,10 @@ class TestNoFalsePositives:
 
     def test_scenario_6_nonempty_read_with_zero_last_sync_no_sync(self, caplog):
         """Non-empty read + last_sync==0.0 -> nothing suspect, no subprocess."""
-        auth = StubAuth(session_key=None, last_sync=0.0)
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[dict(ITEM_A), dict(ITEM_B)]])
+        cli = SpyCli(list_payloads=[[dict(ITEM_A), dict(ITEM_B)]], owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             items = cli.list_items(SESSION_KEY)
@@ -285,9 +333,10 @@ class TestGracefulDegradation:
 
     def test_forced_sync_failure_returns_empty_with_warning(self, caplog):
         exc = errors.NetworkError("connection refused")
-        auth = StubAuth(session_key=None, last_sync=0.0)
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[]], sync_exc=exc)
+        cli = SpyCli(list_payloads=[[]], sync_exc=exc, owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             items = cli.list_items(SESSION_KEY)
@@ -304,10 +353,11 @@ class TestGracefulDegradation:
 
     def test_generic_exception_logs_code_not_raw_text(self, caplog):
         """No raw exception text — only the sanitized code from errors.py."""
-        auth = StubAuth(session_key=None, last_sync=0.0)
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth)
         cli = SpyCli(list_payloads=[[]],
-                    sync_exc=ValueError("secret-ish raw text"))
+                    sync_exc=ValueError("secret-ish raw text"), owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             items = cli.list_items(SESSION_KEY)
@@ -319,9 +369,11 @@ class TestGracefulDegradation:
 
     def test_retry_still_empty_accepted_no_loop(self, caplog):
         """Retry also empty -> accept as genuinely empty; EXACTLY one retry."""
-        auth = StubAuth(session_key=None, last_sync=0.0, sync_result=0)
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0,
+                        sync_result=[])
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], []])
+        cli = SpyCli(list_payloads=[[], []], owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             items = cli.list_items(SESSION_KEY)
@@ -349,9 +401,13 @@ class TestWritesUnaffected:
             # calls run(..., raw=True, retryable=False); swallowing those in a
             # **kwargs would bypass the inherited read defense entirely.
             def run(self, args, **kw):
-                calls.append(list(args))
                 if args[:1] == ["delete"]:
-                    raise errors.NotFoundError("not in stale cache")
+                    calls.append(list(args))
+                    if not any(c[:1] == ["sync"] for c in calls):
+                        # First attempt fails against the stale cache; the
+                        # v0.4.8 not_found recovery syncs and retries once.
+                        raise errors.NotFoundError("not in stale cache")
+                    return "deleted"
                 return super().run(args, **kw)
 
         auth = StubAuth(session_key=None, last_sync=0.0)
@@ -388,17 +444,20 @@ class TestNoSecretsInLogs:
         secrets = (SESSION_KEY, CS_SECRET, MP_SECRET, "sup3r-s3cret-pg!")
 
         # Path A: success + retry with items
-        auth_ok = StubAuth(session_key=None, last_sync=0.0, sync_result=3)
+        auth_ok = StubAuth(session_key=SESSION_KEY, last_sync=0.0,
+                           sync_result=[dict(ITEM_A), dict(ITEM_B)])
         register_auth_manager(auth_ok)
-        cli_ok = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+        cli_ok = SpyCli(list_payloads=[[], [dict(ITEM_A)]], owner=auth_ok)
+        auth_ok.cli = cli_ok
         with caplog.at_level("INFO"):
             cli_ok.list_items(SESSION_KEY)
 
         # Path B: forced sync failure
-        auth_bad = StubAuth(session_key=None, last_sync=0.0)
+        auth_bad = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth_bad)
         cli_bad = SpyCli(list_payloads=[[]],
-                         sync_exc=errors.NetworkError("dns warm-up failed"))
+                         sync_exc=errors.NetworkError("dns warm-up failed"), owner=auth_bad)
+        auth_bad.cli = cli_bad
         with caplog.at_level("INFO"):
             cli_bad.list_items(SESSION_KEY)
 
@@ -410,9 +469,10 @@ class TestNoSecretsInLogs:
         assert "NETWORK_ERROR" in joined
 
     def test_subprocess_env_carries_session_but_logs_do_not(self, caplog):
-        auth = StubAuth(session_key=None, last_sync=0.0)
+        auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth)
-        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]])
+        cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]], owner=auth)
+        auth.cli = cli
 
         with caplog.at_level("INFO"):
             cli.list_items(SESSION_KEY)

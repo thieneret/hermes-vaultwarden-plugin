@@ -1113,6 +1113,12 @@ class BwCli:
             except (TypeError, ValueError):
                 return None
             if suspect:
+                # Re-entrancy guard (see _forced_full_sync_retry): the retry
+                # read must NEVER re-trigger the defense — one forced sync
+                # + one retry max per original read.
+                if getattr(self, "_empty_read_reconciling", False):
+                    self._empty_read_reconciling = False
+                    return None
                 return self._forced_full_sync_retry(args, session_key, auth)
             # Cache was populated at some point (last_sync > 0.0): an empty
             # payload is a GENUINELY empty vault — no subprocess.
@@ -1165,22 +1171,43 @@ class BwCli:
             if callable(mgr_sync):
                 # AuthManager.sync(force=True) skips the freshness gate and
                 # picks the FULL verb because last_sync is still 0.0 (Phase 1).
-                mgr_sync(force=True)
+                result = mgr_sync(force=True)
             else:
-                self.sync(session_key, full=True)
+                result = self.sync(session_key, full=True)
         except Exception as exc:  # noqa: BLE001 - degrade to the empty result
             code = compat.get_error_code(exc)
             log.warning("Forced full sync failed (%s); returning empty list",
                         code)
             return None
-        count = self._extract_item_count(getattr(auth, "last_sync_result",
-                                                 None))
+        # Item-count source: AuthManager.sync() returns the bounded count in
+        # its dict result ("item_count", Phase 3 hand-off); prefer that, fall
+        # back to the last_sync_result property, then parse the raw payload.
+        # Duck-typed managers expose neither — the count is simply omitted.
+        count = None
+        if isinstance(result, dict):
+            c = result.get("item_count")
+            if isinstance(c, int) and not isinstance(c, bool):
+                count = c
+        if count is None:
+            count = self._extract_item_count(getattr(auth, "last_sync_result",
+                                                     None))
+        if count is None:
+            count = self._extract_item_count(result)
         if count is None:
             log.info("Forced full sync completed")
         else:
             log.info("Forced full sync completed (%d items)", count)
         data = self.run(args, env={"BW_SESSION": session_key})
         items = self._extract_items(data)
+        # v0.7.3 Phase 3 RE-ENTRANCY GUARD: the retry read runs with a real
+        # UNLOCKED session key; if it comes back empty while the manager's
+        # last_sync is still 0.0 (e.g. a duck-typed manager that does not
+        # advance sync state, or a sync that pulled nothing), re-entering the
+        # second suspect leg would force ANOTHER sync + retry — an infinite
+        # loop. The defense is limited to ONE forced sync + ONE retry per
+        # original read; a still-empty retry is accepted as genuinely empty.
+        if not items:
+            self._empty_read_reconciling = True
         log.info("Read retry after forced sync returned %d items",
                  len(items))
         return items
