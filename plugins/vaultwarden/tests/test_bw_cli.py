@@ -1037,3 +1037,104 @@ class TestSessionKeyInjectionV064:
         assert resp["error_code"] == "SESSION_EXPIRED"
         assert "Try unlocking" in resp.get("suggestion", "")
         assert "K9" not in resp.get("suggestion", "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.7.6 HOTFIX Phase 2 (CHANGE 4): BwCli.verify_session() — session
+# invalidation defense probe. bw supports exactly ONE session key per profile;
+# when a second AuthManager process unlocks, the first manager's BW_SESSION is
+# invalidated EXTERNALLY while its local state still reports UNLOCKED.
+# verify_session() asks `bw status` WITH the key under test (the persistent
+# profile always reports "locked" by design, so only the key answers honestly)
+# and maps the answer into the taxonomy that decides the recovery leg:
+#   dict payload -> its "status"/"state" field; non-dict -> "unknown";
+#   SessionError -> "locked" (conservative: triggers re-unlock);
+#   any other VaultwardenError -> "unknown" (a downed server must NOT
+#   masquerade as an invalidated key). The key NEVER appears in argv or logs.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestVerifySessionV076:
+
+    def test_verify_session_unlocked_status(self, fake_bw, appdata,
+                                            monkeypatch):
+        """Scenario 1: bw status {"status": "unlocked"} -> "unlocked"."""
+        import subprocess as sp
+
+        from vaultwarden.bw_cli import register_auth_manager
+        register_auth_manager(None)
+        fake_run, calls = _mk_run(cmd_results=[
+            {"rc": 0, "out": '{"status": "unlocked"}', "err": ""}])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+
+        assert cli.verify_session("FAKE_SESSION_KEY_1") == "unlocked"
+        # the probe carries the key via BW_SESSION ONLY — never in argv
+        assert calls[-1][1:] == ["status"]
+        assert all("FAKE_SESSION_KEY_1" not in c for c in calls)
+
+    def test_verify_session_locked_status(self, fake_bw, appdata,
+                                          monkeypatch):
+        """Scenario 2: bw status {"status": "locked"} -> "locked"."""
+        import subprocess as sp
+
+        from vaultwarden.bw_cli import register_auth_manager
+        register_auth_manager(None)
+        fake_run, _calls = _mk_run(cmd_results=[
+            {"rc": 0, "out": '{"status": "locked"}', "err": ""}])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+
+        assert cli.verify_session("FAKE_SESSION_KEY_1") == "locked"
+
+    def test_verify_session_error_maps_to_locked(self, fake_bw, appdata,
+                                                 monkeypatch):
+        """Scenario 3: run() raises SessionError -> "locked".
+
+        A dead key makes bw exit non-zero with a locked-session marker;
+        the conservative mapping triggers the defense's re-unlock leg.
+        Covers both SESSION_ERROR ("Vault is locked.") and SESSION_EXPIRED
+        ("not logged in") classifications — same SessionError class.
+        """
+        import subprocess as sp
+
+        from vaultwarden.bw_cli import register_auth_manager
+        register_auth_manager(None)
+        for err_text in ("Vault is locked.", "You are not logged in."):
+            fake_run, _calls = _mk_run(cmd_results=[
+                {"rc": 1, "out": "", "err": err_text}])
+            monkeypatch.setattr(sp, "run", fake_run)
+            cli = BwCli(fake_bw, appdata)
+            assert cli.verify_session("FAKE_SESSION_KEY_1") == "locked"
+
+    def test_verify_session_network_error_maps_to_unknown(
+            self, fake_bw, appdata, monkeypatch):
+        """Scenario 4: run() raises NetworkError -> "unknown".
+
+        A downed server must NOT masquerade as an invalidated key; the
+        non-"locked" mapping keeps the error taxonomy honest. (Network
+        errors on the idempotent `status` verb retry with backoff inside
+        run(); the final raise is what verify_session() sees.)
+        """
+        import subprocess as sp
+
+        from vaultwarden.bw_cli import register_auth_manager
+        register_auth_manager(None)
+        fake_run, _calls = _mk_run(cmd_results=[dict(_NET_ERR)])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+        monkeypatch.setattr(cli, "_compute_backoff", lambda _n: 0.0)
+
+        assert cli.verify_session("FAKE_SESSION_KEY_1") == "unknown"
+
+    def test_verify_session_non_dict_payload_returns_unknown(
+            self, fake_bw, appdata, monkeypatch):
+        """Scenario 5: rc 0 but stdout is NOT a JSON object -> "unknown"."""
+        import subprocess as sp
+
+        from vaultwarden.bw_cli import register_auth_manager
+        register_auth_manager(None)
+        fake_run, _calls = _mk_run(cmd_results=[
+            {"rc": 0, "out": "not-json-garbage", "err": ""}])
+        monkeypatch.setattr(sp, "run", fake_run)
+        cli = BwCli(fake_bw, appdata)
+
+        assert cli.verify_session("FAKE_SESSION_KEY_1") == "unknown"
