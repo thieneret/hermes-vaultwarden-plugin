@@ -1,8 +1,13 @@
-"""v0.7.3 Phase 1 regression tests: sync verb semantics + sync observability.
+"""Sync verb semantics + sync observability regression tests.
+
+v0.7.4 correction: ``bw sync --last`` is a READ-ONLY date query (it does
+NOT synchronize) and is removed from every code path. The verbs are now:
+  - FULL / initial / forced pull -> ``bw sync --force``
+  - incremental refresh          -> plain ``bw sync``
 
 Covers the eight required scenarios:
-  1. sync() with _last_sync == 0.0   -> FULL `bw sync` (no --last) + INFO decision log
-  2. sync() with _last_sync  > 0.0   -> DELTA `bw sync --last` + INFO decision log
+  1. sync() with _last_sync == 0.0   -> FULL `bw sync --force` + INFO decision log
+  2. sync() with _last_sync  > 0.0   -> INCREMENTAL `bw sync` + INFO decision log
   3. sync() success                  -> INFO "Sync completed" (item count when parseable)
   4. sync() failure                  -> WARNING with sanitized error code + cache state
   5. sync() skip (cache fresh)       -> INFO "Sync skipped" with age
@@ -11,10 +16,11 @@ Covers the eight required scenarios:
   8. no secret values in ANY log record
 
 Hardening context (production incident 2026-11-02): a failed initial sync
-left _last_sync=0.0 with zero log evidence, and sync(force=True) on a fresh
-process issued `bw sync --last` — a delta pull keyed to the CLI's own sync
-timestamp that can report success while pulling NOTHING on a profile whose
-full snapshot was never taken (empty vault, {"synced": true}).
+left _last_sync=0.0 with zero log evidence, and v0.7.3 routed incremental
+refreshes through `bw sync --last` — which per `bw sync --help` only prints
+the last sync date and performs NO synchronization at all (empty vault
+behind a {"synced": true} response). v0.7.4 restores real syncing on every
+path and guarantees the full snapshot via `bw sync --force`.
 """
 from __future__ import annotations
 
@@ -56,7 +62,7 @@ def _auth_records(caplog, level: int) -> list[logging.LogRecord]:
 
 
 # ---------------------------------------------------------------------------
-# Scenario 1: fresh process (_last_sync == 0.0) => FULL sync, never --last
+# Scenario 1: fresh process (_last_sync == 0.0) => FULL sync (--force), never --last
 # ---------------------------------------------------------------------------
 
 class TestSyncVerbSelection:
@@ -75,14 +81,14 @@ class TestSyncVerbSelection:
 
         assert result["synced"] is True
         assert len(seen) == 1
-        # CHANGE 1 contract: full pull explicitly requested, no delta flag.
+        # CHANGE 1/2 contract: full pull explicitly requested (-> --force).
         assert seen[0]["full"] is True
         msgs = _auth_messages(caplog)
-        assert any("Running full sync (no prior sync in this process)" in m
-                   for m in msgs), msgs
+        assert any("Running full sync --force (no prior sync in this process)"
+                   in m for m in msgs), msgs
 
     def test_fresh_process_forced_sync_still_full(self, mgr, caplog):
-        """The exact v0.7.2 bug: force=True on _last_sync==0.0 must NOT be --last."""
+        """v0.7.4: force=True on _last_sync==0.0 must run `bw sync --force`."""
         recorded: list[list[str]] = []
         real_run = mgr._bw.run
 
@@ -95,11 +101,11 @@ class TestSyncVerbSelection:
             mgr.sync(force=True)
 
         assert recorded, "no bw invocation recorded"
-        assert recorded[-1] == ["sync"], \
-            f"fresh process must run plain 'bw sync', got {recorded[-1]}"
+        assert recorded[-1] == ["sync", "--force"], \
+            f"fresh process must run 'bw sync --force', got {recorded[-1]}"
         assert "--last" not in recorded[-1]
 
-    def test_prior_sync_uses_delta_last(self, mgr, monkeypatch, caplog):
+    def test_prior_sync_uses_incremental_sync(self, mgr, monkeypatch, caplog):
         seen: list[dict] = []
 
         def fake_sync(session_key, force=False, *, full=None):
@@ -115,14 +121,15 @@ class TestSyncVerbSelection:
         assert len(seen) == 1
         assert seen[0]["full"] is False
         msgs = _auth_messages(caplog)
-        assert any("Running delta sync --last (last_sync=1234.5)" in m
+        assert any("Running incremental sync (last_sync=1234.5)" in m
                    for m in msgs), msgs
 
     def test_bw_cli_sync_verb_mapping(self, bw_cli, monkeypatch):
-        """BwCli.sync(): full=True -> ['sync']; full=False -> ['sync','--last'].
+        """BwCli.sync(): full=True -> ['sync','--force']; full=False -> ['sync'].
 
-        Legacy force mapping preserved (v0.4.8 permanent-delete recovery calls
-        bare sync(session_key) and needs the FULL pull).
+        Legacy force mapping CORRECTED in v0.7.4 (CHANGE 1): force now maps
+        directly onto the full verb (force=True -> --force). The v0.7.3
+        inverted mapping produced the no-op `--last` date query.
         """
         recorded: list[list[str]] = []
 
@@ -133,13 +140,13 @@ class TestSyncVerbSelection:
         bw_cli.run = fake_run
 
         bw_cli.sync("sess", full=True)
-        assert recorded[-1] == ["sync"]
+        assert recorded[-1] == ["sync", "--force"]
         bw_cli.sync("sess", full=False)
-        assert recorded[-1] == ["sync", "--last"]
-        bw_cli.sync("sess")                 # legacy default -> full pull
         assert recorded[-1] == ["sync"]
-        bw_cli.sync("sess", force=True)     # legacy force -> delta
-        assert recorded[-1] == ["sync", "--last"]
+        bw_cli.sync("sess")                 # legacy default -> incremental
+        assert recorded[-1] == ["sync"]
+        bw_cli.sync("sess", force=True)     # legacy force -> full (--force)
+        assert recorded[-1] == ["sync", "--force"]
 
 
 # ---------------------------------------------------------------------------
@@ -356,24 +363,26 @@ class TestBootstrapIntegration:
 
         sync_calls = [a for a in recorded if a and a[0] == "sync"]
         assert sync_calls, f"initial sync never ran; cmds={recorded}"
-        # Fresh process: the FIRST sync of the bootstrap must be a FULL pull.
-        assert sync_calls[0] == ["sync"], sync_calls
+        # Fresh process: the FIRST sync of the bootstrap must be a FULL pull
+        # (v0.7.4: `bw sync --force` guarantees the complete download).
+        assert sync_calls[0] == ["sync", "--force"], sync_calls
         assert "--last" not in sync_calls[0]
 
         msgs = _auth_messages(caplog)
         assert any(m == "Initial sync started" for m in msgs), msgs
-        assert any("Running full sync (no prior sync in this process)" in m
-                   for m in msgs), msgs
+        assert any("Running full sync --force (no prior sync in this process)"
+                   in m for m in msgs), msgs
         assert any(m.startswith("Sync completed") for m in msgs), msgs
         assert any(m.startswith("Initial sync completed") for m in msgs), msgs
         assert mgr.last_sync > 0.0
 
-        # Second bootstrap-phase sync (if forced) now takes the delta path.
+        # Second bootstrap-phase sync (if forced) now takes the INCREMENTAL
+        # path: plain `bw sync` (v0.7.3's `--last` never synced at all).
         recorded.clear()
         with caplog.at_level(logging.INFO, logger=AUTH_LOGGER):
             mgr.sync(force=True)
         sync_calls = [a for a in recorded if a and a[0] == "sync"]
-        assert sync_calls[-1] == ["sync", "--last"]
+        assert sync_calls[-1] == ["sync"]
 
 
 # ---------------------------------------------------------------------------

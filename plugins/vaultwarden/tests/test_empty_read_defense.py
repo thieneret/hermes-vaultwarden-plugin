@@ -12,9 +12,10 @@ Fixes pinned by this file:
   CHANGE 1  second suspect condition: items == [] AND last_sync == 0.0
             (while UNLOCKED) -> forced FULL sync + exactly ONE read retry,
             with WARNING on suspicion and INFO on trigger/result lines.
-  CHANGE 2  the forced sync uses the FULL verb (plain ``bw sync``, never
-            ``--last``) — consistent with the Phase 1 verb selection;
-            routed through AuthManager.sync(force=True).
+  CHANGE 2  the forced sync uses the FULL verb — v0.7.4 correction:
+            ``bw sync --force`` (the old ``--last`` "delta" verb is a
+            read-only date query that never synced) — consistent with the
+            Phase 1 verb selection; routed through AuthManager.sync(force=True).
   CHANGE 3  this regression suite (8 mandated scenarios).
 
 Hard boundaries pinned here too:
@@ -102,7 +103,8 @@ class SpyCli(BwCli):
 
     Records every run() invocation (args + env) so tests can assert the
     exact subprocess plan the defense would have executed — including the
-    sync VERB (full vs --last) and the BW_SESSION header contents.
+    sync VERB (full ``--force`` vs incremental) and the BW_SESSION header
+    contents.
     """
 
     def __init__(self, list_payloads, sync_exc=None, owner=None,
@@ -141,14 +143,15 @@ class SpyCli(BwCli):
     def sync(self, session_key, force=False, full=None):
         """Record the VERB decision without spawning.
 
-        Mirrors BwCli.sync()'s arg construction exactly (full -> plain
-        ``bw sync``; delta -> ``bw sync --last``), so tests can assert the
-        real subprocess plan even when the defense delegates the sync to an
-        AuthManager stub whose own sync() never reaches this layer.
+        Mirrors BwCli.sync()'s v0.7.4 arg construction exactly (full ->
+        ``bw sync --force``; incremental -> plain ``bw sync``; the no-op
+        ``--last`` verb is gone), so tests can assert the real subprocess
+        plan even when the defense delegates the sync to an AuthManager
+        stub whose own sync() never reaches this layer.
         """
         if full is None:
-            full = not force
-        args = ["sync"] + ([] if full else ["--last"])
+            full = force
+        args = ["sync", "--force"] if full else ["sync"]
         self.calls.append((args, {"BW_SESSION": session_key}))
         if self.sync_exc is not None:
             raise self.sync_exc
@@ -208,7 +211,7 @@ class TestSecondSuspectConditionFires:
         assert len(cli.list_args()) == 2
 
     def test_forced_sync_uses_full_verb_never_last(self, caplog):
-        """CHANGE 2: the forced sync MUST be plain `bw sync` (no --last)."""
+        """CHANGE 2 (v0.7.4): the forced sync MUST be `bw sync --force`."""
         auth = StubAuth(session_key=SESSION_KEY, last_sync=0.0)
         register_auth_manager(auth)
         cli = SpyCli(list_payloads=[[], [dict(ITEM_A)]], owner=auth)
@@ -218,7 +221,8 @@ class TestSecondSuspectConditionFires:
             cli.list_items(SESSION_KEY)
 
         sync_call = cli.synced_args()[0]
-        assert sync_call == ["sync"], "--last delta pull must never be used"
+        assert sync_call == ["sync", "--force"], \
+            "full sync must use --force; --last never synced at all"
         assert "--last" not in sync_call
 
     def test_routed_through_auth_manager_sync_force_true(self, caplog):
@@ -437,7 +441,8 @@ class TestWritesUnaffected:
 
         assert "deleted" in out
         syncs = [c[0] for c in cli.calls if c[0][:1] == ["sync"]]
-        assert syncs == [["sync"]], "write recovery: full sync, no --last"
+        assert syncs == [["sync", "--force"]], \
+            "write recovery: full sync via --force, never the no-op --last"
         lists = cli.list_args()
         assert lists == [], "write path must never hit the read defense"
 

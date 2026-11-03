@@ -844,12 +844,15 @@ class AuthManager:
         v0.7.3 (Phase 1, CHANGE 1/2):
         - SYNC VERB SELECTION: when ``_last_sync == 0.0`` this process has
           never completed a sync, so the profile's FULL snapshot may not
-          exist locally. ``bw sync --last`` is a DELTA pull keyed to the
-          CLI's own server-side sync timestamp — on a never-fully-synced
-          profile it can report success while pulling NOTHING, leaving an
-          empty cache behind a ``{"synced": true}`` response (production
-          incident 2026-11-02). Plain ``bw sync`` (full pull) is used for
-          the first sync; ``--last`` only for incremental refreshes.
+          exist locally. v0.7.4 CORRECTION: ``bw sync --last`` is NOT a
+          delta sync — per ``bw sync --help`` it only PRINTS the last sync
+          date and performs no synchronization at all, so every v0.7.3
+          incremental path routed through it silently skipped syncing.
+          The verb selection now maps:
+          ``full=True`` (initial)  -> ``bw sync --force`` (guaranteed full
+          vault download into the local SQLite cache);
+          ``full=False`` (incremental) -> plain ``bw sync`` (pull latest
+          vault data from server).
         - OBSERVABILITY: every outcome (verb decision, success, skip,
           failure) is logged at INFO/WARNING. Log lines carry ONLY
           sanitized error codes from errors.py, epoch timestamps, item
@@ -867,9 +870,9 @@ class AuthManager:
             last_sync_snapshot = self._last_sync
         full_sync = last_sync_snapshot == 0.0
         if full_sync:
-            log.info("Running full sync (no prior sync in this process)")
+            log.info("Running full sync --force (no prior sync in this process)")
         else:
-            log.info("Running delta sync --last (last_sync=%.1f)",
+            log.info("Running incremental sync (last_sync=%.1f)",
                      last_sync_snapshot)
 
         # run_with_recovery already wraps fn in SESSION_ERROR retry logic.
