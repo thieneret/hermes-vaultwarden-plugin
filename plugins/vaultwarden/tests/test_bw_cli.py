@@ -870,7 +870,11 @@ class TestDeleteItemPermanentSyncRetry:
         assert "abc123" in msg
         assert "--permanent" not in msg     # never args[-1]
         cmds = [c[1:] for c in calls]
-        assert cmds.count(["sync"]) == 1    # sync ran exactly once
+        # v0.7.4: the recovery sync is the FULL verb (`bw sync --force`) —
+        # pinned explicitly so a regression to a bare/`--last` sync fails.
+        assert cmds.count(["sync", "--force"]) == 1    # sync ran exactly once
+        assert cmds.count(["sync"]) == 0               # never a bare sync
+        assert ["sync", "--last"] not in cmds         # never the no-op date query
         # only ONE retry of the delete (no infinite loop)
         assert cmds.count(["delete", "item", "abc123", "--permanent"]) == 2
 
