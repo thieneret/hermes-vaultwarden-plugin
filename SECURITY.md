@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.7.4
+**Applies to:** v0.7.5
 
 ## Threat Model
 

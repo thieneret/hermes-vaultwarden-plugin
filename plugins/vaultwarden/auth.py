@@ -351,8 +351,36 @@ class AuthManager:
 
         Account verification: config.yaml carries client_id "user.<uuid>";
         bw status reports userId "<uuid>" — they must match.
+
+        v0.7.5 (recursive-auth elimination, CHANGE 1): the initial-sync call
+        sites INSIDE this method no longer run ``_maybe_initial_sync()``
+        under ``self._lock``. They only set the local ``needs_initial_sync``
+        flag; the single guarded call happens AFTER the lock block exits.
+        Root cause pinned here (production log 2026-11-03 14:04): while
+        ``sync()`` ran inside the lock, its subprocess held the RLock for
+        its entire (5+ second) duration and the nested
+        ``sync() -> run_with_recovery() -> get_session()`` chain re-entered
+        the re-entrant lock on the same thread, routing back through
+        ``ensure_authenticated()`` and spawning a SECOND full FSM run
+        (duplicate unlock + duplicate sync loop + session-key loss window).
+        With the sync moved outside the lock, ``get_session()`` sees a fully
+        settled UNLOCKED state with a valid session key, takes its fast
+        path, and never re-enters the FSM. The FSM body itself (Case A/B/C
+        dispatch, state transitions, error mapping, logging) is UNCHANGED.
         """
         log.info("Checking authentication status...")
+        # v0.7.5 CHANGE 1: deferred-initial-sync flag — set at each of the
+        # FOUR former _maybe_initial_sync() call sites below, consumed once
+        # after the lock block exits.
+        #
+        # CRITICAL CONTROL-FLOW NOTE: none of the four call sites may leave
+        # the lock block via an early ``return`` — a bare ``return`` inside a
+        # ``with`` block skips the post-lock tail entirely and silently drops
+        # the deferral (duplicate-sync-loop fix regressed to "sync never
+        # ran"). Every site therefore sets the plain boolean and FALLS OUT
+        # of the ``with self._lock:`` block; only the idempotency fast path
+        # (which never requests a sync) returns early.
+        needs_initial_sync = False
         with self._lock:
             # v0.7.2 (first-burst bootstrap fix, CHANGE 1): IDEMPOTENCY fast
             # path — when this process already holds a VALID (unexpired)
@@ -396,49 +424,68 @@ class AuthManager:
             needs_reauth = not (is_correct_server and is_correct_account)
 
             # Case C: already authenticated with the correct session.
-            if not needs_reauth:
-                if current_status == "unlocked":
-                    log.info("Already authenticated and unlocked; nothing to do.")
-                    self._state = AuthState.LOGGED_IN
-                    if self._session_key:
-                        # v0.1.9 fast path: our remembered in-memory session is
-                        # still valid (idempotent re-check, e.g. lazy auth via
-                        # check_fn followed by another tool call) — no extra
-                        # subprocess round-trip needed.
-                        self._state = AuthState.UNLOCKED
-                    else:
-                        self._adopt_existing_unlocked_session()
-                    self._maybe_initial_sync()
-                    return
-                if current_status == "locked":
-                    log.info("Already authenticated but locked, unlocking...")
-                    self._state = AuthState.LOGGED_IN
-                    self._do_unlock()
-                    self._maybe_initial_sync()
-                    return
-                # Correct server/account but bw reports unauthenticated
-                # (e.g. inconclusive status payload) — fall through to login.
+            if not needs_reauth and current_status == "unlocked":
+                log.info("Already authenticated and unlocked; nothing to do.")
+                self._state = AuthState.LOGGED_IN
+                if self._session_key:
+                    # v0.1.9 fast path: our remembered in-memory session is
+                    # still valid (idempotent re-check, e.g. lazy auth via
+                    # check_fn followed by another tool call) — no extra
+                    # subprocess round-trip needed.
+                    self._state = AuthState.UNLOCKED
+                else:
+                    self._adopt_existing_unlocked_session()
+                # v0.7.5 CHANGE 1 (call site 1/4 — Case C/unlocked): defer
+                # the initial sync until AFTER the lock is released. NO
+                # return — control falls out of the with-block so the tail
+                # below runs _maybe_initial_sync() without holding the RLock.
+                needs_initial_sync = True
+            elif not needs_reauth and current_status == "locked":
+                log.info("Already authenticated but locked, unlocking...")
+                self._state = AuthState.LOGGED_IN
+                self._do_unlock()
+                # v0.7.5 CHANGE 1 (call site 2/4 — Case C/locked): defer the
+                # initial sync until AFTER the lock is released (fall out of
+                # the with-block; see call site 1/4 note).
+                needs_initial_sync = True
+            # Correct server/account but bw reports unauthenticated
+            # (e.g. inconclusive status payload) — fall through to login.
 
             # Case B: wrong server or account -> logout before reconfiguring.
-            if current_status in ("locked", "unlocked") and needs_reauth:
+            elif current_status in ("locked", "unlocked") and needs_reauth:
                 log.info("Session mismatch (server/account), logging out first...")
                 self._clear_session_locked()
                 self._bw.logout()
                 current_status = "unauthenticated"
 
             # Case A: not logged in -> config server + login + unlock.
+            # (Case B above deliberately falls into this block: its logout
+            # mutates current_status to "unauthenticated".)
             if current_status == "unauthenticated":
                 log.info("Not authenticated, configuring server and logging in...")
                 self._configure_server()
                 self._do_login()
                 self._do_unlock()
-                self._maybe_initial_sync()
-                return
+                # v0.7.5 CHANGE 1 (call site 3/4 — Case A): defer the initial
+                # sync until AFTER the lock is released (fall out of the
+                # with-block; see call site 1/4 note).
+                needs_initial_sync = True
 
-            # Unreachable in practice; treat as needing full re-auth.
-            self._configure_server()
-            self._do_login()
-            self._do_unlock()
+        # ------------------------------------------------------------------
+        # v0.7.5 CHANGE 1: SINGLE guarded initial-sync call — OUTSIDE the
+        # `with self._lock:` block above. The FSM state transitions (status
+        # probe, login, unlock) ran under the lock; the initial sync spawns
+        # subprocesses (5+ seconds) and must NOT hold the RLock while doing
+        # so. Its nested sync() -> run_with_recovery() -> get_session() chain
+        # then observes a fully settled UNLOCKED state with a valid session
+        # key, takes the get_session() fast path, and never re-enters this
+        # method (no duplicate unlock / duplicate sync loop).
+        # _maybe_initial_sync() internals (retry loop, WARNING budget,
+        # logging) are unchanged; it remains idempotent via its own
+        # _initial_sync_completed guard, so concurrent callers that all set
+        # the flag cannot double-sync.
+        # ------------------------------------------------------------------
+        if needs_initial_sync:
             self._maybe_initial_sync()
 
     def _configure_server(self) -> None:
