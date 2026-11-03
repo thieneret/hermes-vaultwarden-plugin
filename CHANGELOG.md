@@ -5,6 +5,24 @@ Author: **thieneret**
 
 ---
 
+## v0.7.5 (2026-11-03)
+
+### Fixed
+- Recursive `ensure_authenticated()` elimination: moved
+  `_maybe_initial_sync()` outside the `self._lock` block in
+  `ensure_authenticated()`. The sync subprocess no longer holds the
+  RLock, preventing re-entrant `get_session()` from re-entering the
+  FSM and spawning duplicate unlock + sync loops.
+- Session key stability during initial sync: the RLock is no longer
+  held for the duration of the sync subprocess (5+ seconds), closing
+  the window where concurrent lock/timeout checks could invalidate
+  the session mid-sync.
+- Write operations (`vaultwarden_store`) no longer fail with
+  "non-interactive unlock failed" after the first burst.
+
+### Tests
+- Added `test_recursive_auth_guard.py` regression suite (8 scenarios)
+
 ## v0.7.4 (2026-11-03)
 
 ### Fixed
