@@ -285,24 +285,33 @@ def test_get_session_fast_path_during_initial_sync(fake_bw, appdata, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# Scenarios 6 & 7: exactly one "Vault unlocked" and one "Initial sync
-# started" log line per ensure_authenticated() call.
+# Scenario 6: exactly ONE "Vault unlocked" log line per call (no duplicate
+# unlock).  Scenario 7: exactly ONE "Initial sync started" log line per
+# call (no duplicate sync loop).  Split into two tests so each scenario
+# fails independently.
 # ---------------------------------------------------------------------------
 
 
-def test_no_duplicate_unlock_or_sync_loop_logs(fake_bw, appdata, caplog):
+def test_no_duplicate_vault_unlocked_log(fake_bw, appdata, caplog):
     mgr = _make_manager(fake_bw, appdata)
 
     with caplog.at_level(logging.INFO, logger=AUTH_LOGGER):
         mgr.ensure_authenticated()
 
-    messages = [r.getMessage() for r in caplog.records
-                if r.name == AUTH_LOGGER]
-
-    unlocked = [m for m in messages if "Vault unlocked" in m]
+    unlocked = [r.getMessage() for r in caplog.records
+                if r.name == AUTH_LOGGER and "Vault unlocked" in r.getMessage()]
     assert len(unlocked) == 1, f"duplicate unlock logs: {unlocked!r}"
 
-    sync_started = [m for m in messages if "Initial sync started" in m]
+
+def test_no_duplicate_initial_sync_started_log(fake_bw, appdata, caplog):
+    mgr = _make_manager(fake_bw, appdata)
+
+    with caplog.at_level(logging.INFO, logger=AUTH_LOGGER):
+        mgr.ensure_authenticated()
+
+    sync_started = [r.getMessage() for r in caplog.records
+                    if r.name == AUTH_LOGGER
+                    and "Initial sync started" in r.getMessage()]
     assert len(sync_started) == 1, f"duplicate sync loops: {sync_started!r}"
 
 
