@@ -5,30 +5,6 @@ Author: **thieneret**
 
 ---
 
-## v0.7.7 (2026-11-04)
-
-### Fixed
-- Multi-process session invalidation: added SessionLockManager using
-  fcntl.flock() on .bw-data/.unlock.lck to coordinate concurrent bw
-  unlock calls from multiple processes (e.g., dashboard + gateway
-  sharing the same profile). Prevents the infinite invalidation loop
-  where each process's unlock invalidated the other's session key.
-
-### Added
-- SessionLockManager class with acquire/acquire_or_raise/release
-- _NullSessionLock no-op fallback for degraded mode (unusable appdata
-  dir, non-POSIX platforms)
-- session_lock_timeout_seconds config (default: 5.0, bounded [0, 30])
-- test_session_lock.py regression suite (23 scenarios)
-
-### Security
-- Lock file named .unlock.lck (deliberately avoids "session" substring
-  to keep the session-key-persistence security guard meaningful)
-- Lock file is mode 0600, zero bytes — no secrets written to disk
-
-### Tests
-- Total test count: 857 (was 832)
-
 ## v0.7.6 (2026-11-04)
 
 ### Fixed

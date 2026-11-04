@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.7.7**
+**Current version: v0.7.6**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -102,7 +102,6 @@ plugins:
         auto_sync: true
         sync_interval_seconds: 300
         session_timeout_seconds: 14400
-        session_lock_timeout_seconds: 5.0
         placeholder_ttl_seconds: 300
         max_placeholders: 50
         bw_cli_path: "/usr/local/bin/bw"   # REQUIRED, absolute path
@@ -203,7 +202,6 @@ Behavior and guarantees:
 | `auto_sync` | Sync vault before read operations. Default: `true` |
 | `sync_interval_seconds` | Auto-sync interval. Default: `300` |
 | `session_timeout_seconds` | Vault session lifetime. Default: `14400` (4h) |
-| `session_lock_timeout_seconds` | Timeout for acquiring the multi-process session lock when another process holds it. Default: 5.0, bounded [0, 30]. When timeout expires, unlock fails gracefully with AuthError (no crash). |
 | `placeholder_ttl_seconds` | Placeholder token lifetime. Default: `300` (5min) |
 | `max_placeholders` | Maximum active placeholders. Default: `50` |
 | `bw_cli_path` | **REQUIRED** FULL absolute path to the `bw` binary (e.g. `/usr/local/bin/bw`). There is NO PATH lookup and NO environment-variable override — config.yaml is the single source of truth. The path is validated before use: absolute, regular file, no symlink anywhere in the chain, executable, not group/world-writable, owned by root or the current user. If missing or invalid the plugin fails closed (does not load; the agent continues without it). |
@@ -370,7 +368,7 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **857 tests** — including positive-control suites for:
+Current suite: **832 tests** — including positive-control suites for:
 
 - Placeholder lifecycle (single-use, expiry, replay rejection)
 - Fail-closed behaviour (missing hooks, broken config, refused loads)
