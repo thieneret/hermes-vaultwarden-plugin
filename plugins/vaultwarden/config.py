@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -30,6 +31,43 @@ from . import compat, errors
 log = logging.getLogger("hermes.plugins.vaultwarden.config")
 
 PLUGIN_DIR = Path(__file__).resolve().parent
+
+
+# v0.7.7 (Phase 1, CHANGE 1): process role detection for multi-process
+# session separation.  Production evidence (2026-11-03): the Hermes Agent
+# runs TWO separate OS processes (dashboard + gateway) inside the same
+# container and BOTH load this plugin.  The Bitwarden CLI supports exactly
+# ONE session key per profile directory, so each ``bw unlock`` performed by
+# one process invalidated the other process's session key — an infinite
+# loop of empty reads and re-unlocks.  Fix: every process gets its OWN
+# appdata subdirectory under the configured base dir (see
+# auth.resolve_process_appdata_dir).  This is code-only (tests/docs land in
+# later phases).
+VALID_PROCESS_ROLES = ("dashboard", "gateway", "default")
+
+
+def detect_process_role() -> str:
+    """Detect the Hermes process role from sys.argv.
+
+    Returns:
+        "dashboard" — if argv contains the dashboard subcommand
+        "gateway"   — if argv contains the gateway subcommand
+        "default"   — fallback for unknown process types
+
+    This is the ONLY reliable way to distinguish the two processes:
+    env vars are identical across both (verified), but argv differs.
+    Detection is deterministic and deliberately depends on NO environment
+    variable (hard constraint).  Subcommands may appear as bare tokens or
+    as part of a longer path token (e.g. "/usr/local/bin/hermes-dashboard")
+    — substring matching covers both shapes; the substring "session" never
+    occurs in any produced role name (security-test compatibility).
+    """
+    argv_lower = [arg.lower() for arg in sys.argv]
+    if any("dashboard" in arg for arg in argv_lower):
+        return "dashboard"
+    if any("gateway" in arg for arg in argv_lower):
+        return "gateway"
+    return "default"
 
 _DEFAULTS: dict[str, Any] = {
     "enabled": False,

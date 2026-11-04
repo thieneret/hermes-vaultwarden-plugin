@@ -21,9 +21,9 @@ from typing import Any
 
 from . import compat
 from . import secrets as _secrets
-from .auth import AuthManager, ensure_appdata_dir
+from .auth import AuthManager, resolve_process_appdata_dir
 from .bw_cli import BwCli, find_bw_binary
-from .config import _sanitize_url_for_logging, load_config
+from .config import _sanitize_url_for_logging, detect_process_role, load_config
 from .hooks import (
     _cleanup_stale_secrets,
     _cleanup_stale_sockets,
@@ -188,8 +188,27 @@ def register(ctx: Any) -> bool:
     # exactly 0700; created hardened when missing, NEVER silently repaired).
     # A FilesystemSecurityError here aborts plugin activation through the
     # handler below (sanitized log + return False — no tools, no hooks).
+    #
+    # v0.7.7 (Phase 1, CHANGE 3): SUB DIR SESSION SEPARATION. Production
+    # testing (2026-11-03) proved the Hermes Agent runs TWO OS processes
+    # (dashboard + gateway) in one container and BOTH load this plugin;
+    # sharing one .bw-data profile means every second `bw unlock`
+    # invalidates the first process's session key (Bitwarden CLI supports
+    # exactly ONE session key per profile), causing an infinite empty-read /
+    # re-unlock loop. The config-specified directory is now only the BASE
+    # dir: each process unlocks inside its OWN hardened subdirectory
+    # (<base>/dashboard, <base>/gateway, <base>/default). Role detection is
+    # deterministic from sys.argv ONLY (env vars are identical across both
+    # processes and cannot distinguish them). No file locking (the reverted
+    # v0.7.7 lock approach is abandoned), no migration (development stage).
     try:
-        appdata_dir = ensure_appdata_dir(config.appdata_dir())
+        role = detect_process_role()
+        base_appdata = config.appdata_dir()
+        # INFO log BEFORE resolution so "Process role detected" precedes the
+        # "Process-specific appdata dir ready" line emitted by the resolver.
+        log.info("Process role detected: %s; using appdata subdir: %s",
+                 role, Path(base_appdata).expanduser() / role)
+        appdata_dir = resolve_process_appdata_dir(base_appdata, role)
     except Exception as exc:
         log.warning("Vaultwarden plugin load FAILED: appdata isolation error: %s", exc)
         return False
@@ -200,9 +219,11 @@ def register(ctx: Any) -> bool:
     # register() completes well within Hermes's 10s plugin-load timeout.
     try:
         config.validate()
-        # v0.3.8 (VWP-10): wire the retry/backoff config options through.
+        # v0.3.8 (VWP-10): wire the retry/backoff parameters through.
         # (The task spec pointed at auth.py, but the only production BwCli(...)
         # constructor call lives here — auth.py receives the instance.)
+        # v0.7.7 (CHANGE 3): BwCli receives the PROCESS-SPECIFIC SUBDIR
+        # (appdata_dir), never the config base dir.
         bw = BwCli(
             bw_path, appdata_dir,
             max_retries=config.bw_max_retries,
@@ -216,7 +237,9 @@ def register(ctx: Any) -> bool:
         )
         auth = AuthManager(bw, config,
                            client_secret=client_secret,
-                           master_password=master_password)
+                           master_password=master_password,
+                           # v0.7.7 (CHANGE 4): report which role serves.
+                           process_role=role)
         # UNINITIALIZED -> CONFIGURED transition only; NO bw subprocess here.
         auth.configure_server_if_needed()
         log.info("AuthManager created (auth deferred to first tool use)")
@@ -352,7 +375,13 @@ def register(ctx: Any) -> bool:
         register_secret_source(ctx, auth, config, mappings)
 
     PLUGIN_STATE.update({"auth": auth, "registry": registry,
-                         "config": config, "bw": bw})
+                         "config": config, "bw": bw,
+                         # v0.7.7 (Phase 1): introspection surface — the
+                         # detected process role and the process-specific
+                         # appdata SUBDIR actually handed to BwCli (the base
+                         # dir stays available via config.appdata_dir()).
+                         # Plain strings/paths, no secret material.
+                         "process_role": role, "appdata_dir": appdata_dir})
     # HVA-02 (v0.7.1): the server URL is sanitized to scheme://host[:port]
     # so user-info / query / fragment material never reaches the logs.
     log.info("Vaultwarden plugin ACTIVE (server=%s, write=%s, auth=deferred).",
