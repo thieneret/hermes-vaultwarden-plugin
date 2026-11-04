@@ -1361,7 +1361,11 @@ class AuthManager:
             # manager serves ("dashboard" / "gateway" / "default") — lets
             # operators verify multi-process session separation is active.
             # Whitelist-constrained plain string; never secret material.
-            "process_role": self._process_role,
+            # getattr() fallback: hand-built managers (tests that bypass
+            # __new__-based construction) default to deterministic sys.argv
+            # detection rather than AttributeError.
+            "process_role": getattr(self, "_process_role", None)
+                            or detect_process_role(),
             "allow_write": self._config.allow_write,
             "last_sync": self._last_sync,
         }

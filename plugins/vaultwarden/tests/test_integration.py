@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -283,7 +284,7 @@ def test_concurrent_tool_calls(monkeypatch, tmp_path, fake_bw):
 def test_on_session_end_hook_locks_vault(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     auth = vaultwarden.PLUGIN_STATE["auth"]
-    appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    appdata = Path(vaultwarden.PLUGIN_STATE["appdata_dir"])
     # v0.1.9 lazy auth: authenticate first so there IS a live session to lock.
     tools = _dict_tools({t["name"]: t["handler"] for t in ctx.tools})
     assert tools["vaultwarden_list"]({})["total"] == 3
@@ -345,7 +346,7 @@ def test_first_tool_call_triggers_lazy_auth(monkeypatch, tmp_path, fake_bw):
     ok, ctx = _register_ok(monkeypatch, tmp_path, fake_bw)
     assert ok is True
     auth = vaultwarden.PLUGIN_STATE["auth"]
-    appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    appdata = Path(vaultwarden.PLUGIN_STATE["appdata_dir"])
     # Deferred: no server config / login happened during register().
     assert not (appdata / "server.txt").exists()
     assert not (appdata / "fake-logged-in").exists()
@@ -370,7 +371,7 @@ def test_restart_reuses_session_without_reconfig_or_logout(monkeypatch, tmp_path
     assert tools["vaultwarden_list"]({})["total"] == 3   # lazy auth completes
 
     cli = vaultwarden.PLUGIN_STATE["bw"]
-    appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    appdata = Path(vaultwarden.PLUGIN_STATE["appdata_dir"])
     # Restart realism: the fake bw only persists login/unlock markers; a real
     # bw keeps its server URL in data.json. Seed it so the fresh manager can
     # recognise the correct server from `bw status` alone.
@@ -411,7 +412,7 @@ def test_wrong_account_triggers_logout_then_reauth(monkeypatch, tmp_path, fake_b
     tools["vaultwarden_list"]({})                # session up as user 1111...
 
     cli = vaultwarden.PLUGIN_STATE["bw"]
-    appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    appdata = Path(vaultwarden.PLUGIN_STATE["appdata_dir"])
     # Stale foreign account on the same profile (e.g. manual `bw login`).
     (appdata / "fake-user-id").write_text("deadbeef-0000-0000-0000-000000000000")
 
@@ -448,7 +449,7 @@ def test_wrong_server_triggers_logout_then_reconfig(monkeypatch, tmp_path, fake_
     assert ok is True
     vaultwarden.PLUGIN_STATE["auth"].ensure_authenticated()  # idempotent fast path
 
-    appdata = vaultwarden.PLUGIN_STATE["config"].appdata_dir()
+    appdata = Path(vaultwarden.PLUGIN_STATE["appdata_dir"])
     (appdata / "server.txt").write_text("https://old.vault.example.net")
 
     cli = vaultwarden.PLUGIN_STATE["bw"]
