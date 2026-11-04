@@ -17,7 +17,6 @@ Session key rules:
 """
 from __future__ import annotations
 
-import atexit
 import enum
 import json
 import os
@@ -25,11 +24,6 @@ import re
 import threading
 import time
 from pathlib import Path
-
-try:  # v0.7.7 Phase 1: POSIX advisory locking (fcntl is Unix-only).
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX platform fallback
-    fcntl = None  # type: ignore[assignment]
 
 from . import compat, errors
 from .bw_cli import BwCli
@@ -71,154 +65,6 @@ def _initial_sync_failure_summary(exc: BaseException) -> str:
         if m2:
             parts.append(f"status={m2.group(1)}")
     return " ".join(parts)
-
-
-class SessionLockManager:
-    """Multi-process session coordination via POSIX advisory locking.
-
-    v0.7.7 (Phase 1): ensures only ONE process can hold the bw unlock
-    lock at a time, preventing session key invalidation races between
-    the dashboard and gateway processes sharing the same .bw-data dir.
-
-    Bitwarden CLI supports exactly ONE session key per profile; two
-    AuthManager instances unlocking independently invalidate each other's
-    key in an endless loop (production evidence 2026-11-03 23:01-23:05).
-    This manager serializes the unlock critical section with an exclusive
-    advisory lock on ``.bw-data/.unlock.lck``.
-
-    Uses ``fcntl.flock()`` with ``LOCK_EX | LOCK_NB`` + polling (non-blocking
-    attempts until timeout). The lock file itself contains NO secrets —
-    it is a pure coordination primitive (mode 0600, zero bytes written).
-
-    v0.7.7 naming note: the lock file is ``.bw-data/.unlock.lck`` — its name
-    deliberately avoids the substring "session" so it can never be confused
-    with bw's own ``.bw-data/session-*`` key files, and so the security
-    invariant "no session-named file in the profile dir" (test_session_key_
-    not_persisted_to_disk) keeps guarding BW_SESSION persistence.
-    """
-
-    def __init__(self, appdata_dir: Path, timeout_seconds: float = 5.0):
-        self._lock_path = appdata_dir / ".unlock.lck"
-        self._timeout = timeout_seconds
-        self._lock_fd: int | None = None
-        self._held = False
-        # Guarantee release on interpreter exit even if shutdown() never runs.
-        atexit.register(self.release)
-
-    def acquire(self) -> bool:
-        """Acquire exclusive lock. True on success, False on timeout.
-
-        Non-blocking attempt first; on contention, polls with a short sleep
-        until the configured deadline. Never crashes — callers decide how
-        to handle a False return (graceful degradation).
-        """
-        if self._held:
-            return True  # re-entrant: this instance already holds the lock
-        if fcntl is None:  # pragma: no cover - non-POSIX platform fallback
-            log.warning("fcntl unavailable; session lock disabled.")
-            return True
-        try:
-            self._lock_fd = os.open(str(self._lock_path),
-                                    os.O_CREAT | os.O_RDWR, 0o600)
-        except OSError as exc:
-            # Sanitized: exception TYPE name only, never path details beyond
-            # the directory we own (no secret material rides this path).
-            log.warning("Cannot create session lock file: %s",
-                        type(exc).__name__)
-            return False
-        # Fast path: non-blocking exclusive lock.
-        try:
-            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self._held = True
-            log.info("Session lock acquired")
-            return True
-        except OSError:
-            pass  # Lock held by another process — fall through to polling.
-        # Poll until timeout (never a blocking flock — deterministic budget).
-        deadline = time.monotonic() + self._timeout
-        while time.monotonic() < deadline:
-            time.sleep(0.1)
-            try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._held = True
-                log.info("Session lock acquired after wait")
-                return True
-            except OSError:
-                continue
-        # Timeout: fail gracefully (WARNING logged; caller raises AuthError).
-        log.warning("Session lock acquisition timed out after %.1fs",
-                    self._timeout)
-        self._close_fd()
-        return False
-
-    def acquire_or_raise(self) -> None:
-        """Acquire the lock or raise a sanitized AuthError.
-
-        Single-statement entry point for _do_unlock(): keeps the method's
-        top-level AST free of extra If-guards (v0.7.2 invariant enforced by
-        test_do_unlock_has_no_early_return_guard) while still failing closed.
-        """
-        if not self.acquire():
-            raise errors.AuthError(
-                "Failed to acquire session lock (another process may be "
-                "unlocking the vault). Retry after a few seconds.",
-                suggestion="Check if another Hermes process is using "
-                           "the same .bw-data directory.")
-
-    def release(self) -> None:
-        """Release the lock and close the file descriptor (idempotent)."""
-        if not self._held:
-            self._close_fd()
-            return
-        try:
-            if self._lock_fd is not None and fcntl is not None:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            self._held = False
-            log.info("Session lock released")
-        except OSError as exc:  # noqa: BLE001 - best-effort cleanup
-            log.warning("Error releasing session lock: %s",
-                        type(exc).__name__)
-        finally:
-            self._close_fd()
-
-    def _close_fd(self) -> None:
-        """Close the lock file descriptor if open."""
-        if self._lock_fd is not None:
-            try:
-                os.close(self._lock_fd)
-            except OSError:
-                pass
-            self._lock_fd = None
-
-    @property
-    def is_held(self) -> bool:
-        """True if this instance currently holds the advisory lock."""
-        return self._held
-
-
-class _NullSessionLock:
-    """No-op stand-in used when the appdata dir is unusable (degraded mode).
-
-    v0.7.7 (Phase 1): test doubles hand us MagicMock attributes where a real
-    path is expected, and non-POSIX platforms lack fcntl entirely. In those
-    cases the multi-process coordination primitive degrades to a no-op that
-    never blocks and never fails — preserving pre-v0.7.7 single-process
-    behavior instead of crashing the constructor. Interface mirrors
-    SessionLockManager.
-    """
-
-    def acquire(self) -> bool:
-        return True
-
-    def acquire_or_raise(self) -> None:
-        pass  # no-op: lock disabled
-
-    def release(self) -> None:
-        pass
-
-    @property
-    def is_held(self) -> bool:
-        return True
 
 
 class AuthState(str, enum.Enum):
@@ -323,48 +169,6 @@ class AuthManager:
         # only (spec); direct sync() callers never see it set and keep the
         # Phase 1 "Sync failed (...)" WARNING unchanged.
         self._sync_warn_suppressed: bool = False
-        # v0.7.7 (Phase 1, CHANGE 3): multi-process session coordination.
-        # Bitwarden CLI supports exactly ONE session key per profile — two
-        # AuthManager instances (e.g. dashboard + gateway) unlocking the same
-        # .bw-data dir invalidate each other's key in an endless loop. The
-        # lock serializes the unlock critical section via fcntl.flock() on
-        # `.bw-data/.unlock.lck` (pure coordination primitive; NO secrets
-        # ever written to it).
-        #
-        # Defensive appdata resolution: test doubles hand us MagicMock
-        # attributes where a real path is expected (Path(MagicMock()) raises
-        # TypeError) — in that degraded mode the lock becomes a no-op instead
-        # of crashing the constructor. getattr() keeps MagicMock configs from
-        # injecting a non-numeric timeout into float().
-        #
-        # Pre-check is_dir(): bw creates `.bw-data` lazily, so at AuthManager
-        # construction time the directory may not exist yet. Locking inside a
-        # nonexistent dir would fail closed on the very first unlock; instead
-        # we degrade to the no-op lock here and keep acquire() semantics
-        # strict (real lock => real failure handling).
-        _appdata_for_lock: Path | None
-        try:
-            _appdata_for_lock = Path(self._bw.appdata_dir)
-        except (TypeError, ValueError, OSError):
-            _appdata_for_lock = None  # degraded mode: lock disabled
-        if _appdata_for_lock is not None:
-            try:
-                _appdata_is_dir = _appdata_for_lock.is_dir()
-            except OSError:
-                _appdata_is_dir = False
-            if not _appdata_is_dir:
-                _appdata_for_lock = None  # degraded mode: lock disabled
-        if _appdata_for_lock is not None and fcntl is not None:
-            _lock_timeout_cfg = getattr(
-                self._config, "session_lock_timeout_seconds", 5.0)
-            try:
-                _lock_timeout = float(_lock_timeout_cfg)
-            except (TypeError, ValueError):
-                _lock_timeout = 5.0
-            self._session_lock = SessionLockManager(
-                _appdata_for_lock, timeout_seconds=_lock_timeout)
-        else:
-            self._session_lock = _NullSessionLock()
 
     # ------------------------------------------------------------ properties
     @property
@@ -877,16 +681,6 @@ class AuthManager:
                 "master password unavailable; cannot unlock "
                 "non-interactively. Verify master_password in secrets.yaml "
                 "and re-bootstrap.")
-        # v0.7.7 (Phase 1, CHANGE 4): acquire the multi-process session lock
-        # BEFORE spawning `bw unlock` — Bitwarden CLI keeps exactly ONE
-        # session key per profile, so an unsynchronized second process would
-        # silently invalidate the first one's key (production invalidation
-        # loop, 2026-11-03). Plain statement that raises AuthError internally
-        # on timeout — adds NO top-level If/Return here, preserving the
-        # v0.7.2 single-guard AST invariant (test_do_unlock_has_no_early_
-        # return_guard). getattr fallback: tests build managers via
-        # AuthManager.__new__() without running __init__.
-        getattr(self, "_session_lock", _NullSessionLock()).acquire_or_raise()
         try:
             key = self._bw.unlock_passwordenv(self._master_password)
         except errors.VaultwardenError as exc:
@@ -913,13 +707,6 @@ class AuthManager:
         # references, and no execution-scoped release can ever drop it while
         # the vault stays unlocked.
         get_redacting_filter().register_process_scoped_secret(key)
-        # v0.7.7 (Phase 1, CHANGE 4): hand off — release the coordination
-        # lock now that this process owns a fresh session key. The unlock
-        # critical section is over; holding the lock any longer would make
-        # a peer wait needlessly on its own recovery path. Plain statement:
-        # no top-level If added (AST invariant preserved). getattr fallback
-        # for managers built via AuthManager.__new__() in tests.
-        getattr(self, "_session_lock", _NullSessionLock()).release()
         log.info("Vault unlocked; session key held in plugin memory only.")
 
     # -------------------------------------------------------- session mgmt
@@ -1354,11 +1141,6 @@ class AuthManager:
         get_session() down the unlock-only branch, which cannot succeed
         without a key. LOGGED_OUT keeps every recovery path on the full-FSM
         branch (status probe reconciles the real bw login state anyway).
-
-        v0.7.7 (Phase 1, CHANGE 5): also releases the multi-process session
-        coordination lock — idempotent no-op when the lock was never held
-        (or is disabled in degraded mode), so a peer process can enter its
-        own unlock critical section afterwards.
         """
         with self._lock:
             key = self._session_key
@@ -1366,9 +1148,6 @@ class AuthManager:
                 self._bw.lock(key)
             self._clear_session_locked()
             self._state = AuthState.LOGGED_OUT
-            # getattr fallback: managers built via AuthManager.__new__() in
-            # tests skip __init__ and have no _session_lock attribute.
-            getattr(self, "_session_lock", _NullSessionLock()).release()
             log.info("Vault locked; session cleared from plugin memory.")
 
     def shutdown(self, *, keep_appdata: bool = True) -> None:
@@ -1376,10 +1155,6 @@ class AuthManager:
         try:
             self.lock()
         finally:
-            # v0.7.7 (Phase 1, CHANGE 5): belt-and-braces release of the
-            # coordination lock even if lock() raised on the way out
-            # (atexit remains the last-resort cleanup).
-            getattr(self, "_session_lock", _NullSessionLock()).release()
             if not keep_appdata:  # pragma: no cover - destructive, off by default
                 log.debug("keep_appdata=False requested; leaving .bw-data untouched for safety.")
 

@@ -69,12 +69,6 @@ _DEFAULTS: dict[str, Any] = {
     # retried; AuthError/SessionError fail fast.
     "initial_sync_max_attempts": 3,
     "initial_sync_retry_delay_seconds": 10.0,
-    # v0.7.7 (Phase 1): timeout (seconds) for acquiring the multi-process
-    # session lock (.bw-data/.session.lock) when another process holds it.
-    # On timeout the unlock attempt fails gracefully (sanitized AuthError),
-    # never crashes. Bounded to [0, 30] so a hostile/typo config cannot make
-    # a tool call hang past the plugin's subprocess timeout ceiling.
-    "session_lock_timeout_seconds": 5.0,
     "session_timeout_seconds": 14400,
     "placeholder_ttl_seconds": 300,
     "max_placeholders": 50,
@@ -276,21 +270,6 @@ class PluginConfig:
         except (TypeError, ValueError):
             value = 10.0
         return max(0.0, min(value, 10.0))
-
-    @property
-    def session_lock_timeout_seconds(self) -> float:
-        """Timeout for acquiring the multi-process session lock (seconds).
-
-        v0.7.7 (Phase 1): coordinates concurrent ``bw unlock`` calls from
-        multiple processes sharing the same .bw-data profile directory
-        (dashboard + gateway). Bounded [0, 30] — a hostile/typo config can
-        never make an unlock wait past the subprocess timeout ceiling.
-        """
-        try:
-            value = float(self._raw("session_lock_timeout_seconds"))
-        except (TypeError, ValueError):
-            value = 5.0
-        return max(0.0, min(value, 30.0))
 
     @property
     def session_timeout_seconds(self) -> int:
