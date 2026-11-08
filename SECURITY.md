@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.7.6
+**Applies to:** v0.7.7
 
 ## Threat Model
 
@@ -135,6 +135,17 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     with sanitized status/error codes only � the session key value is never
     passed to `bw status`'s command line (env-only), never logged, and never
     written to disk.)
+
+- Threat: Multi-process session invalidation — the Hermes dashboard and
+  gateway run as two separate OS processes in the same container, both
+  loading the vaultwarden plugin. The Bitwarden CLI supports only one
+  session key per profile, so each process's unlock invalidated the other's
+  key, causing an infinite loop of empty reads and re-unlocks.
+- Control: Each process uses its own subdirectory under the configured base
+  appdata directory (dashboard/, gateway/, default/). Role is detected from
+  sys.argv. Subdirectories are hardened via secure_fs (mode 0700, correct
+  owner, non-symlink). Hostile role names fall back to 'default' with no
+  path traversal.
 
 ## Primary Security Controls
 
