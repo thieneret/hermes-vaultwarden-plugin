@@ -116,7 +116,7 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     log messages carry sanitized error codes only â€” never secret values or
     raw exception text.)
 19. **Multi-process session invalidation** (the Hermes Agent can load the
-    vaultwarden plugin TWICE into two separate AuthManager instances — e.g.
+    vaultwarden plugin TWICE into two separate AuthManager instances â€” e.g.
     a dashboard process and a gateway process sharing the same plugin
     directory. Each AuthManager bootstraps independently, but `bw` supports
     only ONE session key per profile: the second unlock silently invalidates
@@ -124,17 +124,18 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     return exit 0 with an empty list against the locked local cache, which
     the v0.7.3 empty-read defense (conditions 1 & 2) does not catch because
     the stale manager still reports UNLOCKED with a valid-looking key and a
-    populated sync timestamp. Mitigated by v0.7.6 defense-in-depth: a third
-    suspect condition in `_reconcile_empty_read()` verifies the session key
-    via `BwCli.verify_session()` (`bw status` called with BW_SESSION, never
-    the persistent profile), and on "locked"/"unauthenticated" forces a
-    re-unlock through the AuthManager FSM and retries the read exactly once.
-    Zero overhead on non-empty reads; bounded to one probe + one re-unlock +
-    one retry per original read (no loops); degrades to the original empty
-    result on any failure. Detection and recovery are logged at WARNING/INFO
-    with sanitized status/error codes only — the session key value is never
-    passed to `bw status`'s command line (env-only), never logged, and never
-    written to disk.)
+    populated sync timestamp. Mitigated by **v0.7.7 sub-dir session
+    separation** (primary fix): each Hermes process now uses its own
+    subdirectory under the configured base appdata dir (dashboard/, gateway/,
+    default/), eliminating the session conflict entirely. Process role is
+    detected from sys.argv (env vars are identical across processes and
+    cannot distinguish them). Subdirectories are hardened via secure_fs
+    (mode 0700, correct owner, no symlinks); hostile role names fall back to
+    'default' with no path traversal. As defense-in-depth, the **v0.7.6
+    verify_session() defense** remains active: if a session key is externally
+    invalidated for any reason, the third suspect condition in
+    `_reconcile_empty_read()` detects it via `BwCli.verify_session()` and
+    forces a re-unlock + retry.)
 
 - Threat: Multi-process session invalidation â€” the Hermes dashboard and
   gateway run as two separate OS processes in the same container, both
