@@ -5,6 +5,38 @@ Author: **thieneret**
 
 ---
 
+## v0.7.7 (2026-11-08)
+
+### Fixed
+- Multi-process session invalidation: the dashboard and gateway processes
+  (two separate OS processes in the same container) both loaded the plugin
+  and unlocked the same bw profile, invalidating each other's session key.
+  Each process now uses its own subdirectory under the configured base
+  appdata dir (.bw-data/dashboard, .bw-data/gateway, .bw-data/default),
+  eliminating the session conflict entirely.
+
+### Added
+- detect_process_role(): deterministic process role detection from sys.argv
+  (dashboard / gateway / default); env vars cannot distinguish the processes
+- resolve_process_appdata_dir(): creates and hardens the process-specific
+  subdirectory via the existing secure_fs layer
+- process_role field in vaultwarden_status output
+- test_subdir_separation.py regression suite (24 scenarios)
+
+### Security
+- Subdirectories validated via secure_fs (mode 0700, correct owner, no
+  symlinks); hostile role names fall back to 'default' (no path traversal)
+- Subdirectory names deliberately avoid the "session" substring
+
+### Changed
+- BwCli now receives the process-specific subdirectory as its appdata dir
+  (previously the flat base directory)
+- Development stage: no backward compatibility or data migration from the
+  old flat .bw-data layout
+
+### Tests
+- Total test count: 865 (was 832)
+
 ## v0.7.6 (2026-11-04)
 
 ### Fixed

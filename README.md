@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.7.6**
+**Current version: v0.7.7**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -111,6 +111,12 @@ plugins:
         bw_max_delay: 10.0
 ```
 
+The configured appdata directory acts as a **BASE** directory. The plugin
+creates a process-specific subdirectory inside it based on the detected
+Hermes process role (`dashboard/`, `gateway/`, or `default/`), so that
+multiple Hermes processes in the same container do not invalidate each
+other's Vaultwarden session.
+
 ### `secrets.yaml` (bootstrap secrets)
 
 Bootstrap secrets are loaded from a plugin-private YAML file that the plugin
@@ -220,7 +226,7 @@ The plugin exposes 12 tools to the Hermes agent. The LLM constructs the exact to
 
 | Tool | Purpose | Requires `allow_write` |
 | --- | --- | :-: |
-| `vaultwarden_status` | Plugin health: auth state, session, server config, plugin version. Distinguishes the plugin's actual operational capability (`operational`, `session_key_available`) from the Bitwarden CLI persistent-profile state (`bw_profile_state`, which normally reads `locked` by design). Reports cache freshness: `cache_populated` (bool) — whether the local vault cache has been populated at least once; `initial_sync_completed` (bool) — whether the initial sync succeeded. `operational` is `true` only when BOTH the session is valid AND the cache is populated | ❌ |
+| `vaultwarden_status` | Plugin health: auth state, session, server config, plugin version. Distinguishes the plugin's actual operational capability (`operational`, `session_key_available`) from the Bitwarden CLI persistent-profile state (`bw_profile_state`, which normally reads `locked` by design). Reports cache freshness: `cache_populated` (bool) — whether the local vault cache has been populated at least once; `initial_sync_completed` (bool) — whether the initial sync succeeded. `operational` is `true` only when BOTH the session is valid AND the cache is populated. `process_role` reports which Hermes process — dashboard / gateway / default — is serving this instance | ❌ |
 | `vaultwarden_sync` | Sync vault (`force=true` bypasses auto-sync interval) | ❌ |
 | `vaultwarden_list` | List items — metadata only | ❌ |
 | `vaultwarden_search` | Search items by name/username/uri — metadata only | ❌ |
@@ -368,7 +374,7 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **832 tests** — including positive-control suites for:
+Current suite: **865 tests** — including positive-control suites for:
 
 - Placeholder lifecycle (single-use, expiry, replay rejection)
 - Fail-closed behaviour (missing hooks, broken config, refused loads)

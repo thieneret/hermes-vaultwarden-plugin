@@ -27,7 +27,12 @@ from pathlib import Path
 
 from . import compat, errors
 from .bw_cli import BwCli
-from .config import PluginConfig, _sanitize_url_for_logging
+from .config import (
+    VALID_PROCESS_ROLES,
+    PluginConfig,
+    _sanitize_url_for_logging,
+    detect_process_role,
+)
 from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
 from .security import get_logger, get_redacting_filter
 
@@ -102,11 +107,74 @@ def ensure_appdata_dir(path: str | Path) -> Path:
             suggestion="Check permissions of the plugin directory or set VW_APPDATA_DIR.") from exc
 
 
+def resolve_process_appdata_dir(base_dir: str | Path, role: str) -> Path:
+    """Resolve the process-specific appdata subdirectory (v0.7.7 Phase 1).
+
+    Root cause (production 2026-11-03): the dashboard and gateway Hermes
+    processes share ONE ``.bw-data`` profile, but the Bitwarden CLI supports
+    exactly one session key per profile — each second unlock invalidates the
+    first process's key (infinite empty-read / re-unlock loop). The fix is
+    isolation, not coordination: the config-specified directory becomes the
+    BASE dir and every process gets its OWN subdirectory inside it
+    (``.bw-data/dashboard``, ``.bw-data/gateway``, ``.bw-data/default``).
+
+    The base dir is validated/created first with the same hardened rules as
+    before (:func:`ensure_appdata_dir`), then the role subdirectory is
+    created and validated through the SAME secure_fs hardening layer
+    (absolute, real non-symlink directory, owned by the current effective
+    UID, mode exactly 0700 — never silently repaired). Subdirectory names
+    are drawn exclusively from ``config.VALID_PROCESS_ROLES`` — none of them
+    contains the substring "session" (security-test compatibility) and the
+    role is whitelist-validated so a hostile value can never become a path
+    traversal component.
+
+    Args:
+        base_dir: The config-specified base appdata directory.
+        role: The detected process role ("dashboard" / "gateway" / "default").
+
+    Returns:
+        The validated process-specific subdirectory path.
+
+    Raises:
+        FilesystemSecurityError: if either directory fails secure_fs
+            validation (fail-closed — ``bw`` must not be invoked against an
+            insecure appdata dir).
+        errors.AppdataError: if subdirectory creation fails at the OS level.
+    """
+    # Validate role name to prevent path traversal — any unknown/hostile
+    # role deterministically falls back to "default".
+    if role not in VALID_PROCESS_ROLES:
+        role = "default"
+
+    # Base dir first: identical fail-closed semantics as v0.7.6
+    # (ensure_appdata_dir wraps OS-level creation failures in AppdataError).
+    base = ensure_appdata_dir(base_dir)
+    subdir = base / role
+    try:
+        resolved = ensure_hardened_directory(subdir, create_if_missing=True)
+    except FilesystemSecurityError:
+        # Fail closed — never downgrade; register()/callers abort on this.
+        raise
+    except OSError as exc:
+        # Spec logging table: sanitized ERROR line (role + exception TYPE
+        # only — never secret values), then the AppdataError wrapper.
+        log.error(
+            "Cannot create process-specific appdata directory '%s' (%s)",
+            role, type(exc).__name__)
+        raise errors.AppdataError(
+            f"Cannot create process-specific appdata directory "
+            f"'{role}' ({type(exc).__name__}).",
+            suggestion="Check permissions of the plugin directory.") from exc
+    log.info("Process-specific appdata dir ready: %s", resolved)
+    return resolved
+
+
 class AuthManager:
     """Owns bw lifecycle: server config, apikey login, unlock, session refresh."""
 
     def __init__(self, bw: BwCli, config: PluginConfig, *,
-                 client_secret: str, master_password: str):
+                 client_secret: str, master_password: str,
+                 process_role: str | None = None):
         # FAIL-9 ordering fix: register the bootstrap secrets with the shared
         # RedactingFilter FIRST — before any attribute assignment or log call
         # can possibly echo them. Everything below is scrubbed from here on.
@@ -121,6 +189,18 @@ class AuthManager:
         redactor.register_process_scoped_secret(master_password)
         self._bw = bw
         self._config = config
+        # v0.7.7 (Phase 1, CHANGE 4): process role for multi-process session
+        # separation — stored for status_snapshot() operator visibility.
+        # Explicit roles are whitelist-sanitized (never a path-traversal or
+        # free-text value); when omitted, fall back to deterministic sys.argv
+        # detection (config.detect_process_role — NEVER env vars). Plain
+        # string, no secret material involved.
+        if process_role is not None:
+            self._process_role = (process_role
+                                  if process_role in VALID_PROCESS_ROLES
+                                  else "default")
+        else:
+            self._process_role = detect_process_role()
         self._client_id = config.client_id
         self._client_secret = client_secret
         self._master_password = master_password
@@ -1277,6 +1357,15 @@ class AuthManager:
                 "userId": bw_status.get("userId"),
             },
             "appdata_dir": self._bw.appdata_dir,
+            # v0.7.7 (Phase 1, CHANGE 4): which Hermes process role this
+            # manager serves ("dashboard" / "gateway" / "default") — lets
+            # operators verify multi-process session separation is active.
+            # Whitelist-constrained plain string; never secret material.
+            # getattr() fallback: hand-built managers (tests that bypass
+            # __new__-based construction) default to deterministic sys.argv
+            # detection rather than AttributeError.
+            "process_role": getattr(self, "_process_role", None)
+                            or detect_process_role(),
             "allow_write": self._config.allow_write,
             "last_sync": self._last_sync,
         }
