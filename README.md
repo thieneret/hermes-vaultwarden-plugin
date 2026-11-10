@@ -80,6 +80,96 @@ uv pip install -e ".[dev]"
 This installs `pytest`, `ruff`, and `mypy` without affecting the
 production Hermes runtime.
 
+## Docker Backend Setup (placeholder injection)
+
+The plugin's placeholder injection writes secret temp files to
+`$XDG_RUNTIME_DIR/vw-secrets` (tmpfs, never on disk). Whether extra
+setup is needed depends on your terminal backend and where the Hermes
+gateway runs:
+
+| Gateway location | Terminal backend | Extra setup needed |
+| --- | --- | --- |
+| Docker container | `local` | ❌ None |
+| Docker container | `docker` | ✅ Shared tmpfs (Docker volume) |
+| Host (bare metal) | `local` | ❌ None |
+| Host (bare metal) | `docker` | ✅ Bind mount host tmpfs into sandbox |
+
+With the `local` backend the gateway and the command share one filesystem,
+so the secret file is visible to both. With the `docker` backend the
+sandbox runs in a separate container with its OWN private
+`/run/user/1000` tmpfs, so the secret file must be shared explicitly.
+
+### Option A: Gateway in Docker — shared tmpfs volume
+
+Create a shared tmpfs-backed Docker volume (one-time):
+
+    docker volume create vw-secrets \
+      --driver local \
+      --opt type=tmpfs \
+      --opt device=tmpfs \
+      --opt o=size=100m,uid=1000,gid=1000,mode=0700
+
+Mount it into the Hermes gateway container (docker-compose.yml):
+
+    services:
+      hermes:
+        volumes:
+          - vw-secrets:/run/user/1000/vw-secrets
+    volumes:
+      vw-secrets:
+        external: true
+
+And into the sandbox via the Hermes Agent config (see config.yaml
+example below). Both containers then see the SAME tmpfs at the SAME
+path.
+
+### Option B: Gateway on host — bind mount host tmpfs
+
+The host's `/run/user/1000` is already a tmpfs created by systemd-logind.
+Bind mount ONLY the `vw-secrets` subdirectory into the sandbox via the
+Hermes Agent config (see config.yaml example below). The directory must
+exist and be owned by the gateway user before the sandbox starts:
+
+    mkdir -p /run/user/1000/vw-secrets
+    chmod 700 /run/user/1000/vw-secrets
+
+Note: `/run/user/1000` is recreated empty on every boot. To make the
+subdirectory persistent across reboots, add a systemd user service or a
+tmpfiles.d entry (see your OS documentation).
+
+### Minimum config.yaml for the docker backend
+
+The minimum `terminal` settings required for placeholder injection to
+work with the docker backend (all three keys are documented in the
+Hermes Agent docs, see "Configuration → Docker Backend" and
+"Docker Setup"):
+
+    terminal:
+      backend: docker
+      docker_run_as_host_user: true        # sandbox runs as the gateway's UID
+      docker_volumes:
+        - vw-secrets:/run/user/1000/vw-secrets          # Option A (gateway in Docker)
+        # - /run/user/1000/vw-secrets:/run/user/1000/vw-secrets  # Option B (gateway on host)
+
+- `docker_run_as_host_user: true` makes the sandbox run with the same
+  UID/GID as the gateway, so the sandbox can read the chmod 600 secret
+  file written by the gateway.
+- `docker_volumes` shares the tmpfs between the gateway and the sandbox.
+  Use the Docker volume name (Option A) or the host path (Option B).
+
+### Security notes
+
+- The secret temp files live on **tmpfs (RAM)** by design — they are
+  never written to disk and disappear on reboot. Do NOT replace the
+  tmpfs with a disk-backed directory.
+- Share ONLY the `vw-secrets` subdirectory. NEVER bind mount the whole
+  `/run/user/1000` into the sandbox — it contains the user's full
+  session infrastructure (D-Bus socket, keyring, GPG, PipeWire, etc.),
+  and exposing it to the sandbox is a privilege-escalation risk.
+- The UID of the gateway, the sandbox, and the tmpfs owner must match
+  (typically 1000), otherwise the sandbox gets EACCES reading the
+  chmod 600 secret file.
+
 ## Configuration
 
 ### `config.yaml`
