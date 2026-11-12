@@ -16,10 +16,22 @@ Author: **thieneret**
   only when the execution has injected secrets. Prevents credential leakage
   when git/tool error lines reprint a credentialed URL.
 
+### Fixed (cosmetic)
+- `vaultwarden_store` / `vaultwarden_update` with `generate=true` now return
+  the `$`-prefixed user-facing placeholder in `password_placeholder`, matching
+  `vaultwarden_get_secret_ref` (previously the bare internal token). Internal
+  registry tokens remain bare; a single shared helper produces the user-facing
+  form. SSH `generate=true` responses intentionally carry no placeholder
+  (contract-tested); no SSH behavior change.
+
 ### Tests
 - Added 5 redaction regression tests (raw, URL-encoded, credentialed-URL,
-  no-userinfo no-op, empty-context no-op). Suite: 882 collected /
-  878 passed / 4 skipped / 0 failed.
+  no-userinfo no-op, empty-context no-op).
+- Added a `$`-prefix consistency test across all LLM-facing placeholder
+  response fields, and SSH generate no-placeholder contract asserts
+  (store_ssh / update_ssh); the existing store/update generate tests were
+  updated for the user-facing form. Suite: 883 collected / 879 passed /
+  4 skipped / 0 failed.
 
 ## v0.7.8 (2026-11-13)
 
