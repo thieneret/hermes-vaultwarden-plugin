@@ -114,10 +114,21 @@ def test_resolve_socket_symlink_rejected(tmp_path):
 # ── Stale socket cleanup (plugin startup) ────────────────────────────────
 
 def test_cleanup_stale_sockets_removes_stale(tmp_path):
-    """Socket file exists but no agent running → removed at startup."""
+    """Socket file exists but no agent running → removed at startup.
+
+    HVA-04 (v0.7.8): the stale object is modeled as a REAL AF_UNIX socket —
+    the cleanup gate refuses to unlink non-socket placeholders, which is
+    the hardened behavior, not a regression.
+    """
+    import socket as socket_mod
+
     from vaultwarden.hooks import _cleanup_stale_sockets
     stale = tmp_path / "auth.sock"
-    stale.write_text("")  # placeholder file standing in for the socket
+    s = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    try:
+        s.bind(str(stale))
+    finally:
+        s.close()  # leaves the socket FILE on disk, unbound = stale
     with patch.dict(os.environ, {
             "VW_SSH_SOCKET_PATH": str(stale),
             "XDG_RUNTIME_DIR": ""}, clear=False):
