@@ -18,8 +18,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -983,6 +985,53 @@ def _validate_ssh_key_file(path: str) -> None:
             suggestion="Expected a file starting with '-----BEGIN' or 'ssh-'.")
 
 
+# ---------------------------------------------------------- use_ssh tools
+#: HVA-04 (v0.6.9 audit): identity of unix sockets created by THIS process.
+#: _start_agent_at() records (st_dev, st_ino) right after ssh-agent binds
+#: the socket; the cleanup gate in hooks._cleanup_stale_sockets() refuses
+#: to unlink a recorded path whose identity no longer matches (the object
+#: was replaced) and never unlinks anything that is not demonstrably a
+#: socket. Keyed by abspath. stdlib-only, in-memory, process-scoped.
+_socket_creations: dict[str, tuple[int, int]] = {}
+_socket_creations_lock = threading.Lock()
+
+
+def _record_created_socket(sock: str) -> None:
+    """Record the (dev, ino) identity of a socket this run just created.
+
+    Uses os.lstat() (never follows symlinks — the symlink guard in
+    _start_agent_at already rejected symlinked paths before ssh-agent ran).
+    A vanished path or a non-socket object after ssh-agent start emits a
+    sanitized WARNING (path + reason only, no secret material) and records
+    nothing; it never raises and never changes the resolve contract.
+    """
+    try:
+        st = os.lstat(sock)
+    except OSError as exc:
+        log.warning("cannot record ssh socket creation identity for %s: %s",
+                    sock, type(exc).__name__)
+        return
+    if not stat.S_ISSOCK(st.st_mode):
+        log.warning("refusing to record ssh socket creation identity for "
+                    "%s: not a socket after ssh-agent start (mode %s)",
+                    sock, oct(stat.S_IMODE(st.st_mode)))
+        return
+    with _socket_creations_lock:
+        _socket_creations[os.path.abspath(sock)] = (st.st_dev, st.st_ino)
+
+
+def socket_creation_identity(sock: str) -> tuple[int, int] | None:
+    """Recorded (dev, ino) if THIS process created *sock*, else None."""
+    with _socket_creations_lock:
+        return _socket_creations.get(os.path.abspath(sock))
+
+
+def forget_socket_creation(sock: str) -> None:
+    """Drop a recorded creation after a verified cleanup."""
+    with _socket_creations_lock:
+        _socket_creations.pop(os.path.abspath(sock), None)
+
+
 def _resolve_socket_path() -> tuple[str, bool]:
     """Resolve the ssh-agent socket path (developer-controlled).
 
@@ -1027,6 +1076,11 @@ def _resolve_socket_path() -> tuple[str, bool]:
         subprocess.run(["ssh-agent", "-a", sock],
                        env=_ssh_base_env(),
                        capture_output=True, text=True, timeout=10)
+        # HVA-04: capture creation identity IMMEDIATELY after creation so
+        # cleanup can later prove the object was not swapped. Non-fatal by
+        # design: a missing/blocked socket surfaces through the ssh-add
+        # step, not here (contract unchanged).
+        _record_created_socket(sock)
 
     # Step 1: Check $VW_SSH_SOCKET_PATH
     vw_sock = os.environ.get("VW_SSH_SOCKET_PATH", "").strip()

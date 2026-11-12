@@ -61,6 +61,7 @@ from __future__ import annotations
 import contextvars
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import threading
@@ -608,12 +609,60 @@ def _cleanup_stale_sockets():
         candidates.append(os.path.join(xdg, "auth.sock"))
 
     for sock in candidates:
-        if _is_stale(sock):
-            try:
-                os.unlink(sock)
-                log.info("cleaned stale ssh socket: %s", sock)
-            except OSError:
-                pass
+        if not _is_stale(sock):
+            continue
+        # HVA-04 (v0.6.9 audit): an unsuccessful `ssh-add -l` proves only
+        # that no agent ANSWERS on the path — NOT that the path still is
+        # the socket object the plugin created. GATE THE UNLINK on the
+        # path itself via os.lstat() (never os.stat — symlinks are
+        # inspected as symlinks and never followed):
+        #   * lstat failure            -> skip (unprovable state)
+        #   * symlink at the path      -> skip (removal could be redirected)
+        #   * symlinked parent dir     -> skip (path redirection, VWP-02 spirit)
+        #   * not a S_ISSOCK object    -> skip (replaced regular/dir/etc.)
+        #   * identity recorded by this process and dev/ino mismatch
+        #                              -> skip (the object was swapped)
+        # Every skip and every failed unlink is OBSERVABLE: sanitized
+        # WARNINGs carrying the path and an error class/mode only — never
+        # secret material. Failures never crash plugin startup.
+        try:
+            st = os.lstat(sock)
+        except OSError as exc:
+            log.warning("skipping stale ssh socket %s: lstat failed (%s)",
+                        sock, type(exc).__name__)
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            log.warning("skipping stale ssh socket %s: path is a symlink; "
+                        "cleanup never follows or unlinks symlinks", sock)
+            continue
+        parent = os.path.dirname(sock)
+        if parent and os.path.islink(parent):
+            log.warning("skipping stale ssh socket %s: parent directory %s "
+                        "is a symlink; refusing redirected cleanup",
+                        sock, parent)
+            continue
+        if not stat.S_ISSOCK(st.st_mode):
+            log.warning("skipping stale ssh socket %s: not a socket "
+                        "(mode %s); refusing to unlink an object of "
+                        "unproven kind", sock, oct(stat.S_IMODE(st.st_mode)))
+            continue
+        # Lazy import: tools owns the creation registry (creation site
+        # _start_agent_at); this avoids a module-level hooks<->tools edge.
+        from .tools import forget_socket_creation, socket_creation_identity
+        recorded = socket_creation_identity(sock)
+        if recorded is not None and (st.st_dev, st.st_ino) != recorded:
+            log.warning("skipping stale ssh socket %s: object identity "
+                        "(dev/ino) no longer matches the socket this "
+                        "process created; the path was replaced", sock)
+            continue
+        try:
+            os.unlink(sock)
+            log.info("cleaned stale ssh socket: %s", sock)
+            if recorded is not None:
+                forget_socket_creation(sock)
+        except OSError as exc:
+            log.warning("Failed to remove stale ssh socket %s: %s",
+                        sock, type(exc).__name__)
 
 
 def _write_secret_file(token: str, value: str, secrets_dir: str,
