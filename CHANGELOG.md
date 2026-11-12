@@ -5,6 +5,22 @@ Author: **thieneret**
 
 ---
 
+## v0.7.8 (2026-11-13)
+
+### Security (HVA hardening from the v0.6.9 audit)
+- HVA-03: fd-based TOCTOU/symlink hardening for file-based secret inputs
+  (password_file / pass_file). Secrets are read via O_NOFOLLOW open + fstat on
+  the file descriptor, closing the validate-then-read race. Symlinked,
+  wrong-owner, and insecure-permission inputs are rejected fail-closed.
+- HVA-04: SSH temporary socket cleanup hardening. Cleanup now unlinks only
+  sockets demonstrably created by the current execution, verifies socket type
+  (S_ISSOCK) and creation identity before removal, and never follows symlinks.
+- HVA-05: Full test-suite verification. Suite completes with exit code 0
+  (877 collected / 873 passed / 4 skipped / 0 failed).
+
+### Tests
+- Added 12 regression tests (7 × HVA-03, 5 × HVA-04).
+
 ## v0.7.7 (2026-11-08)
 
 ### Fixed
