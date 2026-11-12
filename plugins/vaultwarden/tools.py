@@ -27,6 +27,7 @@ from . import errors, schemas
 from .auth import AuthManager
 from .config import PluginConfig
 from .placeholders import PlaceholderRegistry
+from .secure_fs import FilesystemSecurityError, read_hardened_secret_file
 from .security import get_logger, get_redacting_filter
 
 log = get_logger("tools")
@@ -271,9 +272,11 @@ def _resolve_secret_input(
     advisory string when a raw secret was passed directly (also emitted to
     the log), else None. Raises ConfigError on conflict (multiple sources)
     or an unusable file source. Raises NotFoundError when a *_file path
-    does not exist. The file channel is strict: regular file, owner-readable
-    (mode & 0o400), no group/other access (mode & 0o077 == 0) — otherwise
-    the file is NOT read and ConfigError is raised.
+    does not exist. The file channel is strict (HVA-03 hardened, v0.7.8):
+    the file is opened O_NOFOLLOW and validated on the OPENED fd via
+    fstat() — regular file, owned by the current effective uid, mode
+    EXACTLY 0600 — otherwise the file is NOT read and ConfigError is
+    raised (fail-closed, no TOCTOU/symlink window).
 
     v0.4.9 (BREAKING CHANGE): the *_env channel (and with it the `env_key`
     and `config` parameters) was REMOVED from this resolver; handlers
@@ -297,36 +300,29 @@ def _resolve_secret_input(
         return str(args[direct_key]), warning
     if args.get(file_key):
         path = str(args[file_key])
-        if not os.path.isfile(path):
+        # HVA-03 (v0.7.8): the file channel is validated on the OPENED fd,
+        # not on the path. The old sequence (isfile -> stat on path ->
+        # separate open) left a TOCTOU window and silently followed
+        # symlinks. read_hardened_secret_file() collapses open+validate+
+        # read (O_NOFOLLOW, fstat: regular file, euid owner, exact 0600)
+        # into one fd-scoped operation. The lexists() pre-check ONLY
+        # preserves the not-found -> NotFoundError contract; every
+        # security decision is made on the descriptor, never on the path.
+        if not os.path.lexists(path):
             raise errors.NotFoundError(
                 f"{tool_name}: {file_key} not found: {path}",
                 suggestion="Provide an absolute path to an existing file.",
             )
         try:
-            st = os.stat(path)
-        except OSError as exc:
-            raise errors.ConfigError(
-                f"{tool_name}: cannot stat {file_key} path: {type(exc).__name__}"
-            ) from exc
-        mode = st.st_mode & 0o777
-        if mode & 0o077:
-            raise errors.ConfigError(
-                f"{tool_name}: {file_key} must be readable only by the owner "
-                f"(chmod 600); current mode is {oct(mode)}",
-                suggestion="Run: chmod 600 <file>",
-            )
-        if not (mode & 0o400):
-            raise errors.ConfigError(
-                f"{tool_name}: {file_key} is not readable by the owner "
-                f"(mode {oct(mode)})",
-                suggestion="Run: chmod 600 <file>",
-            )
+            raw = read_hardened_secret_file(path)
+        except FilesystemSecurityError as exc:
+            raise errors.ConfigError(f"{tool_name}: {exc}") from exc
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                val = f.read().strip()
-        except OSError as exc:
+            val = raw.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
             raise errors.ConfigError(
-                f"{tool_name}: cannot read {file_key}: {type(exc).__name__}"
+                f"{tool_name}: {file_key} is not valid UTF-8: "
+                f"{type(exc).__name__}"
             ) from exc
         if not val:
             raise errors.ConfigError(f"{tool_name}: {file_key} is empty")

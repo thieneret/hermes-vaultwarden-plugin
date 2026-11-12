@@ -18,6 +18,11 @@ sites so the rules cannot drift apart:
 * :func:`ensure_hardened_secret_file` — secret files: absolute, regular
   (non-symlink) file, owned by the current effective UID, NO group/other
   access (``mode & 0o077 == 0``, i.e. typically ``0600``).
+* :func:`read_hardened_secret_file` — HVA-03: tool-provided secret input
+  files (``password_file`` / ``pass_file``): open + validate + read in ONE
+  fd-scoped operation (``O_NOFOLLOW`` open, ``fstat`` on the descriptor,
+  exact ``0600``), closing the TOCTOU / symlink-substitution window that a
+  path-check-then-open sequence leaves open.
 
 Design rules (fail-closed, defense in depth):
 
@@ -33,6 +38,7 @@ Design rules (fail-closed, defense in depth):
 """
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from pathlib import Path
@@ -231,3 +237,106 @@ def ensure_hardened_secret_file(
             f"plugin never repairs permissions silently. Run: chmod 600 {p}")
 
     return p
+
+
+# ── fd-scoped secret INPUT reads (HVA-03, v0.7.8 hardening) ─────────────────
+
+def read_hardened_secret_file(path: Path | str) -> bytes:
+    """Open, validate and read a tool-provided secret input file in ONE
+    fd-scoped operation — eliminating the TOCTOU / symlink window.
+
+    HVA-03 (v0.6.9 audit, Low): ``password_file`` / ``pass_file`` used to
+    be validated on the PATH (``lstat``/``stat``) and only then opened —
+    between the two steps an attacker able to manipulate the filesystem
+    could swap the path or substitute a symlink. This helper collapses
+    open+validate+read onto the OPENED FILE DESCRIPTOR:
+
+    * ``os.open(O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)`` — a
+      symlinked path fails at open (``ELOOP``) and is NEVER followed;
+      ``O_NONBLOCK`` prevents a hang on FIFOs (which are then rejected by
+      the regular-file check);
+    * validated via ``os.fstat(fd)`` — NOT the path: must be a REGULAR
+      file, owned by the CURRENT EFFECTIVE UID, mode EXACTLY ``0600``
+      (owner read+write only, no group/other, no extra owner bits);
+    * the secret bytes are read from the SAME descriptor; the fd is closed
+      in a ``finally`` block on every path;
+    * every violation raises :class:`FilesystemSecurityError` (fail-closed
+      — no fallback, no silent repair); error text contains PATH, MODE and
+      error code only, NEVER file contents.
+
+    Returns the raw bytes on success. Decoding/stripping/emptiness are the
+    caller's concern (they are not security-relevant for this gate).
+    """
+    p = Path(path)
+    _require_absolute(p, "Secret input file")
+
+    def _validate_fd_st(st: os.stat_result) -> None:
+        """Apply the fd-scoped gate to an fstat() result (fail-closed)."""
+        if not stat.S_ISREG(st.st_mode):
+            # O_NOFOLLOW only guards the LAST path component; parent-dir
+            # trickery or a race swap after open can still land on a
+            # non-regular object — reject it based on the fd, not the path.
+            raise FilesystemSecurityError(
+                f"Secret input file {p} is not a regular file")
+        _check_ownership(st, p, "Secret input file")
+        mode = stat.S_IMODE(st.st_mode)
+        if mode & 0o077:
+            raise FilesystemSecurityError(
+                f"Secret input file {p} must be readable only by the owner "
+                f"(chmod 600); current mode is {oct(mode)} — the plugin "
+                "never repairs permissions silently. Run: "
+                f"chmod 600 {p}")
+        if not (mode & 0o400):
+            raise FilesystemSecurityError(
+                f"Secret input file {p} is not readable by the owner "
+                f"(mode {oct(mode)}). Run: chmod 600 {p}")
+        if mode != 0o600:
+            # Fail-closed on anything that is not EXACTLY 0600 (e.g.
+            # 0500, 0700): stricter than the legacy mode-only check.
+            raise FilesystemSecurityError(
+                f"Unexpected mode on secret input file {p}: {oct(mode)} "
+                "(expected exactly 0600). Fix it explicitly — the plugin "
+                f"never repairs permissions silently. Run: chmod 600 {p}")
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(str(p), flags)
+    except FileNotFoundError:
+        raise FilesystemSecurityError(
+            f"Secret input file does not exist: {p}") from None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise FilesystemSecurityError(
+                f"Secret input file {p} is a symlink; symlinks are "
+                "rejected (the target could be read/tampered with by "
+                "other users)") from exc
+        if exc.errno == errno.EACCES:
+            # DIAGNOSTIC ONLY (never part of the security gate): the file
+            # could NOT be opened, so no secret material was ever read.
+            # An lstat() lets us report the precise reason (wrong owner /
+            # unreadable mode) instead of a bare PermissionError. The
+            # result cannot cause a false accept — acceptance requires a
+            # successful os.open() plus fstat() on the real descriptor.
+            try:
+                _validate_fd_st(os.lstat(str(p)))
+            except FilesystemSecurityError:
+                raise
+            except OSError:
+                pass
+        raise FilesystemSecurityError(
+            f"Cannot open secret input file {p}: "
+            f"{type(exc).__name__}") from exc
+
+    try:
+        _validate_fd_st(os.fstat(fd))
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
