@@ -18,8 +18,10 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,6 +29,7 @@ from . import errors, schemas
 from .auth import AuthManager
 from .config import PluginConfig
 from .placeholders import PlaceholderRegistry
+from .secure_fs import FilesystemSecurityError, read_hardened_secret_file
 from .security import get_logger, get_redacting_filter
 
 log = get_logger("tools")
@@ -271,9 +274,11 @@ def _resolve_secret_input(
     advisory string when a raw secret was passed directly (also emitted to
     the log), else None. Raises ConfigError on conflict (multiple sources)
     or an unusable file source. Raises NotFoundError when a *_file path
-    does not exist. The file channel is strict: regular file, owner-readable
-    (mode & 0o400), no group/other access (mode & 0o077 == 0) — otherwise
-    the file is NOT read and ConfigError is raised.
+    does not exist. The file channel is strict (HVA-03 hardened, v0.7.8):
+    the file is opened O_NOFOLLOW and validated on the OPENED fd via
+    fstat() — regular file, owned by the current effective uid, mode
+    EXACTLY 0600 — otherwise the file is NOT read and ConfigError is
+    raised (fail-closed, no TOCTOU/symlink window).
 
     v0.4.9 (BREAKING CHANGE): the *_env channel (and with it the `env_key`
     and `config` parameters) was REMOVED from this resolver; handlers
@@ -297,36 +302,29 @@ def _resolve_secret_input(
         return str(args[direct_key]), warning
     if args.get(file_key):
         path = str(args[file_key])
-        if not os.path.isfile(path):
+        # HVA-03 (v0.7.8): the file channel is validated on the OPENED fd,
+        # not on the path. The old sequence (isfile -> stat on path ->
+        # separate open) left a TOCTOU window and silently followed
+        # symlinks. read_hardened_secret_file() collapses open+validate+
+        # read (O_NOFOLLOW, fstat: regular file, euid owner, exact 0600)
+        # into one fd-scoped operation. The lexists() pre-check ONLY
+        # preserves the not-found -> NotFoundError contract; every
+        # security decision is made on the descriptor, never on the path.
+        if not os.path.lexists(path):
             raise errors.NotFoundError(
                 f"{tool_name}: {file_key} not found: {path}",
                 suggestion="Provide an absolute path to an existing file.",
             )
         try:
-            st = os.stat(path)
-        except OSError as exc:
-            raise errors.ConfigError(
-                f"{tool_name}: cannot stat {file_key} path: {type(exc).__name__}"
-            ) from exc
-        mode = st.st_mode & 0o777
-        if mode & 0o077:
-            raise errors.ConfigError(
-                f"{tool_name}: {file_key} must be readable only by the owner "
-                f"(chmod 600); current mode is {oct(mode)}",
-                suggestion="Run: chmod 600 <file>",
-            )
-        if not (mode & 0o400):
-            raise errors.ConfigError(
-                f"{tool_name}: {file_key} is not readable by the owner "
-                f"(mode {oct(mode)})",
-                suggestion="Run: chmod 600 <file>",
-            )
+            raw = read_hardened_secret_file(path)
+        except FilesystemSecurityError as exc:
+            raise errors.ConfigError(f"{tool_name}: {exc}") from exc
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                val = f.read().strip()
-        except OSError as exc:
+            val = raw.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
             raise errors.ConfigError(
-                f"{tool_name}: cannot read {file_key}: {type(exc).__name__}"
+                f"{tool_name}: {file_key} is not valid UTF-8: "
+                f"{type(exc).__name__}"
             ) from exc
         if not val:
             raise errors.ConfigError(f"{tool_name}: {file_key} is empty")
@@ -987,6 +985,53 @@ def _validate_ssh_key_file(path: str) -> None:
             suggestion="Expected a file starting with '-----BEGIN' or 'ssh-'.")
 
 
+# ---------------------------------------------------------- use_ssh tools
+#: HVA-04 (v0.6.9 audit): identity of unix sockets created by THIS process.
+#: _start_agent_at() records (st_dev, st_ino) right after ssh-agent binds
+#: the socket; the cleanup gate in hooks._cleanup_stale_sockets() refuses
+#: to unlink a recorded path whose identity no longer matches (the object
+#: was replaced) and never unlinks anything that is not demonstrably a
+#: socket. Keyed by abspath. stdlib-only, in-memory, process-scoped.
+_socket_creations: dict[str, tuple[int, int]] = {}
+_socket_creations_lock = threading.Lock()
+
+
+def _record_created_socket(sock: str) -> None:
+    """Record the (dev, ino) identity of a socket this run just created.
+
+    Uses os.lstat() (never follows symlinks — the symlink guard in
+    _start_agent_at already rejected symlinked paths before ssh-agent ran).
+    A vanished path or a non-socket object after ssh-agent start emits a
+    sanitized WARNING (path + reason only, no secret material) and records
+    nothing; it never raises and never changes the resolve contract.
+    """
+    try:
+        st = os.lstat(sock)
+    except OSError as exc:
+        log.warning("cannot record ssh socket creation identity for %s: %s",
+                    sock, type(exc).__name__)
+        return
+    if not stat.S_ISSOCK(st.st_mode):
+        log.warning("refusing to record ssh socket creation identity for "
+                    "%s: not a socket after ssh-agent start (mode %s)",
+                    sock, oct(stat.S_IMODE(st.st_mode)))
+        return
+    with _socket_creations_lock:
+        _socket_creations[os.path.abspath(sock)] = (st.st_dev, st.st_ino)
+
+
+def socket_creation_identity(sock: str) -> tuple[int, int] | None:
+    """Recorded (dev, ino) if THIS process created *sock*, else None."""
+    with _socket_creations_lock:
+        return _socket_creations.get(os.path.abspath(sock))
+
+
+def forget_socket_creation(sock: str) -> None:
+    """Drop a recorded creation after a verified cleanup."""
+    with _socket_creations_lock:
+        _socket_creations.pop(os.path.abspath(sock), None)
+
+
 def _resolve_socket_path() -> tuple[str, bool]:
     """Resolve the ssh-agent socket path (developer-controlled).
 
@@ -1031,6 +1076,11 @@ def _resolve_socket_path() -> tuple[str, bool]:
         subprocess.run(["ssh-agent", "-a", sock],
                        env=_ssh_base_env(),
                        capture_output=True, text=True, timeout=10)
+        # HVA-04: capture creation identity IMMEDIATELY after creation so
+        # cleanup can later prove the object was not swapped. Non-fatal by
+        # design: a missing/blocked socket surfaces through the ssh-add
+        # step, not here (contract unchanged).
+        _record_created_socket(sock)
 
     # Step 1: Check $VW_SSH_SOCKET_PATH
     vw_sock = os.environ.get("VW_SSH_SOCKET_PATH", "").strip()
