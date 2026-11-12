@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.7.8**
+**Current version: v0.7.9**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -417,6 +417,7 @@ mkdir -m 700 /path/to/real-dir
 | Subprocess env isolation | All `bw` calls run with a minimal, controlled environment |
 | Session key in memory only | Bitwarden session key is never written to disk. The `BW_SESSION` environment variable is guaranteed at the single subprocess-env choke point for all session-requiring `bw` commands (list/get/create/edit/delete), so vault operations can no longer silently run against a locked vault. The choke point adds a pre-flight validity check with synchronous lazy-unlock: if no valid (non-expired) session key is available, the plugin re-unlocks on demand before spawning `bw`, and raises a sanitized `SessionError` if re-unlock fails — session-requiring commands can never run against a locked profile with a stale or missing key. The lazy-unlock is prompt-hardened: every bw invocation without a payload runs with stdin=DEVNULL, and a falsy master password fails closed with a sanitized AUTH error before any unlock is spawned, so the bw CLI can never fall back to an interactive master-password prompt. The first tool call on a fresh profile performs the full auth bootstrap (config server + login + unlock) before any read/write, so reads/writes work on the first burst and vault operations can never run against an un-bootstrapped profile. Locked/expired sessions now surface as `SESSION_ERROR` / `SESSION_EXPIRED` with sanitized stderr and a re-unlock suggestion — never the raw session key. |
 | RedactingFilter | All secrets registered; redacted from logs and errors |
+| Tool-result redaction | The `transform_tool_result` hook scrubs every secret injected during the execution (raw AND URL-encoded forms) from the tool result before it reaches the model. As defense-in-depth, credentialed URLs (`https://user:pass@host`) reprinted in tool output have their userinfo masked — but only for executions that actually injected secrets, so ordinary output stays untouched. |
 | SSH passphrase delivery | Via the `SSH_ASKPASS` mechanism (env var only, never stdin/argv). Helper script removed in `finally` block. |
 | SSH key temp file | `tempfile.mkstemp()` (atomic), `0600` perms, deleted in `finally` |
 | Fail-closed auth | Authentication failures never fall back silently |
@@ -464,7 +465,7 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **877 tests** — including positive-control suites for:
+Current suite: **883 tests** — including positive-control suites for:
 
 - Placeholder lifecycle (single-use, expiry, replay rejection)
 - Fail-closed behaviour (missing hooks, broken config, refused loads)

@@ -69,6 +69,7 @@ import time
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 from . import errors
 from .auth import AuthManager
@@ -1127,6 +1128,26 @@ def _redact_in_result(result: Any) -> Any:
     return result
 
 
+#: SEC-01 defense-in-depth (v0.7.9): fallback pattern that masks the
+#: userinfo/credential block of any credentialed http(s) URL. Matches the
+#: ``scheme://`` literal plus a run of characters that cannot contain ``@``,
+#: whitespace or ``/`` (so it stops at the path), up to and including the
+#: first ``@``. Credential-free URLs have no ``@`` before their first path
+#: separator and are never touched.
+_CREDENTIALED_URL_RE = re.compile(r"(https?://)[^@\s/]+@")
+
+
+def _mask_credentialed_urls(text: str) -> str:
+    """Regex safety net: ``https://<userinfo>@`` -> ``https://[REDACTED]@``.
+
+    v0.7.9: masks credentialed URLs regardless of percent-encoding
+    or any other re-encoding the tool (git, curl, the HTTP layer) applies to
+    the credential. Applied ONLY inside the per-execution injected-secret
+    path (the caller gates on a non-empty injected set) — never globally.
+    """
+    return _CREDENTIALED_URL_RE.sub(r"\1[REDACTED]@", text)
+
+
 def _redact_task_secrets(task_id: str, result: Any,
                          values: list[str] | None = None) -> Any:
     """Remove freshly injected placeholder secrets from *result*.
@@ -1136,6 +1157,13 @@ def _redact_task_secrets(task_id: str, result: Any,
     ``[REDACTED]``), called from the authoritative `transform_tool_result`
     redactor. When *values* is None it falls back to peeking the task-keyed
     store (never popping — the middleware's finally block owns forgetting).
+    v0.7.9: each injected secret is also replaced in its
+    percent-encoded form (``urllib.parse.quote(secret, safe='')``, skipped
+    when identical to the raw secret), and after the exact replacements a
+    credentialed-URL regex fallback masks any remaining
+    ``https://<userinfo>@`` block — defense-in-depth for hosts that reprint
+    the credential re-encoded (git failure lines echo the full clone URL).
+    The fallback runs only when this execution actually injected secrets.
     Containers (dict / list / MutableMapping / writable ``.output`` objects)
     are scrubbed in place; a plain ``str`` result cannot be mutated, so the
     sanitized copy is RETURNED (the transformer returns it — that return
@@ -1146,17 +1174,26 @@ def _redact_task_secrets(task_id: str, result: Any,
         values = peek_task_secrets(task_id)
     if not values:
         return result
+    # Exact replacement covers raw + percent-encoded variants; the
+    # regex fallback below is gated on this non-empty values list, i.e. an
+    # execution that actually injected secrets.
+    replacements: list[str] = []
+    for v in values:
+        replacements.append(v)
+        encoded = quote(v, safe="")
+        if encoded != v:
+            replacements.append(encoded)
     if isinstance(result, str):
         text = result
-        for v in values:
+        for v in replacements:
             text = text.replace(v, "[REDACTED]")
-        return text
+        return _mask_credentialed_urls(text)
 
     def _scrub(obj: Any) -> Any:
         if isinstance(obj, str):
-            for v in values:
+            for v in replacements:
                 obj = obj.replace(v, "[REDACTED]")
-            return obj
+            return _mask_credentialed_urls(obj)
         if isinstance(obj, dict):
             for k in list(obj):
                 val = obj[k]
@@ -1184,8 +1221,9 @@ def _redact_task_secrets(task_id: str, result: Any,
         result.update(scrubbed)
     if hasattr(result, "output") and isinstance(getattr(result, "output"), str):
         out = result.output
-        for v in values:
+        for v in replacements:
             out = out.replace(v, "[REDACTED]")
+        out = _mask_credentialed_urls(out)
         try:
             result.output = out
         except Exception:  # pragma: no cover - immutable result objects
@@ -1215,6 +1253,11 @@ def make_result_redactor(auth: AuthManager,
     3. performs exact, recursive plaintext replacement of every injected
        secret value with the literal ``[REDACTED]`` on str / dict / list
        results and objects exposing a writable ``.output`` attribute;
+       since v0.7.9 additionally replaces each secret's
+       percent-encoded variant and, only when the execution injected
+       secrets, applies the ``_CREDENTIALED_URL_RE`` fallback masking any
+       remaining ``https://<userinfo>@`` block (defense-in-depth against
+       tools reprinting the credential re-encoded);
     4. applies the global RedactingFilter pass (bootstrap secrets, session
        keys, tracked write payloads) to the same result;
     5. RETURNS the sanitized result — that return value is what the model

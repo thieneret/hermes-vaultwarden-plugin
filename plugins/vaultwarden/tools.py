@@ -28,7 +28,7 @@ from typing import Any, Callable
 from . import errors, schemas
 from .auth import AuthManager
 from .config import PluginConfig
-from .placeholders import PlaceholderRegistry
+from .placeholders import PlaceholderRegistry, to_user_facing
 from .secure_fs import FilesystemSecurityError, read_hardened_secret_file
 from .security import get_logger, get_redacting_filter
 
@@ -694,7 +694,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             entry = registry.create(item.get("id") or item_id,
                                     f"custom:{custom}" if custom else field_name)
             result: dict[str, Any] = {
-                "placeholder": f"${entry.token}",
+                "placeholder": to_user_facing(entry.token),
                 "ttl_seconds": registry.ttl_seconds,
                 "usage": ("Insert this exact reference into a terminal command "
                           "INSIDE DOUBLE QUOTES (or unquoted — never inside "
@@ -793,7 +793,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                     item_id = created.get("id") or ""
                     entry = registry.create(item_id, "password")
                     result["password_generated"] = True
-                    result["password_placeholder"] = entry.token
+                    result["password_placeholder"] = to_user_facing(entry.token)
                     result["placeholder_ttl_seconds"] = registry.ttl_seconds
 
                 if pw_warning:
@@ -891,7 +891,7 @@ def get_tools(auth: AuthManager, config: PluginConfig,
                 if generated_pw is not None:
                     entry = registry.create(item_id, "password")
                     result["password_generated"] = True
-                    result["password_placeholder"] = entry.token
+                    result["password_placeholder"] = to_user_facing(entry.token)
                     result["placeholder_ttl_seconds"] = registry.ttl_seconds
 
                 if pw_warning:

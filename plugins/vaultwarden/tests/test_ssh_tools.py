@@ -807,6 +807,9 @@ def test_store_ssh_generate_success_response():
     assert res["key_type"] == "ed25519"
     assert res["ssh_user"] == "deploy"
     assert "warning" not in res
+    # generate=true responses carry NO placeholder field (unlike
+    # store/update) — only non-secret key metadata is returned.
+    assert "placeholder" not in res and "password_placeholder" not in res
     # private key + passphrase NEVER returned
     dumped = json.dumps(res)
     assert GEN_PW not in dumped
@@ -963,6 +966,8 @@ def test_update_ssh_generate_rotates_key():
     assert res["public_key"].startswith("ssh-ed25519 ")
     assert res["passphrase_rotated"] is True
     assert "warning" not in res
+    # generate=true (rotation) responses carry NO placeholder field either.
+    assert "placeholder" not in res and "password_placeholder" not in res
     assert GEN_PW not in json.dumps(res)
     bw = auth._bw                                        # noqa: SLF001
     # attachment replaced: old deleted, new created
