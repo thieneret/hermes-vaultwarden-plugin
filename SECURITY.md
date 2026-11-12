@@ -106,7 +106,7 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     verb selection (corrected in v0.7.4: `bw sync --force` when no prior sync
     exists in this process to guarantee a full vault download, plain
     `bw sync` for incremental refresh; the previously used `bw sync --last`
-    only prints the last sync date and does NOT sync — removed from all sync
+    only prints the last sync date and does NOT sync â€” removed from all sync
     code paths), empty-read defense that
     detects an unpopulated cache on an empty read and forces one full sync +
     single retry, structured INFO/WARNING logging on every sync outcome, and
