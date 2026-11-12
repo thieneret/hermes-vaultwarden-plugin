@@ -192,7 +192,8 @@ def test_store_generate_true(write_tools_by_name, appdata, registry):
         "generate": True, "generate_options": {"length": 24}})
     assert res["created"] is True and res["id"] == "new-item-id-0001"
     assert res["password_generated"] is True
-    assert TOKEN_RE.match(res["password_placeholder"])
+    assert res["password_placeholder"].startswith("$")  # user-facing form
+    assert TOKEN_RE.match(res["password_placeholder"][1:])
     assert res["placeholder_ttl_seconds"] == 300
     # The raw generated password must NEVER appear in the response...
     blob = _json.dumps(res)
@@ -202,10 +203,12 @@ def test_store_generate_true(write_tools_by_name, appdata, registry):
     with open(appdata / "fake_items.json") as f:
         stored = _json.load(f)["new-item-id-0001"]
     assert stored["login"]["password"] == FAKE_GEN_PW
-    # Placeholder registered for later command-time injection.
+    # Placeholder registered for later command-time injection — the registry
+    # key stays the BARE token; only the response field carries the '$'.
     snap = registry.snapshot()
-    assert res["password_placeholder"] in snap
-    assert snap[res["password_placeholder"]]["field"] == "password"
+    bare = res["password_placeholder"][1:]
+    assert bare in snap
+    assert snap[bare]["field"] == "password"
 
 
 def test_update_generate_true(write_tools_by_name, appdata, registry):
@@ -221,7 +224,8 @@ def test_update_generate_true(write_tools_by_name, appdata, registry):
         "generate_options": {"mode": "passphrase", "words": 4, "separator": "-"}})
     assert upd["updated"] is True
     assert upd["password_generated"] is True
-    assert TOKEN_RE.match(upd["password_placeholder"])
+    assert upd["password_placeholder"].startswith("$")  # user-facing form
+    assert TOKEN_RE.match(upd["password_placeholder"][1:])
     assert upd["placeholder_ttl_seconds"] == 300
     blob = _json.dumps(upd)
     assert FAKE_GEN_PW not in blob      # raw value never returned
@@ -230,7 +234,7 @@ def test_update_generate_true(write_tools_by_name, appdata, registry):
         stored = _json.load(f)["new-item-id-0001"]
     assert stored["login"]["password"] == FAKE_GEN_PW
     snap = registry.snapshot()
-    assert snap[upd["password_placeholder"]]["field"] == "password"
+    assert snap[upd["password_placeholder"][1:]]["field"] == "password"
 
 
 def test_store_without_generate_has_no_placeholder_fields(write_tools_by_name):
@@ -238,6 +242,31 @@ def test_store_without_generate_has_no_placeholder_fields(write_tools_by_name):
         "type": "login", "name": "Plain", "username": "u", "password": "pw1"})
     assert "password_generated" not in res
     assert "password_placeholder" not in res
+
+
+def test_placeholder_responses_uniform_user_facing_format(write_tools_by_name,
+                                                         tools_by_name,
+                                                         registry):
+    """Every LLM-facing placeholder field shares get_secret_ref's exact
+    ``$__VW_SECRET_<12hex>__`` user-facing form (single shared formatter),
+    while registry keys stay bare. SSH generate=true responses carry NO
+    placeholder field at all — asserted in test_ssh_tools."""
+    user_re = re.compile(r"^\$__VW_SECRET_[0-9a-f]{12}__$")
+    store = write_tools_by_name["vaultwarden_store"]({
+        "type": "login", "name": "Uniform gen", "username": "u",
+        "generate": True})
+    upd = write_tools_by_name["vaultwarden_update"]({
+        "item_id": "new-item-id-0001", "generate": True})
+    ref = tools_by_name["vaultwarden_get_secret_ref"](
+        {"item_id": "Postgres prod", "field": "password"})
+    fields = [store["password_placeholder"], upd["password_placeholder"],
+              ref["placeholder"]]
+    for f in fields:
+        assert user_re.match(f), f          # all three uniform, $-prefixed
+    snap = registry.snapshot()
+    for f in fields:
+        assert f[1:] in snap                # internal key: BARE token
+        assert f not in snap                # $-form never becomes a key
 
 
 def test_error_envelope_format(tools_by_name):

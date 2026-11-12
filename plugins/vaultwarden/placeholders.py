@@ -33,6 +33,18 @@ def _token_shape(token: str) -> bool:
     return len(body) == 12 and all(c in "0123456789abcdef" for c in body)
 
 
+def to_user_facing(token: str) -> str:
+    """Return the LLM/user-facing form of a BARE registry *token*.
+
+    Registry keys and all middleware-internal handoffs keep the bare
+    ``__VW_SECRET_<12hex>__`` shape; the ``$`` prefix is a display
+    convention applied uniformly to every placeholder field in tool
+    responses (the middleware consumes both forms). It is defined ONCE
+    here — no call site may duplicate the prefix logic.
+    """
+    return f"${token}"
+
+
 @dataclass
 class PlaceholderEntry:
     token: str
