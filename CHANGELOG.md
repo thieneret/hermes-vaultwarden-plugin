@@ -5,6 +5,22 @@ Author: **thieneret**
 
 ---
 
+## v0.7.9 (2026-11-13)
+
+### Security (SEC-01 hardening)
+- `transform_tool_result` redaction now also replaces URL-encoded variants of
+  injected secrets (`urllib.parse.quote`), catching credentials that git/HTTP
+  layers percent-encode in error output.
+- Added a scoped defense-in-depth regex fallback masking credentialed URL
+  userinfo (`https://user:pass@host` → `https://[REDACTED]@host`), applied
+  only when the execution has injected secrets. Prevents credential leakage
+  when git/tool error lines reprint a credentialed URL.
+
+### Tests
+- Added 5 redaction regression tests (raw, URL-encoded, credentialed-URL,
+  no-userinfo no-op, empty-context no-op). Suite: 882 collected /
+  878 passed / 4 skipped / 0 failed.
+
 ## v0.7.8 (2026-11-13)
 
 ### Security (HVA hardening from the v0.6.9 audit)
