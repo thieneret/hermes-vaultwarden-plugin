@@ -8,7 +8,7 @@
 >
 > ⚠️ This is my first "vibe-coded" program, intended primarily for my own use. Use it entirely at your own risk!
 >
-> ⚠️ AI audit results: v0.3.2-Qwen v0.3.2-ChatGPT v0.5.2-Qwen v0.5.2-ChatGPT
+> ⚠️ AI audit results: v0.3.2-ChatGPT v0.5.2-ChatGPT
 >
 > ⚠️ **Security:** See SECURITY.md for the full threat model
 > and security guarantees.
