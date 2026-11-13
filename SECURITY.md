@@ -136,6 +136,18 @@ secret, SSH private keys, vault item secrets). The primary threat vectors are:
     invalidated for any reason, the third suspect condition in
     `_reconcile_empty_read()` detects it via `BwCli.verify_session()` and
     forces a re-unlock + retry.)
+20. **Downstream tool credential persistence** (the plugin provides secrets via
+    placeholder injection, but downstream tools may persist credentials in their
+    own configuration. Example: git persists remote URLs in `.git/config` — using
+    a credentialed URL with `git clone`, `git push -u`, `git remote add`, or
+    `git remote set-url` writes the secret to disk in plaintext, bypassing all
+    plugin redaction. This is a **RECEIVER-SIDE / USER responsibility**: the
+    placeholder mechanism is general-purpose (curl, psql, mongosh, aws cli, etc.)
+    and the plugin cannot enumerate or control the persistence behavior of all
+    downstream tools. Mitigation: the `vaultwarden-usage` skill forbids
+    persistence-prone git commands and mandates post-command `git remote -v`
+    verification. For repeated git operations, operators should use `GIT_ASKPASS`
+    or a git credential helper instead of URL-embedded credentials.)    
 
 - Threat: Multi-process session invalidation — the Hermes dashboard and
   gateway run as two separate OS processes in the same container, both

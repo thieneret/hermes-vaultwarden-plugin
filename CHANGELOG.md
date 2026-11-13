@@ -24,6 +24,15 @@ Author: **thieneret**
   form. SSH `generate=true` responses intentionally carry no placeholder
   (contract-tested); no SSH behavior change.
 
+### Documentation (git credential persistence)
+- Added "Git Credential Safety" section to the `vaultwarden-usage` skill:
+  forbids persistence-prone git commands (clone/push -u/remote add/remote
+  set-url with credentialed URLs), documents safe one-shot patterns, and
+  mandates post-command `git remote -v` verification.
+- SECURITY.md: added threat vector #20 for downstream tool credential
+  persistence, framed as receiver-side/user responsibility (plugin cannot
+  enumerate downstream tool persistence behavior).
+
 ### Tests
 - Added 5 redaction regression tests (raw, URL-encoded, credentialed-URL,
   no-userinfo no-op, empty-context no-op).

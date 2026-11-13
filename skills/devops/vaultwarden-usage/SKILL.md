@@ -144,6 +144,46 @@ than one is a `ConfigError`:
 - ❌ NEVER rotate an SSH key (`update_ssh` + `generate=true`) without `confirm=true`
 - ❌ NEVER place a placeholder inside single quotes (shell won't expand it)
 
+## Git Credential Safety
+
+Git persists remote URLs in `.git/config`. If a credentialed URL containing a
+Vaultwarden-injected secret is used with persistence-prone commands, the secret
+is written to disk in plaintext — bypassing ALL plugin redaction. This is a
+**receiver-side / user responsibility**: the placeholder mechanism is
+general-purpose and the plugin cannot control downstream tool behavior.
+
+### FORBIDDEN commands (credential persistence risk)
+
+- ❌ `git clone "https://$__VW_SECRET_x__@host/repo.git"` — persists credential in origin remote config
+- ❌ `git push -u <remote> "https://$__VW_SECRET_x__@host/repo.git"` — persists credential in upstream + remote config
+- ❌ `git remote add <name> "https://$__VW_SECRET_x__@host/repo.git"` — persists credential in remote config
+- ❌ `git remote set-url <name> "https://$__VW_SECRET_x__@host/repo.git"` — persists credential in remote config
+
+### ALLOWED safe patterns (one-shot only)
+
+Use the credential only for a single operation, without persisting the URL:
+
+- ✅ `git push "https://$__VW_SECRET_x__@host/repo.git" <branch>` (no `-u`)
+- ✅ `git fetch "https://$__VW_SECRET_x__@host/repo.git" <ref>`
+- ✅ `git pull "https://$__VW_SECRET_x__@host/repo.git" <branch>` (no `-u`)
+
+### Mandatory post-command verification
+
+After ANY git operation that used a credential, verify no credential leaked:
+
+```bash
+git remote -v
+```
+
+Output MUST NOT contain credentials. If it does, immediately fix:
+
+```bash
+git remote set-url origin "https://host/repo.git"   # clean URL, no credential
+```
+
+For repeated git operations, operators should configure GIT_ASKPASS or a
+git credential helper instead of URL-embedded credentials.
+
 ## References (load on demand)
 
 - **Examples** (concrete tool calls for every flow): `references/examples.md`
