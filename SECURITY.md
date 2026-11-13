@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.7.9
+**Applies to:** v0.8.0
 
 ## Threat Model
 
@@ -307,6 +307,12 @@ All CI checks (pytest, ruff) are **blocking** — a failing check prevents merge
 
 ## Development Rules
 
+- Audit IDs (HVA-xx, AUD-xx, SEC-xx, VWP-xx and similar) must not appear in
+  file names or runtime log messages. Intentional exception: report files
+  under `audit/` may carry the audited version in their names.
+- Plugin version numbers must not appear in runtime-visible strings (error
+  messages, tool responses, schema descriptions). Exception: the CURRENT
+  plugin version may appear in logs and in `vaultwarden_status` output.
 - Never log raw `bw` output (use structured status codes only).
 - Data tools and the session choke-point must bootstrap a fresh bw profile via
   the full `ensure_authenticated()` FSM (config server + login + unlock); never
