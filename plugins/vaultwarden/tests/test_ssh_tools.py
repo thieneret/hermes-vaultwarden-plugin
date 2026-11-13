@@ -783,7 +783,7 @@ def test_store_ssh_generate_forbids_secret_inputs():
     res = tools["vaultwarden_store_ssh"](
         {"name": "SSH - Gen", "generate": True, "pass_env": "x"})
     assert res["error_code"] == "CONFIG_ERROR"
-    assert "removed in v0.4.9" in res["error"]
+    assert "was removed" in res["error"]
 
 
 def test_store_ssh_generate_bad_key_type():
@@ -861,7 +861,7 @@ def test_store_ssh_upload_pass_env_rejected(tmp_path):
         {"name": "SSH - Up", "user": "deploy", "file": str(key),
          "pass_env": "VW_SSH_PASS"})
     assert res["error_code"] == "CONFIG_ERROR"
-    assert "removed in v0.4.9" in res["error"]
+    assert "was removed" in res["error"]
     assert "pass_file" in res["suggestion"]
 
 
@@ -924,7 +924,7 @@ def test_store_ssh_upload_pass_env_rejected_via_config(tmp_path):
     finally:
         os.environ.pop("VW_SSH_MULTIPLEX_PASS", None)
     assert res["error_code"] == "CONFIG_ERROR"
-    assert "removed in v0.4.9" in res["error"]
+    assert "was removed" in res["error"]
 
 
 
@@ -953,7 +953,7 @@ def test_update_ssh_generate_forbids_secret_inputs():
         {"name": "SSH - Rot", "generate": True, "confirm": True,
          "pass_env": "x"})
     assert res["error_code"] == "CONFIG_ERROR"
-    assert "removed in v0.4.9" in res["error"]
+    assert "was removed" in res["error"]
 
 
 def test_update_ssh_generate_rotates_key():
@@ -995,5 +995,5 @@ def test_update_ssh_upload_pass_env_rejected():
     res = tools["vaultwarden_update_ssh"](
         {"name": "SSH - Rot", "pass_env": "VW_ROT_PASS"})
     assert res["error_code"] == "CONFIG_ERROR"
-    assert "removed in v0.4.9" in res["error"]
+    assert "was removed" in res["error"]
     assert "pass_file" in res["suggestion"]

@@ -259,7 +259,7 @@ def _reject_removed_env_channel(args: dict, env_key: str, file_key: str,
     """
     if args.get(env_key):
         raise errors.ConfigError(
-            f"{tool_name}: {env_key!r} was removed in v0.4.9 — "
+            f"{tool_name}: {env_key!r} was removed — "
             "environment secrets require a Hermes restart to load.",
             suggestion=f"Use {file_key!r} (owner-only file, chmod 600) "
                        "or generate=true instead.")

@@ -762,7 +762,7 @@ def test_reject_removed_env_channel_raises():
     with pytest.raises(errors.ConfigError) as exc_info:
         _reject_removed_env_channel({"password_env": "VW_X"}, "password_env",
                                     "password_file", "vaultwarden_store")
-    assert "removed in v0.4.9" in exc_info.value.message
+    assert "was removed" in exc_info.value.message
     assert "password_file" in exc_info.value.suggestion
     # no-op when the removed key is absent/falsy
     _reject_removed_env_channel({}, "password_env", "password_file",
@@ -783,7 +783,7 @@ def test_store_password_env_rejected(write_auth_manager):
         {"type": "login", "name": "env-test", "username": "u",
          "password_env": "GH_TOKEN"})
     assert res["error_code"] == "CONFIG_ERROR"
-    assert "removed in v0.4.9" in res["error"]
+    assert "was removed" in res["error"]
     assert "password_file" in res["suggestion"]
 
 
@@ -795,7 +795,7 @@ def test_store_password_env_rejected_in_generate_mode(write_auth_manager):
         {"type": "login", "name": "gen-env", "generate": True,
          "password_env": "GH_TOKEN"})
     assert res["error_code"] == "CONFIG_ERROR"
-    assert "removed in v0.4.9" in res["error"]
+    assert "was removed" in res["error"]
 
 
 def test_store_password_file_resolved(write_auth_manager, tmp_path):
@@ -871,7 +871,7 @@ def test_update_password_env_rejected(write_auth_manager):
         {"item_id": "aaaa1111-0000-0000-0000-000000000001",
          "password_env": "VW_UPD_PW"})
     assert res["error_code"] == "CONFIG_ERROR"
-    assert "removed in v0.4.9" in res["error"]
+    assert "was removed" in res["error"]
     assert "password_file" in res["suggestion"]
 
 
