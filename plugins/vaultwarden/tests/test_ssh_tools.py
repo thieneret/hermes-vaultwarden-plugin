@@ -311,8 +311,6 @@ def test_get_ssh_key_uses_get_password():
     assert key_path == "/tmp/key"
 
 
-
-
 # ── _generate_ssh_keypair: mocked subprocess ─────────────────────────────────────────
 
 def _kp_run_factory(unencrypted=False,
@@ -773,17 +771,12 @@ def _store_ssh_tools():
 
 def test_store_ssh_generate_forbids_secret_inputs():
     auth, tools = _store_ssh_tools()
-    # v0.4.9 BREAKING: pass_env is rejected up front (explicit removal
-    # message); the remaining channels hit the generate-conflict check.
+    # The generate-conflict check covers the secret input channels.
     for k in ("pass", "pass_file", "file"):
         res = tools["vaultwarden_store_ssh"](
             {"name": "SSH - Gen", "generate": True, k: "x"})
         assert res["error_code"] == "CONFIG_ERROR", k
         assert "conflicts with" in res["error"]
-    res = tools["vaultwarden_store_ssh"](
-        {"name": "SSH - Gen", "generate": True, "pass_env": "x"})
-    assert res["error_code"] == "CONFIG_ERROR"
-    assert "was removed" in res["error"]
 
 
 def test_store_ssh_generate_bad_key_type():
@@ -850,21 +843,6 @@ def test_store_ssh_upload_raw_pass_dual_warning(tmp_path):
     assert "MUST warn the user" in res["warning"]
 
 
-def test_store_ssh_upload_pass_env_rejected(tmp_path):
-    """v0.4.9 BREAKING: pass_env was removed — explicit ConfigError,
-    never silently ignored."""
-    key = tmp_path / "id_ed25519"
-    key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n"
-                   "-----END OPENSSH PRIVATE KEY-----\n")
-    auth, tools = _store_ssh_tools()
-    res = tools["vaultwarden_store_ssh"](
-        {"name": "SSH - Up", "user": "deploy", "file": str(key),
-         "pass_env": "VW_SSH_PASS"})
-    assert res["error_code"] == "CONFIG_ERROR"
-    assert "was removed" in res["error"]
-    assert "pass_file" in res["suggestion"]
-
-
 def test_store_ssh_upload_pass_file(tmp_path):
     key = tmp_path / "id_ed25519"
     key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n"
@@ -908,26 +886,6 @@ def test_store_ssh_upload_missing_user_raises_config_error():
     assert "'user'" in res["error"] and "required in upload mode" in res["error"]
 
 
-def test_store_ssh_upload_pass_env_rejected_via_config(tmp_path):
-    """v0.4.9 BREAKING: even when the env var IS resolvable (config env
-    snapshot), pass_env is rejected — the channel no longer exists."""
-    key = tmp_path / "id_ed25519"
-    key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n"
-                   "-----END OPENSSH PRIVATE KEY-----\n")
-    auth, tools = _store_ssh_tools()
-    import os
-    os.environ["VW_SSH_MULTIPLEX_PASS"] = "multiplex-pass"
-    try:
-        res = tools["vaultwarden_store_ssh"](
-            {"name": "SSH - Up", "user": "deploy", "file": str(key),
-             "pass_env": "VW_SSH_MULTIPLEX_PASS"})
-    finally:
-        os.environ.pop("VW_SSH_MULTIPLEX_PASS", None)
-    assert res["error_code"] == "CONFIG_ERROR"
-    assert "was removed" in res["error"]
-
-
-
 def _update_ssh_tools():
     auth = _fake_auth(EXISTING_SSH)
     tools = _ssh_dict_tools(auth, auth._config, PlaceholderRegistry())  # noqa: SLF001
@@ -944,16 +902,11 @@ def test_update_ssh_generate_requires_confirm():
 
 def test_update_ssh_generate_forbids_secret_inputs():
     auth, tools = _update_ssh_tools()
-    # v0.4.9 BREAKING: pass_env rejected up front; others hit the conflict check.
+    # The generate-conflict check covers the secret input channels.
     for k in ("pass", "pass_file", "file"):
         res = tools["vaultwarden_update_ssh"](
             {"name": "SSH - Rot", "generate": True, "confirm": True, k: "x"})
         assert res["error_code"] == "CONFIG_ERROR", k
-    res = tools["vaultwarden_update_ssh"](
-        {"name": "SSH - Rot", "generate": True, "confirm": True,
-         "pass_env": "x"})
-    assert res["error_code"] == "CONFIG_ERROR"
-    assert "was removed" in res["error"]
 
 
 def test_update_ssh_generate_rotates_key():
@@ -987,13 +940,3 @@ def test_update_ssh_upload_raw_pass_warning():
     assert "warning" in res
     assert "raw-new-pass" not in json.dumps(res)
     assert auth._bw.edited_items[0]["login"]["password"] == "raw-new-pass"  # noqa: SLF001
-
-
-def test_update_ssh_upload_pass_env_rejected():
-    """v0.4.9 BREAKING: pass_env was removed — explicit ConfigError."""
-    auth, tools = _update_ssh_tools()
-    res = tools["vaultwarden_update_ssh"](
-        {"name": "SSH - Rot", "pass_env": "VW_ROT_PASS"})
-    assert res["error_code"] == "CONFIG_ERROR"
-    assert "was removed" in res["error"]
-    assert "pass_file" in res["suggestion"]

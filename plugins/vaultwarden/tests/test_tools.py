@@ -754,48 +754,7 @@ def test_rsi_none_provided():
     assert val is None and warning is None
 
 
-# ── v0.4.9 (BREAKING CHANGE): *_env channel removed — explicit rejection ──
-
-def test_reject_removed_env_channel_raises():
-    """_reject_removed_env_channel raises ConfigError mentioning v0.4.9."""
-    from vaultwarden.tools import _reject_removed_env_channel
-    with pytest.raises(errors.ConfigError) as exc_info:
-        _reject_removed_env_channel({"password_env": "VW_X"}, "password_env",
-                                    "password_file", "vaultwarden_store")
-    assert "was removed" in exc_info.value.message
-    assert "password_file" in exc_info.value.suggestion
-    # no-op when the removed key is absent/falsy
-    _reject_removed_env_channel({}, "password_env", "password_file",
-                                "vaultwarden_store")
-    _reject_removed_env_channel({"password_env": ""}, "password_env",
-                                "password_file", "vaultwarden_store")
-
-
 # ── h_store / h_update secret-input channel wiring ────────────────────────────────────────────────
-
-
-
-def test_store_password_env_rejected(write_auth_manager):
-    """v0.4.9 BREAKING: password_env now raises an explicit ConfigError."""
-    auth = _fake_auth(write_auth_manager)
-    tools = _channel_tools(auth)
-    res = tools["vaultwarden_store"](
-        {"type": "login", "name": "env-test", "username": "u",
-         "password_env": "GH_TOKEN"})
-    assert res["error_code"] == "CONFIG_ERROR"
-    assert "was removed" in res["error"]
-    assert "password_file" in res["suggestion"]
-
-
-def test_store_password_env_rejected_in_generate_mode(write_auth_manager):
-    """v0.4.9: rejection fires BEFORE the generate branch (not silent)."""
-    auth = _fake_auth(write_auth_manager)
-    tools = _channel_tools(auth)
-    res = tools["vaultwarden_store"](
-        {"type": "login", "name": "gen-env", "generate": True,
-         "password_env": "GH_TOKEN"})
-    assert res["error_code"] == "CONFIG_ERROR"
-    assert "was removed" in res["error"]
 
 
 def test_store_password_file_resolved(write_auth_manager, tmp_path):
@@ -862,17 +821,6 @@ def test_update_generate_conflicts_with_password_channels(write_auth_manager):
         res = tools["vaultwarden_update"](
             {"item_id": "i", "generate": True, k: "x"})
         assert res["error_code"] == "CONFIG_ERROR", k
-
-def test_update_password_env_rejected(write_auth_manager):
-    """v0.4.9 BREAKING: vaultwarden_update rejects password_env explicitly."""
-    auth = _fake_auth(write_auth_manager)
-    tools = _channel_tools(auth)
-    res = tools["vaultwarden_update"](
-        {"item_id": "aaaa1111-0000-0000-0000-000000000001",
-         "password_env": "VW_UPD_PW"})
-    assert res["error_code"] == "CONFIG_ERROR"
-    assert "was removed" in res["error"]
-    assert "password_file" in res["suggestion"]
 
 
 def test_update_raw_password_warning(write_auth_manager):

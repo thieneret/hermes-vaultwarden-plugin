@@ -245,26 +245,6 @@ _DIRECT_SECRET_WARNING = (
 )
 
 
-def _reject_removed_env_channel(args: dict, env_key: str, file_key: str,
-                                tool_name: str) -> None:
-    """Explicitly reject the removed *_env secret-input channel (v0.4.9).
-
-    BREAKING CHANGE (v0.4.9): the password_env / pass_env channels were
-    removed — in multiplex gateway mode Hermes loads .env only at startup,
-    so a secret added to .env requires a full Hermes restart before the
-    plugin can resolve it. Callers that still supply the parameter get a
-    clear ConfigError (never silently ignored). Called at the start of each
-    handler body, BEFORE the generate branch, so the rejection fires in
-    both generate and non-generate modes.
-    """
-    if args.get(env_key):
-        raise errors.ConfigError(
-            f"{tool_name}: {env_key!r} was removed — "
-            "environment secrets require a Hermes restart to load.",
-            suggestion=f"Use {file_key!r} (owner-only file, chmod 600) "
-                       "or generate=true instead.")
-
-
 def _resolve_secret_input(
     args: dict, *, direct_key: str, file_key: str, tool_name: str,
 ) -> tuple[str | None, str | None]:
@@ -281,8 +261,8 @@ def _resolve_secret_input(
     raised (fail-closed, no TOCTOU/symlink window).
 
     v0.4.9 (BREAKING CHANGE): the *_env channel (and with it the `env_key`
-    and `config` parameters) was REMOVED from this resolver; handlers
-    reject the removed parameters up front via _reject_removed_env_channel.
+    and `config` parameters) was REMOVED from this resolver; since the
+    HAVWP1 cleanup the removed parameters are no longer special-cased.
     """
     provided = [k for k in (direct_key, file_key) if args.get(k)]
     if len(provided) > 1:
@@ -717,10 +697,6 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     def h_store(args: dict, **kw: Any) -> str:
         def run():
             _require_write(config)
-            # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
-            # password_env channel — fires in generate AND non-generate mode.
-            _reject_removed_env_channel(args, "password_env", "password_file",
-                                        "vaultwarden_store")
             redactor = get_redacting_filter()
 
             generated_pw = None
@@ -817,10 +793,6 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     def h_update(args: dict, **kw: Any) -> str:
         def run():
             _require_write(config)
-            # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
-            # password_env channel — fires in generate AND non-generate mode.
-            _reject_removed_env_channel(args, "password_env", "password_file",
-                                        "vaultwarden_update")
             redactor = get_redacting_filter()
 
             generated_pw = None
@@ -1125,16 +1097,12 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
        (pass / pass_file); raw pass emits a dual-channel warning
        (log + response "warning" field).
 
-    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; supplying
-    it raises an explicit ConfigError (see _reject_removed_env_channel).
+    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; the
+    parameter has been unknown ever since (no dedicated rejection).
     """
 
     def run():
         _require_write(config)
-        # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
-        # pass_env channel — fires in generate AND non-generate mode.
-        _reject_removed_env_channel(args, "pass_env", "pass_file",
-                                    "vaultwarden_store_ssh")
         name = str(args["name"])
         generate = bool(args.get("generate", False))
         redactor = get_redacting_filter()
@@ -1277,16 +1245,12 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
     _resolve_secret_input (pass / pass_file) with a dual-channel
     warning on raw input.
 
-    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; supplying
-    it raises an explicit ConfigError (see _reject_removed_env_channel).
+    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; the
+    parameter has been unknown ever since (no dedicated rejection).
     """
 
     def run():
         _require_write(config)
-        # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
-        # pass_env channel — fires in generate AND non-generate mode.
-        _reject_removed_env_channel(args, "pass_env", "pass_file",
-                                    "vaultwarden_update_ssh")
         name = str(args["name"])
         generate = bool(args.get("generate", False))
         redactor = get_redacting_filter()
