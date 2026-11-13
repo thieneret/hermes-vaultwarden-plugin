@@ -245,26 +245,6 @@ _DIRECT_SECRET_WARNING = (
 )
 
 
-def _reject_removed_env_channel(args: dict, env_key: str, file_key: str,
-                                tool_name: str) -> None:
-    """Explicitly reject the removed *_env secret-input channel (v0.4.9).
-
-    BREAKING CHANGE (v0.4.9): the password_env / pass_env channels were
-    removed — in multiplex gateway mode Hermes loads .env only at startup,
-    so a secret added to .env requires a full Hermes restart before the
-    plugin can resolve it. Callers that still supply the parameter get a
-    clear ConfigError (never silently ignored). Called at the start of each
-    handler body, BEFORE the generate branch, so the rejection fires in
-    both generate and non-generate modes.
-    """
-    if args.get(env_key):
-        raise errors.ConfigError(
-            f"{tool_name}: {env_key!r} was removed in v0.4.9 — "
-            "environment secrets require a Hermes restart to load.",
-            suggestion=f"Use {file_key!r} (owner-only file, chmod 600) "
-                       "or generate=true instead.")
-
-
 def _resolve_secret_input(
     args: dict, *, direct_key: str, file_key: str, tool_name: str,
 ) -> tuple[str | None, str | None]:
@@ -281,8 +261,8 @@ def _resolve_secret_input(
     raised (fail-closed, no TOCTOU/symlink window).
 
     v0.4.9 (BREAKING CHANGE): the *_env channel (and with it the `env_key`
-    and `config` parameters) was REMOVED from this resolver; handlers
-    reject the removed parameters up front via _reject_removed_env_channel.
+    and `config` parameters) was REMOVED from this resolver; since the
+    HAVWP1 cleanup the removed parameters are no longer special-cased.
     """
     provided = [k for k in (direct_key, file_key) if args.get(k)]
     if len(provided) > 1:
@@ -520,6 +500,31 @@ def _collect_secret_strings(obj: Any) -> list[str]:
     return results
 
 
+def _known_params(schema: dict) -> set[str]:
+    """Declared parameter names of a tool schema (single source: schemas.py)."""
+    return set(schema.get("parameters", {}).get("properties", {}))
+
+
+def _reject_unknown_params(args: dict, known_keys: set[str],
+                           tool_name: str) -> None:
+    """Reject argument keys not declared in the tool's parameter schema.
+
+    Hermes core performs NO call-time schema validation of tool arguments
+    at dispatch: an unknown key travels end-to-end from the model into the
+    handler intact. The handler is therefore the enforcement point — every
+    handler calls this as its first guarded statement, before any other
+    logic (including generate branches). Fail-closed: the call aborts with
+    a ConfigError naming every undeclared key.
+    """
+    unknown = set(args) - known_keys
+    if unknown:
+        raise errors.ConfigError(
+            f"{tool_name}: unexpected parameter(s): "
+            f"{', '.join(sorted(unknown))}",
+            suggestion="Remove the undeclared parameter(s); consult the "
+                       "tool schema for the supported set.")
+
+
 def _guard(fn: Callable[[], dict]) -> str:
     """Execute handler and return JSON string.
 
@@ -590,6 +595,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             # Both stages are guarded so a status call NEVER hard-fails: on
             # total failure we return the observational snapshot, which then
             # truthfully reports operational=false.
+            _reject_unknown_params(args,
+                                   _known_params(schemas.VAULTWARDEN_STATUS),
+                                   "vaultwarden_status")
             try:
                 auth.get_session()
             except Exception:  # noqa: BLE001 - degraded below, never raises
@@ -612,7 +620,13 @@ def get_tools(auth: AuthManager, config: PluginConfig,
 
     # ---------------------------------------------------------------- sync
     def h_sync(args: dict, **kw: Any) -> str:
-        return _guard(lambda: auth.sync(force=bool(args.get("force"))))
+        def run():
+            _reject_unknown_params(args,
+                                   _known_params(schemas.VAULTWARDEN_SYNC),
+                                   "vaultwarden_sync")
+            return auth.sync(force=bool(args.get("force")))
+
+        return _guard(run)
 
     _tools.append((schemas.VAULTWARDEN_SYNC, h_sync))
 
@@ -622,6 +636,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             # BUG-3 fix: bw list items supports only --folderid/--collectionid/
             # --search; there is NO --filter-type flag. Type filtering is done
             # client-side on the returned items via _item_type_name().
+            _reject_unknown_params(args,
+                                   _known_params(schemas.VAULTWARDEN_LIST),
+                                   "vaultwarden_list")
             filters: list[str] = []
             if args.get("folder_id"):
                 filters += ["--folderid", str(args["folder_id"])]
@@ -643,6 +660,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # -------------------------------------------------------------- search
     def h_search(args: dict, **kw: Any) -> str:
         def run():
+            _reject_unknown_params(args,
+                                   _known_params(schemas.VAULTWARDEN_SEARCH),
+                                   "vaultwarden_search")
             query = str(args["query"])
             field = args.get("field")
             want_type = args.get("type")
@@ -681,6 +701,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # ------------------------------------------------------- get_secret_ref
     def h_get_secret_ref(args: dict, **kw: Any) -> str:
         def run():
+            _reject_unknown_params(args,
+                                   _known_params(schemas.VAULTWARDEN_GET_SECRET_REF),
+                                   "vaultwarden_get_secret_ref")
             item_id = str(args["item_id"])
             field_name = str(args["field"])
             custom = args.get("custom_field_name")
@@ -716,11 +739,10 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # --------------------------------------------------------------- store
     def h_store(args: dict, **kw: Any) -> str:
         def run():
+            _reject_unknown_params(args,
+                                   _known_params(schemas.VAULTWARDEN_STORE),
+                                   "vaultwarden_store")
             _require_write(config)
-            # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
-            # password_env channel — fires in generate AND non-generate mode.
-            _reject_removed_env_channel(args, "password_env", "password_file",
-                                        "vaultwarden_store")
             redactor = get_redacting_filter()
 
             generated_pw = None
@@ -816,11 +838,10 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # -------------------------------------------------------------- update
     def h_update(args: dict, **kw: Any) -> str:
         def run():
+            _reject_unknown_params(args,
+                                   _known_params(schemas.VAULTWARDEN_UPDATE),
+                                   "vaultwarden_update")
             _require_write(config)
-            # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
-            # password_env channel — fires in generate AND non-generate mode.
-            _reject_removed_env_channel(args, "password_env", "password_file",
-                                        "vaultwarden_update")
             redactor = get_redacting_filter()
 
             generated_pw = None
@@ -913,6 +934,9 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # -------------------------------------------------------------- delete
     def h_delete(args: dict, **kw: Any) -> str:
         def run():
+            _reject_unknown_params(args,
+                                   _known_params(schemas.VAULTWARDEN_DELETE),
+                                   "vaultwarden_delete")
             _require_write(config)
             if not args.get("confirm"):
                 raise errors.PermissionError_(
@@ -1125,16 +1149,15 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
        (pass / pass_file); raw pass emits a dual-channel warning
        (log + response "warning" field).
 
-    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; supplying
-    it raises an explicit ConfigError (see _reject_removed_env_channel).
+    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; the
+    parameter has been unknown ever since (no dedicated rejection).
     """
 
     def run():
+        _reject_unknown_params(args,
+                               _known_params(schemas.VAULTWARDEN_STORE_SSH),
+                               "vaultwarden_store_ssh")
         _require_write(config)
-        # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
-        # pass_env channel — fires in generate AND non-generate mode.
-        _reject_removed_env_channel(args, "pass_env", "pass_file",
-                                    "vaultwarden_store_ssh")
         name = str(args["name"])
         generate = bool(args.get("generate", False))
         redactor = get_redacting_filter()
@@ -1277,16 +1300,15 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
     _resolve_secret_input (pass / pass_file) with a dual-channel
     warning on raw input.
 
-    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; supplying
-    it raises an explicit ConfigError (see _reject_removed_env_channel).
+    v0.4.9 (BREAKING CHANGE): the pass_env channel was removed; the
+    parameter has been unknown ever since (no dedicated rejection).
     """
 
     def run():
+        _reject_unknown_params(args,
+                               _known_params(schemas.VAULTWARDEN_UPDATE_SSH),
+                               "vaultwarden_update_ssh")
         _require_write(config)
-        # v0.4.9 (BREAKING CHANGE): explicit rejection of the removed
-        # pass_env channel — fires in generate AND non-generate mode.
-        _reject_removed_env_channel(args, "pass_env", "pass_file",
-                                    "vaultwarden_update_ssh")
         name = str(args["name"])
         generate = bool(args.get("generate", False))
         redactor = get_redacting_filter()
@@ -1436,6 +1458,9 @@ def h_delete_ssh(args: dict, auth: AuthManager, config: PluginConfig,
     """Delete an SSH key item (including its attachment). confirm=true required."""
 
     def run():
+        _reject_unknown_params(args,
+                               _known_params(schemas.VAULTWARDEN_DELETE_SSH),
+                               "vaultwarden_delete_ssh")
         _require_write(config)
         if not args.get("confirm"):
             raise errors.PermissionError_(
@@ -1479,6 +1504,9 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
     """
 
     def run():
+        _reject_unknown_params(args,
+                               _known_params(schemas.VAULTWARDEN_USE_SSH),
+                               "vaultwarden_use_ssh")
         name = str(args["name"])
         # VWP-02 (v0.4.6): the LLM-controlled `ssh_auth_sock` argument was
         # removed from the schema; the socket path is resolved exclusively

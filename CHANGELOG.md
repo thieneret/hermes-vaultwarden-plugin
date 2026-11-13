@@ -5,6 +5,31 @@ Author: **thieneret**
 
 ---
 
+## v0.8.0 (2026-11-14)
+
+### Security (generic unknown-parameter rejection)
+- Added handler-level rejection of any argument key not declared in the tool
+  schema, applied to all 12 handlers. Compensates the Hermes core gap where
+  unknown parameters are not validated at dispatch (verified by runtime
+  probe). Closes the silent-ignore window introduced by the
+  `_reject_removed_env_channel` guard removal.
+
+### Cleanup / Refactoring
+- Removed redundant `_reject_removed_env_channel` guard (password_env/pass_env
+  special-casing replaced by the generic check above). (c3ff64e)
+- Purged plugin version references from runtime-visible strings: SSH tool
+  schema descriptions, ConfigError messages, and retargeted test assertions.
+  (7521ff3)
+- Renamed test files to remove HVA audit IDs from filenames
+  (test_hva03_file_input_hardening.py -> test_file_input_hardening.py,
+  test_hva04_ssh_socket_cleanup.py -> test_ssh_socket_cleanup.py). (5ed4a02)
+
+### Development Rules
+- New standing rule: audit IDs (HVA-xx, AUD-xx, SEC-xx, etc.) and plugin
+  version numbers must NOT appear in filenames or runtime-visible strings.
+  The current plugin version may appear in logs and in `vaultwarden_status`
+  output only.
+
 ## v0.7.9 (2026-11-13)
 
 ### Security (SEC-01 hardening)
