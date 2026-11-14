@@ -399,6 +399,15 @@ class PluginConfig:
         components could leak sensitive material into logging or diagnostic
         output, so validation is fail-closed: any prohibited component
         present => ConfigError. The path component remains allowed.
+
+        HVA-079-02 (v0.8.2): additionally validates the port component —
+        fail-closed. A present port must be an integer in the range
+        1-65535; non-numeric or out-of-range ports raise ConfigError. An
+        absent or empty port is accepted (the default port applies). The
+        rejection message names only the config key and the accepted
+        range — never the raw URL or port value; the underlying
+        urlparse ValueError echoes the raw port, so its context is
+        suppressed with ``raise ... from None``.
         """
         from urllib.parse import urlparse
 
@@ -445,6 +454,27 @@ class PluginConfig:
                 "secrets.vaultwarden.server_url must not contain fragments. "
                 "Fragments are not transmitted but may indicate "
                 "misconfiguration."
+            )
+
+        # HVA-079-02 (v0.8.2): port validation — fail-closed on 1-65535.
+        # Runs AFTER the HVA-02 component gates so their rejection wording
+        # keeps precedence for hostile URLs that also carry a bad port.
+        # urlparse().port raises ValueError for non-numeric ports and for
+        # numeric ports outside 0-65535; port 0 passes urlparse but names
+        # no connectable service, hence the explicit 1-65535 gate. An
+        # absent or empty port yields None and remains accepted.
+        try:
+            port = parsed.port
+        except ValueError:
+            raise errors.ConfigError(
+                "secrets.vaultwarden.server_url has an invalid or "
+                "out-of-range port. The port must be a number between "
+                "1 and 65535."
+            ) from None
+        if port is not None and not (1 <= port <= 65535):
+            raise errors.ConfigError(
+                "secrets.vaultwarden.server_url has an out-of-range port. "
+                "The port must be a number between 1 and 65535."
             )
 
     def validate(self) -> None:
