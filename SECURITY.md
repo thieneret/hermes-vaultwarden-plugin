@@ -1,6 +1,6 @@
 # Security Model — hermes-vaultwarden-plugin
 
-**Applies to:** v0.8.0
+**Applies to:** v0.8.1
 
 ## Threat Model
 
@@ -191,7 +191,7 @@ These controls MUST NOT fail. They are the foundation of the plugin's security:
 | Bitwarden appdata hardening | The Bitwarden appdata directory (`.bw-data`) is validated before `BITWARDENCLI_APPDATA_DIR` is exported and before every `bw` subprocess call. A symlinked, wrong-owner, or group/world-accessible `.bw-data` directory blocks Bitwarden CLI execution. |
 | `secrets.yaml` pre-parse validation | Before bootstrap secret parsing, `secrets.yaml` is validated as an absolute path, regular file, non-symlink, owned by the current effective UID, with no group/other access bits. An existing but insecure `secrets.yaml` is never parsed. |
 | Lifecycle hook fail-closed registration | Critical lifecycle hooks required for cleanup and session termination are validated and registered before tools are exposed. If a required lifecycle hook cannot be registered, plugin initialization aborts. Existing `transform_tool_result` and `tool_execution` fail-closed behavior remains unchanged. |
-| Scoped redaction lifecycle | Runtime secrets registered with the RedactingFilter are retained only for active execution scopes using thread-safe reference counting. Overlapping executions sharing a secret do not cause premature removal. Process-scoped secrets remain retained for the process lifetime. |
+| Scoped redaction lifecycle | Runtime secrets registered with the RedactingFilter are retained only for active execution scopes using thread-safe reference counting. Overlapping executions sharing a secret do not cause premature removal. Process-scoped secrets remain retained for the process lifetime. The per-execution secret handoff correlates by the host-provided unique per-tool-call `tool_call_id` (scope creation, active-scope registry, deferred grace store, result transformation, cleanup), with a sanitized `task_id` fallback when `tool_call_id` is unavailable — concurrent tool calls of one task never share or overwrite each other's redaction snapshots. |
 | Shell-safe secret file injection | Injected temporary secret-file paths are shell-quoted (shlex.quote) before command substitution to prevent command injection from unsafe runtime directory paths. Control-character paths fail closed. SEC-02 single-temp-file and $-prefix fail-safe semantics preserved. |
 
 ### File-injected Placeholder Injection (VWP-04) — Crash Recovery (VWP-20)
@@ -406,7 +406,7 @@ it outside the standard paths.
 - All CI checks (pytest, ruff) are **blocking** — a failing check prevents
 merge. (VWP-15)
 
-## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-02 + AUD-03 + AUD-04 + AUD-05 + AUD-06 + AUD-07 + AUD-08 + HOTFIX-01 + HVA-01 + HVA-02 + HVA-03 + HVA-04 + HVA-05 implemented/rejected)
+## Audit Status (20/20 VWP + SEC-01 + SEC-02 + SEC-03 + AUD-01 + AUD-02 + AUD-03 + AUD-04 + AUD-05 + AUD-06 + AUD-07 + AUD-08 + HOTFIX-01 + HVA-01 + HVA-02 + HVA-03 + HVA-04 + HVA-05 + HVA-079-01 implemented/rejected)
 
 | ID | Description | Implemented |
 | --- | --- | --- |
@@ -427,6 +427,7 @@ merge. (VWP-15)
 | HVA-03 | fd-based TOCTOU/symlink hardening for file-based secret inputs — `password_file` / `pass_file` are opened `O_NOFOLLOW` and validated (regular file, euid owner, exactly 0600) via `fstat` on the OPENED descriptor; symlinked / wrong-owner / insecure-mode inputs rejected fail-closed; sanitized errors carry path and code only, never secret content | v0.7.8 |
 | HVA-04 | SSH temporary socket cleanup hardening — cleanup unlinks only sockets whose creation identity (dev/ino, recorded at creation by the current process) and type (`S_ISSOCK` via `lstat`) are verified; symlinked or replaced paths are skipped with sanitized warnings; cleanup failures never crash execution | v0.7.8 |
 | HVA-05 | Full test-suite verification — complete suite runs to completion with exit code 0 in a supported environment (877 collected / 873 passed / 4 skipped / 0 failed; 4 skips are pre-existing root-only chown tests) | v0.7.8 |
+| HVA-079-01 | Concurrent secret correlation fix — deferred secrets keyed by unique per-tool-call `tool_call_id` (not shared `task_id`); sanitized `task_id` fallback when `tool_call_id` is unavailable | v0.8.1 |
 | VWP-01 | Binary path pinning (hash verification = operator responsibility) | v0.4.7 |
 | VWP-02 | SSH socket path restriction (dev-controlled env vars) | v0.4.6 |
 | VWP-03 | Middleware fail-closed registration | v0.4.3 |
