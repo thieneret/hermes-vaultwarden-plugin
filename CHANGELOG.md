@@ -25,11 +25,27 @@ Author: **thieneret**
   BREAKING CHANGE: PATH-based SSH binary discovery is removed. SSH users must
   configure `ssh_binary_dir` (and optionally per-binary overrides).
 
+### Observability
+- `vaultwarden_status` now includes an `ssh_tools` section reporting whether
+  the pinned SSH binaries are configured and valid: overall availability, the
+  resolved `ssh_binary_dir`, a per-binary verdict (`valid` / `invalid`) and a
+  concrete reason on failure (missing config, bad directory, bad binary). The
+  check is filesystem-only: it spawns no subprocess, requires no vault access
+  or unlocked session, and never raises.
+
 ### Tests
 - Added port-validation tests and SSH path-pinning fail-closed tests
   (directory rules, `{dir}/{name}` default resolution, override precedence,
   invalid-override and missing-binary fail-closed, no-PATH-lookup gate,
   registration surface and stale-socket cleanup skip).
+
+### Housekeeping
+- The "BREAKING CHANGE for SSH key users" callout block was removed from the
+  README (pre-1.0 development phase, no external users); the SSH config rows
+  remain in the Key settings table. The BREAKING note above stays for the record.
+- `uv.lock` project version entry synced to 0.8.2 (stale at 0.3.6 since the
+  0.3.x era). Standing rule added to the development rules: regenerate and
+  commit `uv.lock` after every version bump.
 
 ## v0.8.1 (2026-11-14)
 

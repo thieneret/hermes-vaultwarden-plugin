@@ -391,6 +391,8 @@ try/except that swallows failures. Fail-closed is mandatory.
 - Never wrap mandatory lifecycle-hook registration in a try/except block that swallows failures.
 - Do not treat a successful `None` return value from hook registration as failure unless the host API explicitly defines it as failure.
 - Lifecycle-hook registration failures must abort plugin initialization before tools are exposed.
+- After any version bump, regenerate the lockfile (`uv lock`) and commit the updated `uv.lock` so its project version entry stays in sync with `pyproject.toml` and the plugin manifest.
+- A committed `uv.lock` whose project version entry differs from the current manifest versions is a release-hygiene defect: fix it before closing the release.
 
 ## Compatibility Exceptions
 

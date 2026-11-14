@@ -316,14 +316,6 @@ Behavior and guarantees:
 | `bw_backoff_base` | Base delay (seconds) for exponential backoff. Default: `1.0` |
 | `bw_max_delay` | Maximum delay cap (seconds). Default: `10.0` |
 
-> ⚠️ **BREAKING CHANGE for SSH key users (v0.8.2):** PATH-based discovery of
-> the SSH helper binaries (`ssh-add`, `ssh-keygen`, `ssh-agent`) has been
-> **removed**. SSH users MUST set `ssh_binary_dir` to the directory holding
-> these binaries (e.g. `/usr/bin`); individual binaries may be overridden
-> with `ssh_add_path` / `ssh_keygen_path` / `ssh_agent_path`. Missing or
-> invalid values fail ONLY the four SSH key tools closed — vault,
-> placeholder and all other functionality remain unaffected.
-
 ## Tools
 
 The plugin exposes 12 tools to the Hermes agent. The LLM constructs the exact tool calls based on the registered JSON schemas and the `vaultwarden-usage` skill.
