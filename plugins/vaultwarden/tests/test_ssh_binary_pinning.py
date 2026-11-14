@@ -356,3 +356,75 @@ def test_non_ssh_handlers_unaffected_by_missing_ssh_keys(tmp_path):
                get_tools(_auth_stub(), cfg, MagicMock())}["vaultwarden_status"]
     res = json.loads(handler({}))
     assert "status" in res
+
+
+# -------------------------------------------- ssh_tools_status report
+
+def _status_handler(cfg):
+    return {s["name"]: h for s, h in
+            get_tools(_auth_stub(), cfg, MagicMock())}["vaultwarden_status"]
+
+
+def test_ssh_status_available_true_when_pinned_valid(tmp_path):
+    cfg = make_config(section=write_fake_ssh_binaries(str(tmp_path / "bins")))
+    rep = json.loads(_status_handler(cfg)({}))["ssh_tools"]
+    assert rep["available"] is True
+    d = os.path.abspath(str(tmp_path / "bins"))
+    assert rep["ssh_binary_dir"] == d
+    assert rep["binaries"] == {"ssh_add": "valid", "ssh_keygen": "valid",
+                               "ssh_agent": "valid"}
+    assert "reason" not in rep
+
+
+def test_ssh_status_unset_dir_reports_reason():
+    rep = json.loads(_status_handler(make_config())({}))["ssh_tools"]
+    assert rep["available"] is False
+    assert rep["reason"] == "ssh_binary_dir not configured"
+
+
+def test_ssh_status_invalid_binary_per_binary_detail(tmp_path):
+    bins = write_fake_ssh_binaries(str(tmp_path / "bins"))
+    (tmp_path / "bins" / "ssh-agent").chmod(0o644)  # not executable
+    rep = json.loads(_status_handler(make_config(section=bins))({}))["ssh_tools"]
+    assert rep["available"] is False
+    assert rep["binaries"]["ssh_add"] == "valid"
+    assert rep["binaries"]["ssh_agent"] == "invalid"
+    assert "ssh-agent" in rep["reason"]
+    assert "not executable" in rep["reason"]
+
+
+def test_ssh_status_bad_directory_skips_binaries(tmp_path):
+    d = tmp_path / "worldwritable"
+    d.mkdir()
+    d.chmod(0o757)
+    cfg = make_config(section={"ssh_binary_dir": str(d)})
+    rep = json.loads(_status_handler(cfg)({}))["ssh_tools"]
+    assert rep["available"] is False
+    assert "group/world-writable" in rep["reason"]
+    assert "binaries" not in rep  # directory failed: per-binary unchecked
+
+
+def test_ssh_status_spawns_no_subprocess(tmp_path):
+    cfg = make_config(section=write_fake_ssh_binaries(str(tmp_path / "bins")))
+    with patch("vaultwarden.tools.subprocess.run") as mock_run, \
+         patch("vaultwarden.tools.subprocess.Popen") as mock_popen:
+        rep = json.loads(_status_handler(cfg)({}))["ssh_tools"]
+    assert rep["available"] is True
+    mock_run.assert_not_called()
+    mock_popen.assert_not_called()
+
+
+def test_ssh_status_needs_no_unlocked_session(tmp_path):
+    # Fully failed auth reconciliation: status degrades to the
+    # observational snapshot but the SSH report must still be present.
+    auth = _auth_stub()
+    auth.get_session.side_effect = RuntimeError("locked")
+    auth.ensure_authenticated.side_effect = RuntimeError("locked")
+    auth.status_snapshot.return_value = {"operational": False}
+    cfg = make_config(section=write_fake_ssh_binaries(str(tmp_path / "bins")))
+    handler = {s["name"]: h for s, h in
+               get_tools(auth, cfg, MagicMock())}["vaultwarden_status"]
+    res = json.loads(handler({}))
+    assert res["status"]["operational"] is False
+    assert res["ssh_tools"]["available"] is True
+    assert res["ssh_tools"]["binaries"]["ssh_agent"] == "valid"

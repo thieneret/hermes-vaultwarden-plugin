@@ -353,6 +353,62 @@ def _require_ssh_binaries(config: PluginConfig) -> dict:
     return bins
 
 
+def ssh_tools_status(config: PluginConfig) -> dict:
+    """Filesystem-only SSH availability report for vaultwarden_status.
+
+    NEVER raises, spawns no subprocess, touches no vault or session:
+    it only re-runs the pinned-path directory/binary validators (the same
+    resolution the handlers and registration use) and reports each
+    binary's verdict. reason strings are the validator's own sanitized
+    wording (config keys + path labels only).
+
+    Shape:
+      valid:      {"available": True, "ssh_binary_dir": <resolved>,
+                   "binaries": {ssh_add|ssh_keygen|ssh_agent: "valid"}}
+      unset dir:  {"available": False, "reason": "ssh_binary_dir not
+                   configured"}
+      bad dir:    {"available": False, "ssh_binary_dir": <configured>,
+                   "reason": <validator message>}
+      bad bin:    {"available": False, "ssh_binary_dir": <resolved>,
+                   "binaries": {...per-binary "valid"/"invalid"...},
+                   "reason": <first failing binary's validator message>}
+    """
+    try:
+        raw_dir = str(getattr(config, "ssh_binary_dir", "") or "").strip()
+        if not raw_dir:
+            return {"available": False,
+                    "reason": "ssh_binary_dir not configured"}
+        try:
+            bdir = validate_ssh_binary_dir(raw_dir)
+        except errors.VaultwardenError as exc:
+            return {"available": False,
+                    "ssh_binary_dir": raw_dir,
+                    "reason": exc.message}
+        binaries: dict[str, str] = {}
+        first_bad: str | None = None
+        for key, name in _SSH_BINARY_KEYS.items():
+            override = str(getattr(config, key, "") or "").strip()
+            candidate = override or os.path.join(bdir, name)
+            try:
+                validate_ssh_binary_path(candidate, key)
+                binaries[name.replace("-", "_")] = "valid"
+            except errors.VaultwardenError as exc:
+                binaries[name.replace("-", "_")] = "invalid"
+                if first_bad is None:
+                    first_bad = exc.message
+        report: dict = {"available": first_bad is None,
+                        "ssh_binary_dir": bdir,
+                        "binaries": binaries}
+        if first_bad is not None:
+            report["reason"] = first_bad
+        return report
+    except Exception:  # noqa: BLE001 - status must never raise over this
+        log.debug("ssh_tools_status: unexpected check failure; reporting "
+                  "unavailable.")
+        return {"available": False,
+                "reason": "ssh status check failed unexpectedly"}
+
+
 _ASKPASS_SCRIPT_BODY = '#!/bin/sh\necho "$VW_SSH_PASS"\n'
 _ASKPASS_ENV_VAR = "VW_SSH_PASS"
 
@@ -831,7 +887,11 @@ def get_tools(auth: AuthManager, config: PluginConfig,
             # source of truth — see get_plugin_version).
             return {"status": auth.status_snapshot(),
                     "plugin_version": get_plugin_version(),
-                    "placeholders_active": len(registry.active_tokens())}
+                    "placeholders_active": len(registry.active_tokens()),
+                    # SSH availability is filesystem-only (no subprocess, no
+                    # vault/session dependency) and NEVER raises: operators
+                    # and the agent can see why the SSH tools are (un)usable.
+                    "ssh_tools": ssh_tools_status(config)}
 
         return _guard(build)
 
