@@ -151,6 +151,133 @@ def _ssh_base_env(extra: dict | None = None) -> dict:
     return env
 
 
+# ---------------------------------------------------------------------------
+# HVA-079-03 (v0.8.2, BREAKING): SSH binary path pinning — Option B.
+# ssh-add / ssh-keygen / ssh-agent are executed ONLY from the REQUIRED
+# pinned absolute paths configured in settings (config.yaml). There is NO
+# PATH lookup and NO environment-variable override — a compromised PATH
+# or a same-named malicious binary must never run with the plugin's
+# privileges, since these binaries handle private keys and passphrases.
+# The validation rules deliberately mirror validate_bw_path() rule-for-
+# rule; the bw validation itself is UNCHANGED (separate function, shared
+# model). Missing or invalid paths fail ONLY the SSH tools closed — the
+# plugin itself and all non-SSH tools stay available (SSH is optional
+# functionality, unlike bw which is core).
+
+#: config key -> binary name (labels for validator messages).
+_SSH_BINARY_KEYS = {
+    "ssh_add_path": "ssh-add",
+    "ssh_keygen_path": "ssh-keygen",
+    "ssh_agent_path": "ssh-agent",
+}
+
+#: Sentinel: get_tools() resolves the SSH bins itself when the caller
+#: did not pre-resolve them (None means "already checked: invalid").
+_SSH_BINS_UNRESOLVED = object()
+
+
+def validate_ssh_binary_path(raw: str, config_key: str) -> str:
+    """Strictly validate one pinned SSH binary path (mirrors validate_bw_path).
+
+    Rules (any failure raises):
+      * path must be non-empty                   -> ConfigError
+      * path must be absolute                    -> BinaryError
+      * no symlink anywhere in the chain         -> BinaryError
+      * target must be a regular file            -> BinaryError
+      * target must be executable (X_OK)         -> BinaryError
+      * target must NOT be group/world-writable  -> BinaryError
+      * owner must be root (uid 0) or the euid   -> BinaryError
+
+    Returns the validated (absolute) path string on success.
+    """
+    binary = _SSH_BINARY_KEYS[config_key]
+    raw = str(raw or "").strip()
+    if not raw:
+        raise errors.ConfigError(
+            f"{config_key} is required for the SSH tools.",
+            suggestion=f"Set plugins.entries.vaultwarden.settings."
+                       f"{config_key} to the FULL absolute path of the "
+                       f"{binary} binary (e.g. /usr/bin/{binary}).")
+
+    if not os.path.isabs(raw):
+        raise errors.BinaryError(
+            f"{config_key} {raw!r} must be an absolute path.")
+
+    # Symlink check FIRST: reject if the configured path is (or traverses)
+    # any symlink — abspath (lexical) must equal realpath (resolved).
+    abs_path = os.path.abspath(raw)
+    real_path = os.path.realpath(abs_path)
+    if abs_path != real_path:
+        raise errors.BinaryError(
+            f"{config_key} {raw!r} resolves through a symlink "
+            f"(realpath: {real_path}); symlinks are not allowed.")
+
+    try:
+        st = os.stat(abs_path)
+    except OSError as exc:
+        raise errors.BinaryError(
+            f"{binary} binary at {raw!r} not found or not accessible: "
+            f"{type(exc).__name__}") from exc
+
+    if not stat.S_ISREG(st.st_mode):
+        raise errors.BinaryError(
+            f"{config_key} {raw!r} is not a regular file.")
+
+    if not os.access(abs_path, os.X_OK):
+        raise errors.BinaryError(
+            f"{binary} binary at {raw!r} is not executable.")
+
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise errors.BinaryError(
+            f"{binary} binary at {raw!r} is group/world-writable; refusing "
+            "to execute a binary other users can modify.")
+
+    if st.st_uid not in (0, os.geteuid()):
+        raise errors.BinaryError(
+            f"{binary} binary at {raw!r} has unexpected owner uid "
+            f"{st.st_uid}; it must be owned by root or the current "
+            "effective user.")
+
+    return abs_path
+
+
+def resolve_ssh_binaries(config: PluginConfig) -> tuple[dict, object]:
+    """Resolve and validate all three pinned SSH binary paths.
+
+    Returns ({config_key: validated absolute path}, None) when ALL three
+    keys are configured and valid, or (None, error) describing the first
+    failure. QUIET by design: the caller owns the log/response wording
+    (registration warning line, handler error text).
+    """
+    bins: dict[str, str] = {}
+    for key in _SSH_BINARY_KEYS:
+        raw = str(getattr(config, key, "") or "")
+        try:
+            bins[key] = validate_ssh_binary_path(raw, key)
+        except errors.VaultwardenError as exc:
+            return None, exc
+    return bins, None
+
+
+def _require_ssh_binaries(config: PluginConfig) -> dict:
+    """Handler-level fail-closed gate: pinned bins or a raised ConfigError.
+
+    Every SSH tool handler calls this at the start of its run() (after
+    unknown-parameter rejection, before any vault or subprocess work),
+    so SSH binaries can NEVER be resolved through PATH on any path.
+    """
+    bins, err = resolve_ssh_binaries(config)
+    if err is not None:
+        raise errors.ConfigError(
+            f"SSH tools are fail-closed: {err.message}",
+            suggestion=(err.suggestion or (
+                "Set ssh_add_path / ssh_keygen_path / ssh_agent_path in "
+                "plugins.entries.vaultwarden.settings to the FULL absolute "
+                "paths of the ssh-add, ssh-keygen and ssh-agent binaries; "
+                "there is no PATH lookup.")))
+    return bins
+
+
 _ASKPASS_SCRIPT_BODY = '#!/bin/sh\necho "$VW_SSH_PASS"\n'
 _ASKPASS_ENV_VAR = "VW_SSH_PASS"
 
@@ -314,8 +441,14 @@ def _resolve_secret_input(
 
 def _generate_ssh_keypair(
     key_type: str, rsa_bits: int, comment: str, passphrase: str,
+    *, keygen_bin: str,
 ) -> tuple[str, str, str, str]:
     """Generate an SSH keypair in a temp dir; passphrase via SSH_ASKPASS.
+
+    HVA-079-03 (v0.8.2 BREAKING): ``keygen_bin`` is REQUIRED and must be
+    the validated absolute path of the ssh-keygen binary (from
+    resolve_ssh_binaries/_require_ssh_binaries). ssh-keygen is NEVER
+    resolved through PATH.
 
     ssh-keygen reads passphrases through read_passphrase(), which NEVER reads
     stdin — with a tty present it prompts the user on /dev/tty. Delivery is
@@ -343,7 +476,7 @@ def _generate_ssh_keypair(
     env = _askpass_env(passphrase)
     askpass_path = env["SSH_ASKPASS"]
     try:
-        cmd = ["ssh-keygen", "-t", key_type, "-f", key_path, "-C", comment]
+        cmd = [keygen_bin, "-t", key_type, "-f", key_path, "-C", comment]
         if key_type == "rsa":
             cmd += ["-b", str(rsa_bits)]
         proc = subprocess.run(
@@ -354,14 +487,15 @@ def _generate_ssh_keypair(
         if proc.returncode != 0:
             raise errors.VaultwardenError(
                 f"ssh-keygen failed (exit {proc.returncode})",
-                suggestion="Check ssh-keygen availability and key_type.",
+                suggestion="Check the pinned ssh_keygen_path setting and "
+                           "key_type.",
             )
         # SAFETY VERIFY — see docstring.
         # v0.4.2: start_new_session=True is the critical fix here — without a
         # controlling tty, -yf on an encrypted key fails fast instead of
         # hanging on a /dev/tty passphrase prompt (interactive sessions).
         verify = subprocess.run(
-            ["ssh-keygen", "-yf", key_path], env=_ssh_base_env(),
+            [keygen_bin, "-yf", key_path], env=_ssh_base_env(),
             stdin=subprocess.DEVNULL, capture_output=True, text=True,
             timeout=10,
             start_new_session=True,   # detach from controlling tty: no
@@ -378,7 +512,7 @@ def _generate_ssh_keypair(
         with open(pub_path, "r", encoding="utf-8") as f:
             public_key = f.read().strip()
         fp_proc = subprocess.run(
-            ["ssh-keygen", "-lf", pub_path], env=_ssh_base_env(),
+            [keygen_bin, "-lf", pub_path], env=_ssh_base_env(),
             stdin=subprocess.DEVNULL, capture_output=True, text=True,
             timeout=10,
             start_new_session=True,   # detach from controlling tty
@@ -559,7 +693,9 @@ def _vault_error(message: str, *, code: str,
 
 # --------------------------------------------------------------- handlers
 def get_tools(auth: AuthManager, config: PluginConfig,
-              registry: PlaceholderRegistry) -> list[tuple[dict, Handler]]:
+              registry: PlaceholderRegistry,
+              ssh_bins: dict | None = _SSH_BINS_UNRESOLVED
+              ) -> list[tuple[dict, Handler]]:
     """Return (schema, handler) pairs for all vaultwarden tools.
 
     v0.2.8: returns a concrete list of (schema, handler) pairs — the
@@ -567,6 +703,14 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     the end of the list.
     v0.3.7 (VWP-12): 12 tools — vaultwarden_generate_password was removed;
     password generation is integrated into store/update via generate=true.
+    HVA-079-03 (v0.8.2, BREAKING): SSH binary pinning — the 4 SSH tools
+    are registered ONLY when all three pinned paths (ssh_add_path /
+    ssh_keygen_path / ssh_agent_path) are configured and valid; otherwise
+    they fail closed (not registered; a direct handler call still refuses
+    via _require_ssh_binaries). The 8 non-SSH tools are unaffected —
+    SSH is optional functionality. Pass *ssh_bins* pre-resolved (from
+    resolve_ssh_binaries; None means "confirmed invalid") to skip the
+    internal resolution and its warning log.
     """
     _tools: list[tuple[dict, Handler]] = []
 
@@ -961,26 +1105,38 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # per-session auth/config objects — no duplicated implementation code.
     # Helpers (_validate_ssh_key_file / _resolve_socket_path) are also
     # module-level only.
+    #
+    # HVA-079-03 (v0.8.2, BREAKING): the SSH tools are registered ONLY
+    # with pinned, validated ssh_add_path / ssh_keygen_path /
+    # ssh_agent_path settings (no PATH lookup). Missing/invalid paths
+    # fail these four tools closed — the 8 non-SSH tools stay available.
+    if ssh_bins is _SSH_BINS_UNRESOLVED:
+        ssh_bins, _ssh_err = resolve_ssh_binaries(config)
+        if ssh_bins is None:
+            log.warning("SSH key management tools NOT registered (fail-"
+                        "closed): ssh_add_path / ssh_keygen_path / "
+                        "ssh_agent_path missing or invalid; non-SSH tools "
+                        "unaffected.")
+    if ssh_bins is not None:
+        def _h_store_ssh_bound(args: dict, **kw: Any) -> str:
+            return h_store_ssh(args, auth=auth, config=config, **kw)
 
-    def _h_store_ssh_bound(args: dict, **kw: Any) -> str:
-        return h_store_ssh(args, auth=auth, config=config, **kw)
+        _tools.append((schemas.VAULTWARDEN_STORE_SSH, _h_store_ssh_bound))
 
-    _tools.append((schemas.VAULTWARDEN_STORE_SSH, _h_store_ssh_bound))
+        def _h_update_ssh_bound(args: dict, **kw: Any) -> str:
+            return h_update_ssh(args, auth=auth, config=config, **kw)
 
-    def _h_update_ssh_bound(args: dict, **kw: Any) -> str:
-        return h_update_ssh(args, auth=auth, config=config, **kw)
+        _tools.append((schemas.VAULTWARDEN_UPDATE_SSH, _h_update_ssh_bound))
 
-    _tools.append((schemas.VAULTWARDEN_UPDATE_SSH, _h_update_ssh_bound))
+        def _h_delete_ssh_bound(args: dict, **kw: Any) -> str:
+            return h_delete_ssh(args, auth=auth, config=config, **kw)
 
-    def _h_delete_ssh_bound(args: dict, **kw: Any) -> str:
-        return h_delete_ssh(args, auth=auth, config=config, **kw)
+        _tools.append((schemas.VAULTWARDEN_DELETE_SSH, _h_delete_ssh_bound))
 
-    _tools.append((schemas.VAULTWARDEN_DELETE_SSH, _h_delete_ssh_bound))
+        def _h_use_ssh_bound(args: dict, **kw: Any) -> str:
+            return h_use_ssh(args, auth=auth, config=config, **kw)
 
-    def _h_use_ssh_bound(args: dict, **kw: Any) -> str:
-        return h_use_ssh(args, auth=auth, config=config, **kw)
-
-    _tools.append((schemas.VAULTWARDEN_USE_SSH, _h_use_ssh_bound))
+        _tools.append((schemas.VAULTWARDEN_USE_SSH, _h_use_ssh_bound))
 
     return _tools
 
@@ -1056,8 +1212,13 @@ def forget_socket_creation(sock: str) -> None:
         _socket_creations.pop(os.path.abspath(sock), None)
 
 
-def _resolve_socket_path() -> tuple[str, bool]:
+def _resolve_socket_path(ssh_add_bin: str, ssh_agent_bin: str) -> tuple[str, bool]:
     """Resolve the ssh-agent socket path (developer-controlled).
+
+    HVA-079-03 (v0.8.2 BREAKING): the agent probe (ssh-add -l) and the
+    agent startup (ssh-agent -a) run from the REQUIRED pinned absolute
+    paths passed in by the caller (resolve_ssh_binaries output) — the
+    binaries are NEVER resolved through PATH.
 
     VWP-02 (v0.4.6, BREAKING): the LLM-controlled ``ssh_auth_sock`` tool
     parameter was removed — it enabled local process/socket takeover
@@ -1076,7 +1237,7 @@ def _resolve_socket_path() -> tuple[str, bool]:
     """
     def _agent_running(sock: str) -> bool:
         try:
-            r = subprocess.run(["ssh-add", "-l"],
+            r = subprocess.run([ssh_add_bin, "-l"],
                                env=_ssh_base_env({"SSH_AUTH_SOCK": sock}),
                                capture_output=True, text=True, timeout=5)
             return r.returncode in (0, 1)
@@ -1097,7 +1258,7 @@ def _resolve_socket_path() -> tuple[str, bool]:
                 "Socket path or parent directory is a symlink.",
                 code="SECURITY_ERROR",
                 suggestion="Use a direct path, not a symlink.")
-        subprocess.run(["ssh-agent", "-a", sock],
+        subprocess.run([ssh_agent_bin, "-a", sock],
                        env=_ssh_base_env(),
                        capture_output=True, text=True, timeout=10)
         # HVA-04: capture creation identity IMMEDIATELY after creation so
@@ -1158,6 +1319,9 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                                _known_params(schemas.VAULTWARDEN_STORE_SSH),
                                "vaultwarden_store_ssh")
         _require_write(config)
+        # HVA-079-03 (v0.8.2 BREAKING): pinned-binary gate — runs before any
+        # vault or subprocess work; SSH binaries are never PATH-resolved.
+        ssh_bins = _require_ssh_binaries(config)
         name = str(args["name"])
         generate = bool(args.get("generate", False))
         redactor = get_redacting_filter()
@@ -1196,7 +1360,8 @@ def h_store_ssh(args: dict, auth: AuthManager, config: PluginConfig,
             try:
                 tmpdir, key_path, public_key, fingerprint = \
                     _generate_ssh_keypair(key_type, rsa_bits,
-                                          comment=name, passphrase=passphrase)
+                                          comment=name, passphrase=passphrase,
+                                          keygen_bin=ssh_bins["ssh_keygen_path"])
                 try:
                     with open(key_path, "r", encoding="utf-8",
                               errors="replace") as f:
@@ -1309,6 +1474,9 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                                _known_params(schemas.VAULTWARDEN_UPDATE_SSH),
                                "vaultwarden_update_ssh")
         _require_write(config)
+        # HVA-079-03 (v0.8.2 BREAKING): pinned-binary gate — before any
+        # vault or subprocess work; SSH binaries are never PATH-resolved.
+        ssh_bins = _require_ssh_binaries(config)
         name = str(args["name"])
         generate = bool(args.get("generate", False))
         redactor = get_redacting_filter()
@@ -1363,7 +1531,8 @@ def h_update_ssh(args: dict, auth: AuthManager, config: PluginConfig,
             try:
                 tmpdir, key_path, public_key, fingerprint = \
                     _generate_ssh_keypair(key_type, rsa_bits,
-                                          comment=name, passphrase=passphrase)
+                                          comment=name, passphrase=passphrase,
+                                          keygen_bin=ssh_bins["ssh_keygen_path"])
                 try:
                     with open(key_path, "r", encoding="utf-8",
                               errors="replace") as f:
@@ -1462,6 +1631,10 @@ def h_delete_ssh(args: dict, auth: AuthManager, config: PluginConfig,
                                _known_params(schemas.VAULTWARDEN_DELETE_SSH),
                                "vaultwarden_delete_ssh")
         _require_write(config)
+        # HVA-079-03 (v0.8.2 BREAKING): the SSH tool group fails closed as
+        # a unit — direct calls are rejected when the pinned binaries are
+        # missing/invalid, even for the no-subprocess delete handler.
+        _require_ssh_binaries(config)
         if not args.get("confirm"):
             raise errors.PermissionError_(
                 "Deletion requires explicit confirm=true.",
@@ -1488,10 +1661,15 @@ def h_delete_ssh(args: dict, auth: AuthManager, config: PluginConfig,
     return _guard(run)
 
 
-def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
+def h_use_ssh(args: dict, auth: AuthManager, config: PluginConfig,
+              **kw: Any) -> str:
     """Load an SSH private key from the vault into ssh-agent (v0.2.8).
 
     Security guarantees:
+    - HVA-079-03 (v0.8.2 BREAKING): ssh-add / ssh-keygen / ssh-agent run
+      ONLY from the pinned, validated absolute paths supplied by the
+      three ssh_*_path settings — never PATH-resolved; the handler fails
+      closed when any path is missing or invalid.
     - Passphrase delivered via the SSH_ASKPASS mechanism: a dynamically
       generated shell script containing ONLY `echo "$VW_SSH_PASS"` runs
       as the askpass helper; the passphrase itself is passed to the
@@ -1507,6 +1685,9 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
         _reject_unknown_params(args,
                                _known_params(schemas.VAULTWARDEN_USE_SSH),
                                "vaultwarden_use_ssh")
+        # HVA-079-03 (v0.8.2 BREAKING): pinned-binary gate — before any
+        # vault or subprocess work; SSH binaries are never PATH-resolved.
+        ssh_bins = _require_ssh_binaries(config)
         name = str(args["name"])
         # VWP-02 (v0.4.6): the LLM-controlled `ssh_auth_sock` argument was
         # removed from the schema; the socket path is resolved exclusively
@@ -1525,7 +1706,8 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
         item = exact[0]
         item_id = item.get("id", "")
 
-        sock, agent_started = _resolve_socket_path()
+        sock, agent_started = _resolve_socket_path(
+            ssh_bins["ssh_add_path"], ssh_bins["ssh_agent_path"])
 
         key_path = None
         askpass_path = None
@@ -1565,7 +1747,7 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
             env = _askpass_env(passphrase, extra={"SSH_AUTH_SOCK": sock})
             askpass_path = env["SSH_ASKPASS"]
             proc = subprocess.run(
-                ["ssh-add", key_path],
+                [ssh_bins["ssh_add_path"], key_path],
                 env=env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True, text=True, timeout=30,
@@ -1579,7 +1761,7 @@ def h_use_ssh(args: dict, auth: AuthManager, **kw: Any) -> str:
                     suggestion="Check if the passphrase is correct.")
 
             fp_proc = subprocess.run(
-                ["ssh-keygen", "-lf", key_path],
+                [ssh_bins["ssh_keygen_path"], "-lf", key_path],
                 env=_ssh_base_env(),
                 capture_output=True, text=True, timeout=10)
             fingerprint = (fp_proc.stdout or "").strip().split()[1] \

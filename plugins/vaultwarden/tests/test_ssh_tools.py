@@ -16,7 +16,7 @@ import pytest
 from vaultwarden import errors
 from vaultwarden.auth import AuthManager, AuthState
 from vaultwarden.placeholders import PlaceholderRegistry
-from vaultwarden.tests.conftest import make_config
+from vaultwarden.tests.conftest import make_config, write_fake_ssh_binaries
 from vaultwarden.tools import (
     _ASKPASS_SCRIPT_BODY,
     _askpass_env,
@@ -25,6 +25,24 @@ from vaultwarden.tools import (
     _resolve_socket_path,
     _validate_ssh_key_file,
 )
+
+# HVA-079-03: SSH binaries are pinned; there is no PATH lookup. Tests that
+# mock subprocess.run only need matching pinned argv strings (files need not
+# exist). Tests that reach the tool gate / get_tools registration need real
+# executable stubs that satisfy the strict validator — created once here
+# (inert stubs: '#!/bin/sh' + 'exit 0').
+_PB_ADD = "/usr/bin/ssh-add"
+_PB_AGENT = "/usr/bin/ssh-agent"
+_PB_KEYGEN = "/usr/bin/ssh-keygen"
+
+_SSH_STUB_DIR = tempfile.mkdtemp(prefix="vw_ssh_stub_bins_")
+_SSH_BINS = write_fake_ssh_binaries(_SSH_STUB_DIR)
+
+# Thin wrapper: production now REQUIRES the keygen_bin kwarg (HVA-079-03).
+# subprocess.run is mocked on every path reached from here, so a pinned
+# path that does not exist on disk is fine — only argv strings are used.
+def _gen_kp(*args, keygen_bin=_PB_KEYGEN):
+    return _generate_ssh_keypair(*args, keygen_bin=keygen_bin)
 
 # ── SSH key file validation ──────────────────────────────────────────────
 
@@ -59,12 +77,12 @@ def test_resolve_socket_vw_env_var_running(tmp_path):
     with patch.dict(os.environ, {"VW_SSH_SOCKET_PATH": sock_path}, clear=False):
         with patch("vaultwarden.tools.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)  # ssh-add -l OK
-            sock, started = _resolve_socket_path()
+            sock, started = _resolve_socket_path(_PB_ADD, _PB_AGENT)
             assert sock == os.path.abspath(sock_path)
             assert started is False
             # only the ssh-add probe ran — no ssh-agent spawn
             assert mock_run.call_count == 1
-            assert mock_run.call_args_list[0][0][0] == ["ssh-add", "-l"]
+            assert mock_run.call_args_list[0][0][0] == [_PB_ADD, "-l"]
 
 
 def test_resolve_socket_vw_env_var_not_running(tmp_path):
@@ -76,11 +94,11 @@ def test_resolve_socket_vw_env_var_not_running(tmp_path):
                 MagicMock(returncode=2),  # ssh-add -l → no agent
                 MagicMock(returncode=0),  # ssh-agent -a → started
             ]
-            sock, started = _resolve_socket_path()
+            sock, started = _resolve_socket_path(_PB_ADD, _PB_AGENT)
             assert sock == os.path.abspath(sock_path)
             assert started is True
             agent_call = mock_run.call_args_list[1]
-            assert agent_call[0][0][:2] == ["ssh-agent", "-a"]
+            assert agent_call[0][0][:2] == [_PB_AGENT, "-a"]
             assert sock in agent_call[0][0]
 
 
@@ -91,7 +109,7 @@ def test_resolve_socket_fallback_xdg_runtime(tmp_path):
             "XDG_RUNTIME_DIR": str(tmp_path)}, clear=False):
         with patch("vaultwarden.tools.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1)  # agent running (no keys)
-            sock, started = _resolve_socket_path()
+            sock, started = _resolve_socket_path(_PB_ADD, _PB_AGENT)
             assert sock == os.path.join(str(tmp_path), "auth.sock")
             assert started is False
 
@@ -107,7 +125,7 @@ def test_resolve_socket_symlink_rejected(tmp_path):
         with patch("vaultwarden.tools.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=2)  # no agent → try start
             with pytest.raises(errors.VaultwardenError) as exc_info:
-                _resolve_socket_path()
+                _resolve_socket_path(_PB_ADD, _PB_AGENT)
             assert exc_info.value.code == "SECURITY_ERROR"
 
 
@@ -134,7 +152,7 @@ def test_cleanup_stale_sockets_removes_stale(tmp_path):
             "XDG_RUNTIME_DIR": ""}, clear=False):
         with patch("vaultwarden.hooks.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=2)  # agent not running
-            _cleanup_stale_sockets()
+            _cleanup_stale_sockets(_PB_ADD)
     assert not stale.exists()
 
 
@@ -148,7 +166,7 @@ def test_cleanup_stale_sockets_keeps_active(tmp_path):
             "XDG_RUNTIME_DIR": ""}, clear=False):
         with patch("vaultwarden.hooks.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)  # agent running
-            _cleanup_stale_sockets()
+            _cleanup_stale_sockets(_PB_ADD)
     assert active.exists()
 
 
@@ -232,9 +250,9 @@ def test_use_ssh_env_keyset_and_cleanup(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
     monkeypatch.setattr(tools, "_resolve_socket_path",
-                        lambda: ("/tmp/fake.sock", False))
+                        lambda *a: ("/tmp/fake.sock", False))
     registry = PlaceholderRegistry()
-    cfg = make_config()
+    cfg = make_config(section=dict(_SSH_BINS))
     handler = {s["name"]: h for s, h in
                tools.get_tools(auth, cfg, registry)}["vaultwarden_use_ssh"]
     res_json = handler({"name": "SSH - X"})
@@ -242,7 +260,7 @@ def test_use_ssh_env_keyset_and_cleanup(monkeypatch, tmp_path):
     res = _json.loads(res_json) if isinstance(res_json, str) else res_json
     assert res["loaded"] is True
 
-    add_call = next(c for c in calls if c[0][0] == "ssh-add")
+    add_call = next(c for c in calls if c[0][0] == _SSH_BINS["ssh_add_path"])
     env = add_call[1]["env"]
     assert set(env) == {"PATH", "HOME", "LC_ALL", "SSH_AUTH_SOCK",
                         "SSH_ASKPASS_REQUIRE", "SSH_ASKPASS", "VW_SSH_PASS"}
@@ -319,7 +337,7 @@ def _kp_run_factory(unencrypted=False,
 
     def fake_run(cmd, **kw):
         calls.append((list(cmd), kw))
-        if cmd[:2] == ["ssh-keygen", "-yf"]:
+        if len(cmd) > 1 and cmd[1] == "-yf":
             rc = 0 if unencrypted else 1
             return MagicMock(returncode=rc, stdout="", stderr="")
         if "-lf" in cmd:
@@ -343,7 +361,7 @@ def test_gen_keypair_passphrase_via_askpass_not_stdin_or_argv():
 
     fake = _kp_run_factory()
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake):
-        tmpdir, key_path, public_key, fp = _generate_ssh_keypair(
+        tmpdir, key_path, public_key, fp = _gen_kp(
             "ed25519", 4096, "comment", "the-passphrase-123")
     try:
         gen_cmd, gen_kw = fake.calls[0]
@@ -380,7 +398,7 @@ def test_gen_keypair_all_calls_start_new_session():
     """
     fake = _kp_run_factory()
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake):
-        tmpdir, _, _, _ = _generate_ssh_keypair(
+        tmpdir, _, _, _ = _gen_kp(
             "ed25519", 4096, "comment", "pp1234")
     try:
         assert len(fake.calls) == 3
@@ -388,8 +406,8 @@ def test_gen_keypair_all_calls_start_new_session():
             assert kw.get("start_new_session") is True, \
                 f"missing start_new_session on {cmd[:2]}"
         # critical fix lives on the -yf verify call specifically
-        verify_kw = next(kw for cmd, kw in fake.calls if cmd[:2] ==
-                         ["ssh-keygen", "-yf"])
+        verify_kw = next(kw for cmd, kw in fake.calls
+                         if cmd[1:2] == ["-yf"])
         assert verify_kw["start_new_session"] is True
         assert "input" not in verify_kw              # no stdin delivery
     finally:
@@ -402,7 +420,7 @@ def test_gen_keypair_verify_rc_nonzero_proceeds_rc_zero_aborts():
     # Encrypted key: -yf fails (rc=1) -> flow proceeds normally.
     fake_ok = _kp_run_factory(unencrypted=False)
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake_ok):
-        tmpdir, _, public_key, fp = _generate_ssh_keypair(
+        tmpdir, _, public_key, fp = _gen_kp(
             "ed25519", 4096, "c", "pp1234")
     try:
         assert public_key and fp == "SHA256:abc123fp"
@@ -414,14 +432,14 @@ def test_gen_keypair_verify_rc_nonzero_proceeds_rc_zero_aborts():
     fake_bad = _kp_run_factory(unencrypted=True)
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake_bad):
         with pytest.raises(errors.VaultwardenError) as exc_info:
-            _generate_ssh_keypair("ed25519", 4096, "c", "pp1234")
+            _gen_kp("ed25519", 4096, "c", "pp1234")
     assert "UNENCRYPTED" in exc_info.value.message
 
 
 def test_gen_keypair_rsa_adds_bits_default_4096():
     fake = _kp_run_factory()
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake):
-        tmpdir, _, _, _ = _generate_ssh_keypair(
+        tmpdir, _, _, _ = _gen_kp(
             "rsa", 4096, "c", "pp1234")
     try:
         gen_cmd = fake.calls[0][0]
@@ -434,7 +452,7 @@ def test_gen_keypair_rsa_adds_bits_default_4096():
 def test_gen_keypair_rsa_custom_bits():
     fake = _kp_run_factory(pub="ssh-rsa AAAAB3 public comment")
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake):
-        tmpdir, _, _, _ = _generate_ssh_keypair("rsa", 2048, "c", "pp1234")
+        tmpdir, _, _, _ = _gen_kp("rsa", 2048, "c", "pp1234")
     try:
         gen_cmd = fake.calls[0][0]
         assert gen_cmd[gen_cmd.index("-b") + 1] == "2048"
@@ -448,7 +466,7 @@ def test_gen_keypair_unencrypted_key_aborts():
     fake = _kp_run_factory(unencrypted=True)
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake):
         with pytest.raises(errors.VaultwardenError) as exc_info:
-            _generate_ssh_keypair("ed25519", 4096, "c", "pp1234")
+            _gen_kp("ed25519", 4096, "c", "pp1234")
     assert "UNENCRYPTED" in exc_info.value.message
 
 
@@ -457,7 +475,7 @@ def test_gen_keypair_ssh_keygen_failure_raises():
         return MagicMock(returncode=1, stdout="", stderr="boom")
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake_run):
         with pytest.raises(errors.VaultwardenError):
-            _generate_ssh_keypair("ed25519", 4096, "c", "pp1234")
+            _gen_kp("ed25519", 4096, "c", "pp1234")
 
 
 def test_gen_keypair_askpass_script_unlinked_on_failure():
@@ -470,7 +488,7 @@ def test_gen_keypair_askpass_script_unlinked_on_failure():
 
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake_run):
         with pytest.raises(errors.VaultwardenError):
-            _generate_ssh_keypair("ed25519", 4096, "c", "pp1234")
+            _gen_kp("ed25519", 4096, "c", "pp1234")
     assert not os.path.exists(captured["SSH_ASKPASS"])
 
 
@@ -479,7 +497,7 @@ def test_gen_keypair_askpass_script_unlinked_when_verify_aborts():
     fake = _kp_run_factory(unencrypted=True)
     with patch("vaultwarden.tools.subprocess.run", side_effect=fake):
         with pytest.raises(errors.VaultwardenError):
-            _generate_ssh_keypair("ed25519", 4096, "c", "pp1234")
+            _gen_kp("ed25519", 4096, "c", "pp1234")
     env = fake.calls[0][1]["env"]
     assert not os.path.exists(env["SSH_ASKPASS"])
 
@@ -616,7 +634,7 @@ def _run_keypair_with_fake_keygen(script_body: str, passphrase: str):
     real_run = subprocess.run
 
     def patched_run(cmd, **kw):
-        if cmd and cmd[0] == "ssh-keygen":
+        if cmd and cmd[0] == fake:
             env = dict(kw.get("env") or {})
             env["PATH"] = bindir + ":" + env.get("PATH", "")
             env["EXPECT_PASS"] = passphrase
@@ -625,8 +643,9 @@ def _run_keypair_with_fake_keygen(script_body: str, passphrase: str):
 
     try:
         with patch("vaultwarden.tools.subprocess.run", side_effect=patched_run):
-            return _generate_ssh_keypair(
-                "ed25519", 4096, "comment", passphrase)
+            return _gen_kp(
+                "ed25519", 4096, "comment", passphrase,
+                keygen_bin=fake)
     finally:
         shutil.rmtree(bindir, ignore_errors=True)
 
@@ -742,7 +761,7 @@ def _fake_auth(existing_items=None):
     on what actually reaches the (fake) bw layer via bw.edited_items.
     """
     bw = FakeBw(existing_items)
-    cfg = make_config(section={"allow_write": True})
+    cfg = make_config(section={"allow_write": True, **_SSH_BINS})
     auth = AuthManager.__new__(AuthManager)
     auth._bw = bw                                    # noqa: SLF001
     auth._config = cfg                               # noqa: SLF001

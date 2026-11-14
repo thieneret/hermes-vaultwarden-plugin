@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 
 import vaultwarden
-from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
+from vaultwarden.tests.conftest import (
+    BASE_SECTION,
+    RecordingCtx,
+    write_fake_ssh_binaries,
+)
 
 TOKEN_RE = re.compile(r"__VW_SECRET_[0-9a-f]{12}__")
 
@@ -46,9 +50,14 @@ def _register_ok(monkeypatch, tmp_path, fake_bw, section_extra=None, env_extra=N
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "docker")  # sandboxed backend -> INFO
+    # SSH pinning (HVA-079-03 BREAKING): the SSH tool group registers only
+    # with pinned valid ssh_*_path settings — pin executable stubs so the
+    # default registration surface stays at 12 tools.
+    ssh_bins = write_fake_ssh_binaries(str(tmp_path / "ssh-bins"))
     for k, v in (env_extra or {}).items():
         monkeypatch.setenv(k, v)
-    section = {**BASE_SECTION, "bw_cli_path": fake_bw, **(section_extra or {})}
+    section = {**BASE_SECTION, "bw_cli_path": fake_bw, **ssh_bins,
+               **(section_extra or {})}
     ctx = RecordingCtx(section)
     ok = vaultwarden.register(ctx)
     return ok, ctx

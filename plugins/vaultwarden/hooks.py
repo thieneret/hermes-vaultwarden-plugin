@@ -670,7 +670,7 @@ def _cleanup_stale_secrets(ttl_seconds: int | None = None):
             pass  # best-effort cleanup (stat/race failures are transient)
 
 
-def _cleanup_stale_sockets():
+def _cleanup_stale_sockets(ssh_add_bin: str = "") -> None:
     """Remove stale ssh-agent sockets at plugin startup (VWP-02, v0.4.6).
 
     A socket is stale if the file exists but no agent is running on it.
@@ -678,12 +678,25 @@ def _cleanup_stale_sockets():
     two developer-controlled socket locations used by
     tools._resolve_socket_path(). Called from register() next to
     _cleanup_stale_secrets().
+
+    HVA-079-03 (v0.8.2 BREAKING): the staleness probe runs ONLY from the
+    pinned, validated ssh-add absolute path passed in by register() —
+    there is no PATH lookup. When SSH functionality is disabled (no
+    valid pinned ssh-add) the whole probe/cleanup is SKIPPED: without a
+    provable "no agent answers" result, unlinking sockets could break a
+    live external agent, and stale sockets of a disabled SSH toolset are
+    inert anyway.
     """
+    if not ssh_add_bin:
+        log.info("stale ssh-agent socket cleanup skipped: SSH binaries "
+                 "are not pinned (SSH functionality disabled).")
+        return
+
     def _is_stale(sock: str) -> bool:
         if not os.path.exists(sock):
             return False
         try:
-            r = subprocess.run(["ssh-add", "-l"],
+            r = subprocess.run([ssh_add_bin, "-l"],
                                env={"SSH_AUTH_SOCK": sock,
                                     "PATH": os.environ.get("PATH", "")},
                                capture_output=True, text=True, timeout=5)

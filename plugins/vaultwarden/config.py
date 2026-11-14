@@ -111,6 +111,13 @@ _DEFAULTS: dict[str, Any] = {
     "placeholder_ttl_seconds": 300,
     "max_placeholders": 50,
     "bw_cli_path": "",
+    # HVA-079-03 (v0.8.2, BREAKING): REQUIRED pinned absolute paths for
+    # the SSH binaries (no PATH lookup, no env override). Empty string
+    # here means "not configured" — the SSH tools then fail closed while
+    # every non-SSH tool stays available (SSH is optional functionality).
+    "ssh_add_path": "",
+    "ssh_keygen_path": "",
+    "ssh_agent_path": "",
     # VWP-10 (v0.3.8): retry / backoff for idempotent bw calls.
     "bw_max_retries": 3,
     "bw_backoff_base": 1.0,
@@ -334,6 +341,25 @@ class PluginConfig:
             log.warning("BW_CLI_PATH is set but IGNORED: "
                         "bw_cli_path in config.yaml is the only source.")
         return str(self._raw("bw_cli_path") or "")
+
+    # HVA-079-03 (v0.8.2, BREAKING): SSH binary path pinning. The SSH
+    # binaries are executed ONLY from these REQUIRED absolute paths —
+    # there is NO PATH lookup and NO environment-variable override.
+    # The keys are optional at plugin LOAD time (SSH is optional
+    # functionality): a missing or invalid path fails the SSH tools
+    # closed while every non-SSH tool stays available. Validation rules
+    # mirror the bw pinning model (see tools.validate_ssh_binary_path).
+    @property
+    def ssh_add_path(self) -> str:
+        return str(self._raw("ssh_add_path") or "")
+
+    @property
+    def ssh_keygen_path(self) -> str:
+        return str(self._raw("ssh_keygen_path") or "")
+
+    @property
+    def ssh_agent_path(self) -> str:
+        return str(self._raw("ssh_agent_path") or "")
 
     # v0.2.2 (BUGFIX): configurable terminal tool names / command keys.
     # Empty list => hooks.py falls back to its built-in defaults.

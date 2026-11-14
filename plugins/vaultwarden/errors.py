@@ -172,7 +172,9 @@ class AgentError(VaultwardenError):
 
     code = "AGENT_ERROR"
     recoverable = True
-    suggestion = "Verify ssh-agent/ssh-add are installed and PATH is set."
+    suggestion = ("Verify the pinned ssh_add_path / ssh_agent_path settings "
+                  "(absolute, validated binary paths — there is no PATH "
+                  "lookup).")
 
 
 # ---------------------------------------------------- v0.3.8 error taxonomy

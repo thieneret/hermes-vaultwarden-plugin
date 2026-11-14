@@ -9,11 +9,20 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from vaultwarden import hooks, tools
+from vaultwarden.tests.conftest import write_fake_ssh_binaries
+
+# HVA-079-03: the staleness probe runs ONLY from the pinned ssh-add path.
+# subprocess.run is mocked for the probe, so an inert executable stub is
+# enough for the probe branch; tests of the DISABLED path call
+# _cleanup_stale_sockets() with no pinned path (skip branch).
+_SSH_STUB_DIR = tempfile.mkdtemp(prefix="vw_sockclean_stub_bins_")
+_SSH_ADD = write_fake_ssh_binaries(_SSH_STUB_DIR)["ssh_add_path"]
 
 #: Marker standing in for passphrase material — must never surface in logs.
 PASSPHRASE_MARKER = "hva04-PASSPHRASE-MUST-NEVER-APPEAR-b7d3"
@@ -41,7 +50,7 @@ def _cleanup(sock_path: str, rc: int = 2) -> None:
                                  "XDG_RUNTIME_DIR": ""}, clear=False):
         with patch("vaultwarden.hooks.subprocess.run",
                    return_value=MagicMock(returncode=rc)):
-            hooks._cleanup_stale_sockets()
+            hooks._cleanup_stale_sockets(_SSH_ADD)
 
 
 # Case 1: socket created by the current execution -> unlinked after
@@ -118,3 +127,18 @@ def test_hva04_logs_contain_no_secret_material(tmp_path, caplog):
     text = caplog.text
     assert PASSPHRASE_MARKER not in text
     assert "skipping stale ssh socket" in text  # warnings actually emitted
+
+
+# Case 6 (HVA-079-03): SSH binaries NOT pinned -> the staleness probe can
+# never prove "no agent answers", so the whole cleanup is SKIPPED: the
+# socket file survives and a single INFO skip line is logged (no WARNING).
+def test_unpinned_ssh_cleanup_skipped_socket_intact(tmp_path, caplog):
+    sock = str(tmp_path / "auth.sock")
+    _mksock(sock)
+    with patch.dict(os.environ, {"VW_SSH_SOCKET_PATH": sock,
+                                 "XDG_RUNTIME_DIR": ""}, clear=False):
+        with caplog.at_level(logging.DEBUG,
+                             logger="hermes.plugins.vaultwarden.hooks"):
+            hooks._cleanup_stale_sockets()  # no pinned path -> skip
+    assert os.path.lexists(sock)
+    assert "skipped" in caplog.text

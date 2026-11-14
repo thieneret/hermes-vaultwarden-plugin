@@ -101,6 +101,38 @@ config:
       file with no symlink anywhere in its chain, executable, not
       group/world-writable, and owned by root or the current user; the
       plugin fails closed (does not load) otherwise.
+  # SSH binary pinning (BREAKING change for SSH users): the SSH tools
+  # replaced PATH-based discovery with these REQUIRED pinned absolute
+  # paths. There is NO PATH lookup and NO environment-variable override
+  # for ssh-add / ssh-keygen / ssh-agent. Validation mirrors the bw
+  # pinning rules (absolute regular file, no symlink in the chain,
+  # executable, not group/world-writable, owned by root or the current
+  # user). These keys are NOT marked required: true in the manifest on
+  # purpose — SSH is optional functionality: a missing or invalid path
+  # fails ONLY the four SSH tools closed (they are not registered and
+  # reject any direct call); the plugin itself and every non-SSH tool
+  # stay fully available.
+  ssh_add_path:
+    type: string
+    default: ""
+    description: >-
+      REQUIRED for the SSH tools: FULL absolute path to the ssh-add
+      binary (e.g. /usr/bin/ssh-add). No PATH lookup; the SSH tools fail
+      closed if this is missing or fails validation.
+  ssh_keygen_path:
+    type: string
+    default: ""
+    description: >-
+      REQUIRED for the SSH tools: FULL absolute path to the ssh-keygen
+      binary (e.g. /usr/bin/ssh-keygen). No PATH lookup; the SSH tools
+      fail closed if this is missing or fails validation.
+  ssh_agent_path:
+    type: string
+    default: ""
+    description: >-
+      REQUIRED for the SSH tools: FULL absolute path to the ssh-agent
+      binary (e.g. /usr/bin/ssh-agent). No PATH lookup; the SSH tools
+      fail closed if this is missing or fails validation.
   # v0.3.8 (VWP-10): retry / backoff for idempotent bw calls. NOTE: the
   # minimum supported bw version is deliberately NOT configurable (VWP-11:
   # fail-closed, no override).

@@ -36,7 +36,7 @@ from .hooks import (
 from .placeholders import PlaceholderRegistry
 from .secure_fs import FilesystemSecurityError, ensure_hardened_directory
 from .security import get_logger, get_redacting_filter
-from .tools import get_tools
+from .tools import get_tools, resolve_ssh_binaries
 
 log = get_logger("init")
 
@@ -98,10 +98,6 @@ def register(ctx: Any) -> bool:
     # FilesystemSecurityError propagating here would likewise abort loading.
     _cleanup_stale_secrets(ttl_seconds=config.placeholder_ttl_seconds)
 
-    # VWP-02 (v0.4.6): remove stale ssh-agent sockets (file exists but no
-    # agent running) at the developer-controlled socket locations.
-    _cleanup_stale_sockets()
-
     log.info("Vaultwarden plugin enabled, checking prerequisites...")
 
     # v0.5.0 (BREAKING): bootstrap secrets are loaded from the plugin-private
@@ -131,6 +127,35 @@ def register(ctx: Any) -> bool:
                     "reason.", configured_bw)
         return False
     log.info("Bitwarden CLI pinned and validated: %s", bw_path)
+
+    # HVA-079-03 (v0.8.2, BREAKING): SSH binaries are executed ONLY from
+    # the REQUIRED pinned absolute paths configured in settings — NO PATH
+    # lookup, NO environment-variable override (they handle private keys
+    # and passphrases; PATH substitution must be impossible). SSH is
+    # OPTIONAL functionality: missing or invalid paths fail ONLY the four
+    # SSH tools closed (get_tools does not register them; direct handler
+    # calls still refuse via _require_ssh_binaries) — the plugin itself
+    # and every non-SSH tool stay fully available, unlike bw which is
+    # core and fails the whole load.
+    ssh_bins, ssh_err = resolve_ssh_binaries(config)
+    if ssh_err is not None:
+        log.warning("SSH key management tools DISABLED (fail-closed): %s "
+                    "Set plugins.entries.vaultwarden.settings.ssh_add_path "
+                    "/ ssh_keygen_path / ssh_agent_path to the FULL "
+                    "absolute paths of the ssh-add / ssh-keygen / ssh-agent "
+                    "binaries. Non-SSH tools remain available; PATH lookup "
+                    "is never performed for SSH binaries.", ssh_err.message)
+    else:
+        log.info("SSH binaries pinned and validated: ssh-add=%s "
+                 "ssh-keygen=%s ssh-agent=%s",
+                 ssh_bins["ssh_add_path"], ssh_bins["ssh_keygen_path"],
+                 ssh_bins["ssh_agent_path"])
+
+    # VWP-02 (v0.4.6): remove stale ssh-agent sockets (file exists but no
+    # agent running) at the developer-controlled socket locations. The
+    # staleness probe uses the PINNED ssh-add; skipped when SSH is
+    # disabled (HVA-079-03, see hooks._cleanup_stale_sockets).
+    _cleanup_stale_sockets(ssh_bins["ssh_add_path"] if ssh_bins else "")
 
     try:
         client_secret, master_password = _secrets.load_secrets(hermes_home)
@@ -356,8 +381,10 @@ def register(ctx: Any) -> bool:
 
     # 8. register tools on the 'vaultwarden' toolset — ONLY reached after
     # every mandatory registration above succeeded (AUD-06).
+    # HVA-079-03: the pre-resolved ssh_bins decides the SSH tool set
+    # (None = confirmed invalid → SSH tools omitted, fail-closed).
     registered = 0
-    for schema, handler in get_tools(auth, config, registry):
+    for schema, handler in get_tools(auth, config, registry, ssh_bins):
         # VWP-17: signature compatibility handled centrally in compat.py
         compat.register_tool_compat(
             ctx, name=schema["name"], toolset="vaultwarden", schema=schema,

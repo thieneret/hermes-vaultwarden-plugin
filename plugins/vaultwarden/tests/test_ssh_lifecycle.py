@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -27,13 +28,21 @@ from vaultwarden.hooks import (
     _open_execution_scope,
 )
 from vaultwarden.security import RedactingFilter
-from vaultwarden.tests.conftest import make_config
+from vaultwarden.tests.conftest import make_config, write_fake_ssh_binaries
 
 # Module-level fake secret material (test sentinels only — never real keys).
 GEN_PW = "Zk9#xQ2vLm8pRt4wYb7nKp3mQs8vXc1d"           # fake bw generate output
 SENTINEL_PASS = "SENTINEL-PASSPHRASE-9f3a-lifecycle"   # fake stored passphrase
 KEY_MARK = "PRIVKEYMARKER-lifecycle-material-xyz"     # fake private-key body
 UPLOAD_PASS = "upload-passphrase-lifecycle-abcdef"
+
+# HVA-079-03: SSH binaries are pinned to validated absolute paths (no PATH
+# lookup). subprocess.run is mocked throughout this module, but the handler
+# gate (and _fake_auth configs) validate the paths ON DISK — so the module
+# creates inert executable stubs ('#!/bin/sh' + 'exit 0') once.
+_SSH_STUB_DIR = tempfile.mkdtemp(prefix="vw_ssh_lifecyc_stub_bins_")
+_SSH_BINS = write_fake_ssh_binaries(_SSH_STUB_DIR)
+_USE_SSH_CFG = make_config(section=dict(_SSH_BINS))
 
 
 # ------------------------------------------------------------- fixtures
@@ -78,7 +87,7 @@ class FakeBw:
 
 
 def _fake_auth(existing_items=None):
-    cfg = make_config(section={"allow_write": True})
+    cfg = make_config(section={"allow_write": True, **_SSH_BINS})
     auth = AuthManager.__new__(AuthManager)
     auth._bw = FakeBw(existing_items)                            # noqa: SLF001
     auth._config = cfg                                           # noqa: SLF001
@@ -105,7 +114,7 @@ def _kp_run_factory():
     """Fake subprocess.run emulating ssh-keygen (encrypted-key semantics)."""
 
     def fake_run(cmd, **kw):
-        if cmd[:2] == ["ssh-keygen", "-yf"]:
+        if cmd[1:2] == ["-yf"]:
             # non-zero => the key IS passphrase-protected (safe outcome)
             return MagicMock(returncode=1, stdout="", stderr="")
         if "-lf" in cmd:
@@ -213,17 +222,18 @@ def test_use_ssh_success_releases_baseline(isolated_filter, monkeypatch):
     """Successful ssh-add: passphrase registered, released afterwards."""
     auth = _use_ssh_auth()
     monkeypatch.setattr(tools, "_resolve_socket_path",
-                        lambda: ("/tmp/fake.sock", False))
+                        lambda *a: ("/tmp/fake.sock", False))
     baseline = isolated_filter.active_secret_count()
     seen: list[int] = []
 
     def run_and_probe(cmd, **kw):
-        if cmd and cmd[0] == "ssh-add":
+        if cmd and cmd[0] == _SSH_BINS["ssh_add_path"]:
             seen.append(int(isolated_filter.has_secret(SENTINEL_PASS)))
         return _run_proc_ok(cmd, **kw)
 
     monkeypatch.setattr(tools.subprocess, "run", run_and_probe)
-    res = json.loads(tools.h_use_ssh({"name": "SSH - Life"}, auth=auth))
+    res = json.loads(tools.h_use_ssh({"name": "SSH - Life"},
+                                 auth=auth, config=_USE_SSH_CFG))
     assert res["loaded"] is True
     assert seen == [1]      # registered while ssh-add ran
     assert isolated_filter.active_secret_count() == baseline
@@ -237,7 +247,7 @@ def test_use_ssh_subprocess_failure_still_releases(isolated_filter,
     """ssh-add exit != 0 -> AuthError surfaced; finally block releases."""
     auth = _use_ssh_auth()
     monkeypatch.setattr(tools, "_resolve_socket_path",
-                        lambda: ("/tmp/fake.sock", False))
+                        lambda *a: ("/tmp/fake.sock", False))
     baseline = isolated_filter.active_secret_count()
 
     def run_fail(cmd, **kw):
@@ -245,7 +255,8 @@ def test_use_ssh_subprocess_failure_still_releases(isolated_filter,
                          stderr="Bad passphrase")
 
     monkeypatch.setattr(tools.subprocess, "run", run_fail)
-    res = json.loads(tools.h_use_ssh({"name": "SSH - Life"}, auth=auth))
+    res = json.loads(tools.h_use_ssh({"name": "SSH - Life"},
+                                 auth=auth, config=_USE_SSH_CFG))
     assert res.get("error_code") == "AUTH_ERROR"
     assert isolated_filter.active_secret_count() == baseline
     assert not isolated_filter.has_secret(SENTINEL_PASS)
@@ -257,7 +268,7 @@ def test_use_ssh_exception_still_releases(isolated_filter, monkeypatch):
     """Unexpected exception mid-operation: release runs, error propagates."""
     auth = _use_ssh_auth()
     monkeypatch.setattr(tools, "_resolve_socket_path",
-                        lambda: ("/tmp/fake.sock", False))
+                        lambda *a: ("/tmp/fake.sock", False))
     baseline = isolated_filter.active_secret_count()
 
     def run_boom(cmd, **kw):
@@ -266,7 +277,8 @@ def test_use_ssh_exception_still_releases(isolated_filter, monkeypatch):
     monkeypatch.setattr(tools.subprocess, "run", run_boom)
     # _guard converts unexpected exceptions into an error response; the
     # handler-level finally must have released everything either way.
-    res = json.loads(tools.h_use_ssh({"name": "SSH - Life"}, auth=auth))
+    res = json.loads(tools.h_use_ssh({"name": "SSH - Life"},
+                                 auth=auth, config=_USE_SSH_CFG))
     assert "error" in res
     assert isolated_filter.active_secret_count() == baseline
     assert not isolated_filter.has_secret(SENTINEL_PASS)
@@ -349,7 +361,7 @@ def test_concurrent_ssh_operations_no_refcount_leak(isolated_filter,
     """Concurrent SSH executions: refcounts balance; baseline restored."""
     auth = _use_ssh_auth()
     monkeypatch.setattr(tools, "_resolve_socket_path",
-                        lambda: ("/tmp/fake.sock", False))
+                        lambda *a: ("/tmp/fake.sock", False))
     monkeypatch.setattr(tools.subprocess, "run", _run_proc_ok)
 
     baseline = isolated_filter.active_secret_count()
@@ -358,7 +370,8 @@ def test_concurrent_ssh_operations_no_refcount_leak(isolated_filter,
     def worker() -> None:
         try:
             res = json.loads(tools.h_use_ssh({"name": "SSH - Life"},
-                                             auth=auth))
+                                             auth=auth,
+                                             config=_USE_SSH_CFG))
             assert res["loaded"] is True
         except BaseException as exc:  # noqa: BLE001 - collected for assert
             errors.append(exc)
@@ -384,7 +397,7 @@ def test_scope_managed_release_no_unknown_warning(isolated_filter):
         probe: dict[str, int] = {}
 
         def run_probe(cmd, **kw):
-            if cmd and cmd[0] == "ssh-add":
+            if cmd and cmd[0] == _SSH_BINS["ssh_add_path"]:
                 # DURING the execution the passphrase is registered via
                 # the scope (retain_in_execution_scope path).
                 probe["during"] = int(redactor.has_secret(SENTINEL_PASS))
@@ -392,7 +405,8 @@ def test_scope_managed_release_no_unknown_warning(isolated_filter):
 
         with patch.object(tools.subprocess, "run", run_probe):
             res = json.loads(tools.h_use_ssh({"name": "SSH - Life"},
-                                             auth=auth))
+                                             auth=auth,
+                                             config=_USE_SSH_CFG))
         assert res["loaded"] is True
         assert probe.get("during") == 1
         # Handler's finally must NOT have released it (scope still owns it).
@@ -414,7 +428,8 @@ def test_no_double_release_warnings(caplog, isolated_filter):
     try:
         with patch.object(tools.subprocess, "run", _run_proc_ok):
             res = json.loads(tools.h_use_ssh({"name": "SSH - Life"},
-                                             auth=auth))
+                                             auth=auth,
+                                             config=_USE_SSH_CFG))
         assert res["loaded"] is True
     finally:
         _close_execution_scope(scope, token)
@@ -447,7 +462,7 @@ def test_askpass_delivery_unchanged(isolated_filter, monkeypatch):
     """HVA-01 must not alter SSH_ASKPASS delivery: env contract intact."""
     auth = _use_ssh_auth()
     monkeypatch.setattr(tools, "_resolve_socket_path",
-                        lambda: ("/tmp/fake.sock", False))
+                        lambda *a: ("/tmp/fake.sock", False))
     calls: list[tuple[list, dict]] = []
 
     def capture(cmd, **kw):
@@ -455,9 +470,11 @@ def test_askpass_delivery_unchanged(isolated_filter, monkeypatch):
         return _run_proc_ok(cmd, **kw)
 
     monkeypatch.setattr(tools.subprocess, "run", capture)
-    res = json.loads(tools.h_use_ssh({"name": "SSH - Life"}, auth=auth))
+    res = json.loads(tools.h_use_ssh({"name": "SSH - Life"},
+                                 auth=auth, config=_USE_SSH_CFG))
     assert res["loaded"] is True
-    add_call = next(c for c in calls if c[0][0] == "ssh-add")
+    add_call = next(c for c in calls
+                   if c[0][0] == _SSH_BINS["ssh_add_path"])
     env = add_call[1]["env"]
     assert set(env) == {"PATH", "HOME", "LC_ALL", "SSH_AUTH_SOCK",
                         "SSH_ASKPASS_REQUIRE", "SSH_ASKPASS", "VW_SSH_PASS"}

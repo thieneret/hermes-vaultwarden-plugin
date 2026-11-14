@@ -162,6 +162,14 @@ _PASS_FILE_DESC = (
     "(chmod 600); mutually exclusive with pass. Forbidden when "
     "generate=true."
 )
+#: Note shared by all four SSH tools: binaries run ONLY from pinned
+#: absolute paths (no PATH lookup); fail-closed when unset/invalid.
+_SSH_PINNED_BINARIES_NOTE = (
+    " SSH key tools execute the OpenSSH binaries ONLY from the pinned "
+    "ssh_add_path / ssh_keygen_path / ssh_agent_path settings (absolute, "
+    "validated paths — no PATH lookup); they fail closed when those "
+    "settings are missing or invalid."
+)
 _SSH_GENERATE_PROPERTIES = {
     "generate": {
         "type": "boolean",
@@ -309,7 +317,8 @@ VAULTWARDEN_STORE_SSH = {
         "both in the vault, and returns ONLY the public key + fingerprint. "
         "In generate mode pass/pass_file/file are forbidden. "
         "Without generate, the passphrase can come from pass (raw — warns "
-        "in log AND response) or pass_file (chmod 600)."),
+        "in log AND response) or pass_file (chmod 600)." +
+        _SSH_PINNED_BINARIES_NOTE),
     "parameters": {
         "type": "object",
         "properties": {
@@ -352,7 +361,7 @@ VAULTWARDEN_UPDATE_SSH = {
         "returns only the new public key + fingerprint. In generate mode "
         "pass/pass_file/file are forbidden. Without generate, the "
         "passphrase can come from pass (raw — warns in log AND response) "
-        "or pass_file (chmod 600)."),
+        "or pass_file (chmod 600)." + _SSH_PINNED_BINARIES_NOTE),
     "parameters": {
         "type": "object",
         "properties": {
@@ -383,7 +392,7 @@ VAULTWARDEN_DELETE_SSH = {
     "name": "vaultwarden_delete_ssh",
     "description": (
         "Delete an SSH key item (including its attachment). Requires "
-        "allow_write=true and confirm=true."),
+        "allow_write=true and confirm=true." + _SSH_PINNED_BINARIES_NOTE),
     "parameters": {
         "type": "object",
         "properties": {
@@ -406,7 +415,8 @@ VAULTWARDEN_USE_SSH = {
     # only (see tools._resolve_socket_path). Tool description intentionally
     # carries no socket-behavior details.
     "description": (
-        "Load an SSH private key from the vault into ssh-agent."),
+        "Load an SSH private key from the vault into ssh-agent." +
+        _SSH_PINNED_BINARIES_NOTE),
     "parameters": {
         "type": "object",
         "properties": {

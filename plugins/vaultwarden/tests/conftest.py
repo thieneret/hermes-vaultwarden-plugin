@@ -270,6 +270,42 @@ def fake_bw(tmp_path: Path) -> str:
     return str(script)
 
 
+# SSH binary pinning (HVA-079-03 test support): pinned ssh_*_path settings
+# must pass the strict validator (absolute regular file, executable, not
+# group/world-writable, owned by the euid, no symlink chain). These stubs
+# are plain executables under a caller-supplied REAL directory — tests
+# that never exec them (subprocess.run mocked) only need valid stat()s.
+_SSH_STUB_SCRIPT = "#!/bin/sh\nexit 0\n"
+_SSH_STUB_NAMES = {
+    "ssh_add_path": "ssh-add",
+    "ssh_keygen_path": "ssh-keygen",
+    "ssh_agent_path": "ssh-agent",
+}
+
+
+def write_fake_ssh_binaries(bindir: str) -> dict:
+    """Create the three executable SSH stubs under *bindir*.
+
+    Returns the settings mapping {config_key: absolute stub path} ready
+    to merge into a config section.
+    """
+    os.makedirs(bindir, exist_ok=True)
+    out: dict[str, str] = {}
+    for key, binary in _SSH_STUB_NAMES.items():
+        path = os.path.join(bindir, binary)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_SSH_STUB_SCRIPT)
+        os.chmod(path, 0o755)
+        out[key] = path
+    return out
+
+
+@pytest.fixture()
+def fake_ssh_bins(tmp_path: Path) -> dict:
+    """Settings dict pinning the three SSH binaries to executable stubs."""
+    return write_fake_ssh_binaries(str(tmp_path / "ssh-bins"))
+
+
 @pytest.fixture()
 def appdata(tmp_path: Path) -> Path:
     d = tmp_path / ".bw-data"
@@ -313,8 +349,12 @@ def make_config(**overrides) -> PluginConfig:
 
 
 @pytest.fixture()
-def plugin_config() -> PluginConfig:
-    return make_config()
+def plugin_config(tmp_path) -> PluginConfig:
+    # SSH pinning gate (HVA-079-03): the shared config fixture pins the
+    # three SSH binaries to executable stubs so the SSH tool group stays
+    # registered for dependent tests; tests exercising the fail-closed
+    # path build their own configs WITHOUT these keys.
+    return make_config(section=write_fake_ssh_binaries(str(tmp_path / "ssh-bins")))
 
 
 @pytest.fixture()
@@ -465,9 +505,11 @@ class RecordingCtx:
 
 
 @pytest.fixture()
-def write_auth_manager(bw_cli):
+def write_auth_manager(bw_cli, tmp_path):
     """AuthManager wired to a config that allows write operations."""
-    cfg = make_config(section={"allow_write": True})
+    cfg = make_config(section={"allow_write": True,
+                               **write_fake_ssh_binaries(
+                                   str(tmp_path / "ssh-bins"))})
     mgr = AuthManager(bw_cli, cfg, client_secret="cs-secret", master_password="mp-secret")
     mgr.ensure_authenticated()
     return mgr

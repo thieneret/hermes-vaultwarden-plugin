@@ -28,7 +28,11 @@ import logging
 import pytest
 
 import vaultwarden
-from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
+from vaultwarden.tests.conftest import (
+    BASE_SECTION,
+    RecordingCtx,
+    write_fake_ssh_binaries,
+)
 from vaultwarden.tests.test_integration import _write_secrets_yaml
 
 
@@ -147,7 +151,8 @@ def test_register_local_backend_optin_loads_with_warning(monkeypatch, tmp_path,
     """local backend + allow_insecure_local_backend=true -> loads + WARNING."""
     _setup_env(monkeypatch, tmp_path, "local")
     ctx = RecordingCtx({**BASE_SECTION, "bw_cli_path": fake_bw,
-                        "allow_insecure_local_backend": True})
+                        "allow_insecure_local_backend": True,
+                        **write_fake_ssh_binaries(str(tmp_path / "ssh-bins"))})
     with caplog.at_level(logging.WARNING):
         ok = vaultwarden.register(ctx)
     assert ok  # truthy — plugin loaded
@@ -167,6 +172,7 @@ def test_register_sandboxed_backends_load_regardless_of_flag(
         _setup_env(monkeypatch, tmp_path, backend)
         section = dict(BASE_SECTION)
         section["bw_cli_path"] = fake_bw
+        section.update(write_fake_ssh_binaries(str(tmp_path / "ssh-bins")))
         if flag is not None:
             section["allow_insecure_local_backend"] = flag
         ctx = RecordingCtx(section)
@@ -196,7 +202,8 @@ def test_12_tools_still_registered_on_secure_backend(monkeypatch, tmp_path,
                                                      fake_bw):
     """Hard constraint re-check: the 12-tool contract is unchanged by SEC-03."""
     _setup_env(monkeypatch, tmp_path, "docker")
-    ctx = RecordingCtx({**BASE_SECTION, "bw_cli_path": fake_bw})
+    ctx = RecordingCtx({**BASE_SECTION, "bw_cli_path": fake_bw,
+                        **write_fake_ssh_binaries(str(tmp_path / "ssh-bins"))})
     assert vaultwarden.register(ctx) is True
     assert len(ctx.tools) == 12
     names = {t["name"] for t in ctx.tools}
