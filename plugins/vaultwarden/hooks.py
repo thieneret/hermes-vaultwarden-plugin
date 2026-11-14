@@ -175,6 +175,28 @@ def _warn_missing_tool_call_id_once() -> None:
                 "secret material is logged.")
 
 
+def resolve_correlation_id(tool_call_id: str = "", task_id: str = "",
+                           turn_id: str = "",
+                           kwargs: "dict[str, Any] | None" = None) -> str:
+    """Single source of truth for the per-execution correlation key.
+
+    HVA-079-01 and its follow-up: Hermes threads task_id, tool_call_id and
+    turn_id independently through every hook/middleware call (the host's
+    tool_hook_ids contract), and older hosts may omit some of them. The
+    tool_execution middleware, the transform_tool_result redactor and the
+    post_tool_call observer MUST derive the SAME key with the SAME priority
+    chain — unique per-tool-call tool_call_id first, then task_id, then
+    turn_id — so concurrent calls of one task never share (or steal)
+    per-execution entries (secret snapshots, deferred handoffs, pending
+    errors). Sanitized by contract: the chain reads identifier PRESENCE from
+    named parameters / dispatch kwargs only; nothing else can reach it.
+    """
+    extra = kwargs or {}
+    return (tool_call_id or extra.get("tool_call_id")
+            or task_id or extra.get("task_id")
+            or turn_id or extra.get("turn_id") or "")
+
+
 def _stash_deferred_injected(exec_id: str, values: frozenset[str]) -> None:
     """Record a closed scope's injected snapshot for the deferred transform."""
     if not values:
@@ -797,7 +819,11 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
             task_errors.append(err.to_dict())
         else:
             with _PENDING_LOCK:
-                _PENDING_ERRORS.setdefault(task_id or "", []).append(err.to_dict())
+                # HVA-079-01 follow-up: prefer the per-call correlation id
+                # (middleware passes it explicitly); legacy direct callers
+                # keep owning their task_id key.
+                _PENDING_ERRORS.setdefault(correlation_id or task_id or "",
+                                           []).append(err.to_dict())
         return None  # leave the reference verbatim ($ expands to empty)
     try:
         item = auth.get_item(entry.item_id)
@@ -810,12 +836,14 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
                 f"Referenced field '{entry.field_name}' is now empty.")
             log.warning("Placeholder %s: %s", placeholder, err.message)
             with _PENDING_LOCK:
-                _PENDING_ERRORS.setdefault(task_id or "", []).append(err.to_dict())
+                _PENDING_ERRORS.setdefault(correlation_id or task_id or "",
+                                           []).append(err.to_dict())
             return None
     except errors.VaultwardenError as exc:
         log.error("Secret fetch failed for %s (%s)", placeholder, exc.code)
         with _PENDING_LOCK:
-            _PENDING_ERRORS.setdefault(task_id or "", []).append(exc.to_dict())
+            _PENDING_ERRORS.setdefault(correlation_id or task_id or "",
+                                       []).append(exc.to_dict())
         return None
     # Write the secret to a mkstemp file (chmod 600, atomic, symlink-protected).
     path = _write_secret_file(six_hex, value, secrets_dir, temp_files)
@@ -913,8 +941,22 @@ def make_placeholder_resolver(auth: AuthManager,
         # references that expand to an empty string (fail-safe), a warning is
         # logged and a PLACEHOLDER_ERROR is recorded for post_tool_call to
         # surface to the agent.
+        # HVA-079-01 follow-up: ONE correlation id drives the WHOLE call —
+        # the pending-error store, the execution secret scope, the deferred
+        # handoff, the task-keyed secret store and the post_tool_call
+        # surfacing all use the same per-tool-call key (tool_call_id ->
+        # task_id -> turn_id priority via the single shared resolver), so
+        # concurrent calls of one task get independent entries and can never
+        # consume or overwrite each other's — for secrets AND for
+        # diagnostics. Older hosts without tool_call_id degrade to task_id
+        # (one-time sanitized warning; behaviour identical to pre-fix).
+        correlation_id = resolve_correlation_id(tool_call_id=tool_call_id,
+                                                task_id=task_id,
+                                                kwargs=kwargs)
+        if not tool_call_id:
+            _warn_missing_tool_call_id_once()
         with _PENDING_LOCK:
-            task_errors = _PENDING_ERRORS.setdefault(task_id or "", [])
+            task_errors = _PENDING_ERRORS.setdefault(correlation_id, [])
         try:
             secrets_dir = _secrets_dir()
         except FilesystemSecurityError as exc:
@@ -949,22 +991,12 @@ def make_placeholder_resolver(auth: AuthManager,
         # execution has consumed the handoff), after temp-file cleanup
         # observability, and even when an exception aborts the lifecycle.
         _scope, _scope_token = _open_execution_scope(get_redacting_filter())
-        # AUD-02 (phase 2): bind the execution id so the authoritative
-        # transform_tool_result redactor can correlate THIS execution's
-        # injected set through the active-scope registry even when Hermes
-        # dispatches the hook on a different context/thread.
-        # HVA-079-01 (v0.8.1 hardening): Hermes threads a UNIQUE per-tool-
-        # call tool_call_id through the middleware contract, and the SAME
-        # value reaches transform_tool_result. Prefer it as the correlation
-        # key: task_id is shared by every tool call of one task, so keying
-        # the scope / deferred store / task store by it made concurrent
-        # calls overwrite (and steal) each other's snapshots — letting the
-        # transformer scrub a result with the WRONG secret set. Older hosts
-        # that provide no tool_call_id fall back to task_id (one-time
-        # sanitized warning; behaviour otherwise identical to pre-fix).
-        correlation_id = tool_call_id or task_id or ""
-        if not tool_call_id:
-            _warn_missing_tool_call_id_once()
+        # AUD-02 (phase 2) + HVA-079-01 (v0.8.1 hardening): bind the
+        # per-call correlation id computed above (single shared resolver,
+        # not duplicated here) so the authoritative transform_tool_result
+        # redactor can correlate THIS execution's injected set through the
+        # active-scope registry even when Hermes dispatches the hook on a
+        # different context/thread.
         _bind_scope_correlation(_scope, correlation_id)
         _register_active_scope(_scope)
         try:
@@ -1093,8 +1125,11 @@ def make_placeholder_resolver(auth: AuthManager,
 
 
 #: transient error store surfaced by post_tool_call then cleared.
-#: v0.2.2 (BUGFIX): task-scoped dict + lock — parallel tool calls can no
-#: longer lose (or steal) each other's pending errors via a shared list.
+#: v0.2.2 (BUGFIX): scoped dict + lock — parallel tool calls can no longer
+#: lose (or steal) each other's pending errors via a shared list.
+#: HVA-079-01 follow-up: the scope is the per-tool-call correlation id
+#: (tool_call_id -> task_id -> turn_id, via resolve_correlation_id), so even
+#: concurrent calls sharing one task_id keep independent diagnostics.
 _PENDING_ERRORS: dict[str, list[dict]] = {}
 _PENDING_LOCK = threading.Lock()
 
@@ -1404,14 +1439,13 @@ def make_result_redactor(auth: AuthManager,
                                           tool_call_id: str = "",
                                           **kwargs: Any) -> Any:
         # HVA-079-01: prefer the UNIQUE per-tool-call id — the exact same
-        # value the middleware used for scope creation, deferred stashing
-        # and the task store. Hermes threads task_id, tool_call_id and
-        # turn_id independently; task_id is shared across a task's calls,
-        # so it can no longer be the primary key. Older hosts that pass no
-        # tool_call_id keep working: both sides then fall back to task_id.
-        exec_id = (tool_call_id or kwargs.get("tool_call_id")
-                   or task_id or kwargs.get("task_id")
-                   or turn_id or kwargs.get("turn_id") or "")
+        # value the middleware used for scope creation, deferred stashing,
+        # the task store and the pending-error store (shared resolver, no
+        # duplicated chain). task_id is shared by every tool call of one
+        # task, so it can only be a fallback. Older hosts that pass no
+        # tool_call_id keep working: both sides derive the same key.
+        exec_id = resolve_correlation_id(tool_call_id, task_id, turn_id,
+                                         kwargs)
         # 1) per-execution injected secrets (SEC-01 handoff). ContextVar is
         #    the primary channel; the AUD-02 active-scope registry is the
         #    context-independent fallback while the owning execution is still
@@ -1493,6 +1527,7 @@ def make_post_cleanup_hook(auth: AuthManager,
 
     def vaultwarden_post_cleanup(tool_name: str = "", args: dict | None = None,
                                  result: Any = None, task_id: str = "",
+                                 turn_id: str = "", tool_call_id: str = "",
                                  **kwargs: Any) -> None:
         # SEC-01 (v0.5.4): redaction moved to transform_tool_result. This
         # hook is now observer-only for cleanup/metrics and must not mutate
@@ -1506,12 +1541,20 @@ def make_post_cleanup_hook(auth: AuthManager,
         if n:
             log.debug("post_tool_call cleaned %d used placeholder(s).", n)
         # Surface fail-closed resolution errors to the agent (secret-free).
-        # v0.2.2 (BUGFIX): pop only THIS task's errors — other in-flight
-        # tasks keep their pending errors until their own post_tool_call.
+        # v0.2.2 (BUGFIX): pop only THIS call's errors — other in-flight
+        # calls keep their pending errors until their own post_tool_call.
+        # HVA-079-01 follow-up: "this call" is the per-tool-call correlation
+        # id derived through the SAME shared resolver the middleware stashed
+        # under (tool_call_id -> task_id -> turn_id), so concurrent calls
+        # sharing one task_id never consume or misattribute each other's
+        # diagnostics.
         # NOTE: this is diagnostic telemetry, NOT a confidentiality boundary;
         # the error dicts never contain secret values by construction.
         with _PENDING_LOCK:
-            task_errors = _PENDING_ERRORS.pop(task_id or "", [])
+            task_errors = _PENDING_ERRORS.pop(
+                resolve_correlation_id(tool_call_id, task_id, turn_id,
+                                       kwargs),
+                [])
         if task_errors and isinstance(result, dict):
             result.setdefault("vaultwarden_placeholder_errors", []).extend(task_errors)
         log.debug("post_tool_call observer finished for %s (errors=%d).",
