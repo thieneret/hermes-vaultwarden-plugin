@@ -137,12 +137,64 @@ _DEFAULT_STALE_TTL_SECONDS = 300
 # count and age — so it can never become unbounded global retention, and it
 # complements (never replaces) the refcounted redactor state, which is
 # already released exactly once by the scope itself.
+#
+# HVA-079-01 (v0.8.1 hardening): the execution id is the PER-TOOL-CALL
+# correlation id — Hermes's unique tool_call_id when the host provides one,
+# task_id only as fallback for older hosts. Concurrent calls of the SAME
+# task_id therefore own independent entries: closing one execution can never
+# overwrite (and let the transformer consume the wrong) snapshot of another.
 # ---------------------------------------------------------------------------
 
 _DEFERRED_MAX_ENTRIES = 64
 _DEFERRED_TTL_SECONDS = 300.0
 _DEFERRED_INJECTED: "dict[str, tuple[float, frozenset[str]]]" = {}
 _DEFERRED_LOCK = threading.Lock()
+
+#: HVA-079-01: hosts older than the tool_call_id contract pass no
+#: tool_call_id; the correlation then degrades to task_id (shared by all
+#: concurrent calls of one task). Operators must learn that degraded mode
+#: exactly ONCE per process instead of on every injected call.
+_MISSING_TOOL_CALL_ID_WARNED = False
+_MISSING_TOOL_CALL_ID_LOCK = threading.Lock()
+
+
+def _warn_missing_tool_call_id_once() -> None:
+    """Emit the tool_call_id fallback warning at most once per process.
+
+    Sanitized by construction: it names only identifier PRESENCE (a host
+    contract observation) — never a task id, tool argument or any secret.
+    """
+    global _MISSING_TOOL_CALL_ID_WARNED
+    with _MISSING_TOOL_CALL_ID_LOCK:
+        if _MISSING_TOOL_CALL_ID_WARNED:
+            return
+        _MISSING_TOOL_CALL_ID_WARNED = True
+    log.warning("tool_call_id unavailable from the host; falling back to "
+                "task_id for execution-secret correlation (concurrent tool "
+                "calls sharing one task_id share one correlation key). No "
+                "secret material is logged.")
+
+
+def resolve_correlation_id(tool_call_id: str = "", task_id: str = "",
+                           turn_id: str = "",
+                           kwargs: "dict[str, Any] | None" = None) -> str:
+    """Single source of truth for the per-execution correlation key.
+
+    HVA-079-01 and its follow-up: Hermes threads task_id, tool_call_id and
+    turn_id independently through every hook/middleware call (the host's
+    tool_hook_ids contract), and older hosts may omit some of them. The
+    tool_execution middleware, the transform_tool_result redactor and the
+    post_tool_call observer MUST derive the SAME key with the SAME priority
+    chain — unique per-tool-call tool_call_id first, then task_id, then
+    turn_id — so concurrent calls of one task never share (or steal)
+    per-execution entries (secret snapshots, deferred handoffs, pending
+    errors). Sanitized by contract: the chain reads identifier PRESENCE from
+    named parameters / dispatch kwargs only; nothing else can reach it.
+    """
+    extra = kwargs or {}
+    return (tool_call_id or extra.get("tool_call_id")
+            or task_id or extra.get("task_id")
+            or turn_id or extra.get("turn_id") or "")
 
 
 def _stash_deferred_injected(exec_id: str, values: frozenset[str]) -> None:
@@ -232,10 +284,15 @@ class ExecutionSecretScope:
         # BEFORE the authoritative transform_tool_result hook has executed
         # for this execution (hosts that dispatch the transformer AFTER the
         # middleware call returns), the injected plaintext snapshot is moved
-        # into a bounded, task-keyed grace store instead of being dropped —
-        # so SEC-01 result redaction stays intact while the refcount release
-        # still happens exactly once at scope close. Cleared by consume().
-        self._task_id: str = ""
+        # into a bounded, execution-keyed grace store instead of being
+        # dropped — so SEC-01 result redaction stays intact while the
+        # refcount release still happens exactly once at scope close.
+        # Cleared by consume().
+        # HVA-079-01 (v0.8.1 hardening): the correlation key is the
+        # PER-TOOL-CALL id (Hermes tool_call_id, task_id only as fallback
+        # on hosts that provide none), so concurrent calls of one task own
+        # independent grace-store entries instead of overwriting each other.
+        self._correlation_id: str = ""
         self._deferred_snapshot: frozenset[str] = frozenset()
 
     # -------------------------------------------------------- redactor pin
@@ -305,7 +362,7 @@ class ExecutionSecretScope:
             # warnings on the redactor side (length fingerprint only).
             redactor.release_secret(value)
         if snapshot:
-            _stash_deferred_injected(self._task_id, snapshot)
+            _stash_deferred_injected(self._correlation_id, snapshot)
 
     @property
     def closed(self) -> bool:
@@ -381,9 +438,11 @@ def _open_execution_scope(redactor: Any) -> tuple["ExecutionSecretScope", Any]:
 # objects whose lifetime is bounded by their own execution (entries vanish
 # exactly once when each scope closes), so this can never become unbounded
 # global retention. Consumers read plaintext ONLY through the narrow
-# heuristics in peek_scope_injected_secrets(), which prefer the single most
-# recently opened still-active scope and require an exact exec-id match
-# against the scope's OWN task id before trusting a keyed lookup.
+# heuristics in peek_scope_injected_secrets(), which require an EXACT
+# exec-id match against the scope's OWN per-tool-call correlation id before
+# trusting a lookup (HVA-079-01) — a non-matching exec id must never select
+# a DIFFERENT execution's snapshot, because scrubbing the result with the
+# wrong set leaves this execution's own secret unscrubbed.
 # ---------------------------------------------------------------------------
 
 _ACTIVE_SCOPES: "list[ExecutionSecretScope]" = []
@@ -409,28 +468,41 @@ def active_scope_count() -> int:
         return len(_ACTIVE_SCOPES)
 
 
-def _bind_scope_task(scope: ExecutionSecretScope, task_id: str) -> None:
-    """Attach the execution's task id to *scope* for transform correlation."""
-    if task_id:
-        scope._task_id = task_id  # noqa: SLF001 - internal correlation tag
+def _bind_scope_correlation(scope: ExecutionSecretScope,
+                            correlation_id: str) -> None:
+    """Attach the execution's correlation id to *scope* (HVA-079-01).
+
+    The id is the host-provided per-tool-call ``tool_call_id`` when present,
+    otherwise the task id (legacy-host fallback). It keys the active-scope
+    lookup, the deferred grace store and the per-execution task store, so
+    concurrent calls of one task never share an entry.
+    """
+    if correlation_id:
+        # noqa: SLF001 - internal correlation tag, no secret material.
+        scope._correlation_id = correlation_id
 
 
 def peek_scope_injected_secrets(exec_id: str) -> list[str]:
-    """Injected-plaintext set from the ACTIVE scope(s) for one execution.
+    """Injected-plaintext set from the ACTIVE scope for one execution.
 
     AUD-02 (phase 2) transform-side fallback: consulted by the authoritative
-    redactor AFTER the ContextVar channel and BEFORE the task-keyed store.
-    Never raises; returns ``[]`` when no active scope plausibly matches.
+    redactor AFTER the ContextVar channel and BEFORE the execution-keyed
+    store. Never raises; returns ``[]`` when no active scope matches.
 
-    Correlation policy (deliberately conservative):
-    - exec_id given and equal to a scope's bound task id -> that scope wins;
+    Correlation policy (HVA-079-01, deliberately conservative):
+    - exec_id given and equal to a scope's bound CORRELATION id
+      (per-tool-call tool_call_id, or task id on legacy hosts) -> that
+      scope wins, so overlapping scopes of one task never borrow each
+      other's snapshot;
     - exec_id empty -> the MOST RECENTLY opened still-active scope wins
       (Hermes dispatches transform_tool_result right after the middleware
-      call returns, while exactly its own scope is normally active);
-    - exec_id given but matching no bound scope -> union of ALL active
-      scopes' sets (fail-safe over-redaction: during overlapping executions
-      every retained value is still needed by someone anyway, and extra
-      scrubbing can never leak — only hide — text).
+      call returns, while exactly its own scope is normally active, and
+      hosts that thread no ids at all have nothing better to match on);
+    - exec_id given but matching no bound scope -> ``[]``. The caller then
+      consults the exact-keyed deferred store / task store and only as a
+      last resort the over-redaction union below. Selecting ANOTHER
+      execution's set here would scrub the result with the wrong values
+      and let this execution's own secret reach the model.
     """
     with _ACTIVE_SCOPES_LOCK:
         scopes = list(_ACTIVE_SCOPES)
@@ -438,13 +510,31 @@ def peek_scope_injected_secrets(exec_id: str) -> list[str]:
         return []
     if exec_id:
         for scope in reversed(scopes):
-            if getattr(scope, "_task_id", "") == exec_id:
+            if getattr(scope, "_correlation_id", "") == exec_id:
                 return list(scope.injected_values())
-        merged: list[str] = []
-        for scope in scopes:
-            merged.extend(v for v in scope.injected_values() if v not in merged)
-        return merged
+        return []
     return list(scopes[-1].injected_values())
+
+
+def union_active_scope_injected_secrets() -> list[str]:
+    """Over-redaction LAST resort: union of every still-active scope's set.
+
+    HVA-079-01 moved this out of peek_scope_injected_secrets(): correlation
+    there must be EXACT. The transformer runs this only after every
+    exact-keyed channel (ContextVar / active-scope match / deferred store /
+    task store) came up empty for this execution — i.e. a host whose id
+    domain disagrees between middleware and transform dispatch. Values held
+    by still-active scopes are ALSO registered in the global refcounted
+    redactor for their scope's lifetime, so scrubbing the union from a
+    result can only hide text, never leak it (fail-safe over-redaction,
+    historical pre-HVA-079-01 behaviour).
+    """
+    with _ACTIVE_SCOPES_LOCK:
+        scopes = list(_ACTIVE_SCOPES)
+    merged: list[str] = []
+    for scope in scopes:
+        merged.extend(v for v in scope.injected_values() if v not in merged)
+    return merged
 
 
 def _close_execution_scope(scope: ExecutionSecretScope, token: Any) -> None:
@@ -690,6 +780,7 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
                                injected_values_out: list[str] | None = None,
                                task_errors: list[dict] | None = None,
                                scope: "ExecutionSecretScope | None" = None,
+                               correlation_id: str = "",
                                ) -> str | None:
     """SEC-02 (v0.5.7): atomically consume one unique token and create its
     single temp file; return the file path or ``None`` (fail-safe).
@@ -728,7 +819,11 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
             task_errors.append(err.to_dict())
         else:
             with _PENDING_LOCK:
-                _PENDING_ERRORS.setdefault(task_id or "", []).append(err.to_dict())
+                # HVA-079-01 follow-up: prefer the per-call correlation id
+                # (middleware passes it explicitly); legacy direct callers
+                # keep owning their task_id key.
+                _PENDING_ERRORS.setdefault(correlation_id or task_id or "",
+                                           []).append(err.to_dict())
         return None  # leave the reference verbatim ($ expands to empty)
     try:
         item = auth.get_item(entry.item_id)
@@ -741,12 +836,14 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
                 f"Referenced field '{entry.field_name}' is now empty.")
             log.warning("Placeholder %s: %s", placeholder, err.message)
             with _PENDING_LOCK:
-                _PENDING_ERRORS.setdefault(task_id or "", []).append(err.to_dict())
+                _PENDING_ERRORS.setdefault(correlation_id or task_id or "",
+                                           []).append(err.to_dict())
             return None
     except errors.VaultwardenError as exc:
         log.error("Secret fetch failed for %s (%s)", placeholder, exc.code)
         with _PENDING_LOCK:
-            _PENDING_ERRORS.setdefault(task_id or "", []).append(exc.to_dict())
+            _PENDING_ERRORS.setdefault(correlation_id or task_id or "",
+                                       []).append(exc.to_dict())
         return None
     # Write the secret to a mkstemp file (chmod 600, atomic, symlink-protected).
     path = _write_secret_file(six_hex, value, secrets_dir, temp_files)
@@ -777,7 +874,13 @@ def _resolve_placeholder_token(six_hex: str, auth: AuthManager,
     if injected_values_out is not None:
         injected_values_out.append(value)
         with _INJECTED_LOCK:
-            _INJECTED_SECRETS.setdefault(task_id or "", []).append(value)
+            # HVA-079-01: key the per-execution fallback store by the SAME
+            # correlation id the middleware bound to the scope and the
+            # transformer will look the store up with (tool_call_id, task_id
+            # only as legacy fallback) — concurrent calls of one task never
+            # see or steal each other's values.
+            _INJECTED_SECRETS.setdefault(correlation_id or task_id or "",
+                                         []).append(value)
     else:
         record_task_secret(task_id, value)
     return path
@@ -801,6 +904,7 @@ def make_placeholder_resolver(auth: AuthManager,
                                    original_args: dict | None = None,
                                    next_call: Callable[..., Any] | None = None,
                                    task_id: str = "",
+                                   tool_call_id: str = "",
                                    **kwargs: Any) -> Any:
         # --- chain safety gates -------------------------------------------
         if tool_name not in terminal_tools:
@@ -837,8 +941,22 @@ def make_placeholder_resolver(auth: AuthManager,
         # references that expand to an empty string (fail-safe), a warning is
         # logged and a PLACEHOLDER_ERROR is recorded for post_tool_call to
         # surface to the agent.
+        # HVA-079-01 follow-up: ONE correlation id drives the WHOLE call —
+        # the pending-error store, the execution secret scope, the deferred
+        # handoff, the task-keyed secret store and the post_tool_call
+        # surfacing all use the same per-tool-call key (tool_call_id ->
+        # task_id -> turn_id priority via the single shared resolver), so
+        # concurrent calls of one task get independent entries and can never
+        # consume or overwrite each other's — for secrets AND for
+        # diagnostics. Older hosts without tool_call_id degrade to task_id
+        # (one-time sanitized warning; behaviour identical to pre-fix).
+        correlation_id = resolve_correlation_id(tool_call_id=tool_call_id,
+                                                task_id=task_id,
+                                                kwargs=kwargs)
+        if not tool_call_id:
+            _warn_missing_tool_call_id_once()
         with _PENDING_LOCK:
-            task_errors = _PENDING_ERRORS.setdefault(task_id or "", [])
+            task_errors = _PENDING_ERRORS.setdefault(correlation_id, [])
         try:
             secrets_dir = _secrets_dir()
         except FilesystemSecurityError as exc:
@@ -873,11 +991,13 @@ def make_placeholder_resolver(auth: AuthManager,
         # execution has consumed the handoff), after temp-file cleanup
         # observability, and even when an exception aborts the lifecycle.
         _scope, _scope_token = _open_execution_scope(get_redacting_filter())
-        # AUD-02 (phase 2): bind the execution id so the authoritative
-        # transform_tool_result redactor can correlate THIS execution's
-        # injected set through the active-scope registry even when Hermes
-        # dispatches the hook on a different context/thread.
-        _bind_scope_task(_scope, task_id or "")
+        # AUD-02 (phase 2) + HVA-079-01 (v0.8.1 hardening): bind the
+        # per-call correlation id computed above (single shared resolver,
+        # not duplicated here) so the authoritative transform_tool_result
+        # redactor can correlate THIS execution's injected set through the
+        # active-scope registry even when Hermes dispatches the hook on a
+        # different context/thread.
+        _bind_scope_correlation(_scope, correlation_id)
         _register_active_scope(_scope)
         try:
           try:
@@ -899,7 +1019,8 @@ def make_placeholder_resolver(auth: AuthManager,
                 for suffix in unique_suffixes:
                     path = _resolve_placeholder_token(
                         suffix, auth, registry, secrets_dir, temp_files,
-                        task_id, injected_values, task_errors, scope=_scope)
+                        task_id, injected_values, task_errors, scope=_scope,
+                        correlation_id=correlation_id)
                     if path is None:
                         continue  # unknown/expired/used -> leave verbatim
                     try:
@@ -980,8 +1101,10 @@ def make_placeholder_resolver(auth: AuthManager,
             # SEC-01 (v0.5.4): forget this execution's per-task plaintext set
             # too (the ContextVar was already restored above). The middleware
             # is the single OWNER that forgets injected values — neither the
-            # transformer nor the observer pops them.
-            take_task_secrets(task_id)
+            # transformer nor the observer pops them. HVA-079-01: forget by
+            # THIS call's correlation key only — a concurrent call of the
+            # same task keeps its own store entry untouched.
+            take_task_secrets(correlation_id)
         finally:
             # AUD-02 (phase 2): LATEST SAFE LIFECYCLE POINT. Everything that
             # may still need the injected plaintext has now run for THIS
@@ -1002,8 +1125,11 @@ def make_placeholder_resolver(auth: AuthManager,
 
 
 #: transient error store surfaced by post_tool_call then cleared.
-#: v0.2.2 (BUGFIX): task-scoped dict + lock — parallel tool calls can no
-#: longer lose (or steal) each other's pending errors via a shared list.
+#: v0.2.2 (BUGFIX): scoped dict + lock — parallel tool calls can no longer
+#: lose (or steal) each other's pending errors via a shared list.
+#: HVA-079-01 follow-up: the scope is the per-tool-call correlation id
+#: (tool_call_id -> task_id -> turn_id, via resolve_correlation_id), so even
+#: concurrent calls sharing one task_id keep independent diagnostics.
 _PENDING_ERRORS: dict[str, list[dict]] = {}
 _PENDING_LOCK = threading.Lock()
 
@@ -1013,10 +1139,13 @@ _PENDING_LOCK = threading.Lock()
 #
 # When the middleware resolves a placeholder it knows the plaintext secret
 # value that is about to enter the shell. We keep that value ONLY for the
-# duration of the tool call (keyed by task_id) so the redaction layer can
-# scrub it out of whatever the command echoed back — without ever registering
-# vault item values in the global RedactingFilter (which would redact them
-# from unrelated text forever and could collide with benign strings).
+# duration of the tool call, keyed by the execution CORRELATION id
+# (HVA-079-01: the per-tool-call tool_call_id, task_id only as legacy
+# fallback; pre-v0.8.1 the key was the shared task_id) so the redaction
+# layer can scrub it out of whatever the command echoed back — without ever
+# registering vault item values in the global RedactingFilter (which would
+# redact them from unrelated text forever and could collide with benign
+# strings).
 # The store is short-lived, memory-only and never logged.
 #
 # SEC-01 (v0.5.4): the authoritative confidentiality boundary is the
@@ -1070,23 +1199,28 @@ def _restore_injected_secrets(token: "contextvars.Token[frozenset[str] | None]")
         _CURRENT_INJECTED_SECRETS.set(None)
 
 
-def take_task_secrets(task_id: str) -> list[str]:
-    """Pop (and thereby forget) all pending secret values for *task_id*."""
+def take_task_secrets(exec_id: str) -> list[str]:
+    """Pop (and thereby forget) all pending secret values for *exec_id*.
+
+    HVA-079-01: *exec_id* is the execution correlation key (tool_call_id,
+    task_id on legacy hosts); popping one call's key must never touch a
+    concurrent call's entry.
+    """
     with _INJECTED_LOCK:
-        return _INJECTED_SECRETS.pop(task_id or "", [])
+        return _INJECTED_SECRETS.pop(exec_id or "", [])
 
 
-def peek_task_secrets(task_id: str) -> list[str]:
-    """Return (without forgetting) the pending secret values for *task_id*.
+def peek_task_secrets(exec_id: str) -> list[str]:
+    """Return (without forgetting) the pending values for *exec_id*.
 
     Used by the SEC-01 `transform_tool_result` redactor: unlike the old
     post_tool_call path it must NOT pop, because both the transformer and
-    the cleanup observer may run for the same task_id and the transformer
+    the cleanup observer may run for the same execution and the transformer
     may be invoked more than once. The middleware's finally block (and the
     session-end hook) remain the single owners that forget these values.
     """
     with _INJECTED_LOCK:
-        return list(_INJECTED_SECRETS.get(task_id or "", []))
+        return list(_INJECTED_SECRETS.get(exec_id or "", []))
 
 
 def clear_task_secrets() -> None:
@@ -1148,15 +1282,16 @@ def _mask_credentialed_urls(text: str) -> str:
     return _CREDENTIALED_URL_RE.sub(r"\1[REDACTED]@", text)
 
 
-def _redact_task_secrets(task_id: str, result: Any,
+def _redact_task_secrets(exec_id: str, result: Any,
                          values: list[str] | None = None) -> Any:
     """Remove freshly injected placeholder secrets from *result*.
 
     SEC-01 (v0.5.4): refactored from "pop the per-task store" to a helper
     that redacts an EXPLICIT set of plaintext values (exact replacement with
     ``[REDACTED]``), called from the authoritative `transform_tool_result`
-    redactor. When *values* is None it falls back to peeking the task-keyed
-    store (never popping — the middleware's finally block owns forgetting).
+    redactor. When *values* is None it falls back to peeking the execution-
+    keyed store (never popping — the middleware's finally block owns
+    forgetting).
     v0.7.9: each injected secret is also replaced in its
     percent-encoded form (``urllib.parse.quote(secret, safe='')``, skipped
     when identical to the raw secret), and after the exact replacements a
@@ -1171,7 +1306,7 @@ def _redact_task_secrets(task_id: str, result: Any,
     no I/O, no subprocesses, no network.
     """
     if values is None:
-        values = peek_task_secrets(task_id)
+        values = peek_task_secrets(exec_id)
     if not values:
         return result
     # Exact replacement covers raw + percent-encoded variants; the
@@ -1245,11 +1380,16 @@ def make_result_redactor(auth: AuthManager,
 
     The returned callable:
     1. follows the standard Hermes transformer signature
-       ``(tool_name, result, task_id/turn_id, **kwargs)``;
+       ``(tool_name, result, task_id/turn_id/tool_call_id, **kwargs)`` and
+       derives the execution correlation key by preferring the UNIQUE per-
+       tool-call ``tool_call_id`` (HVA-079-01; task_id/turn_id remain only
+       as fallbacks for hosts that thread no tool_call_id through);
     2. reads the per-execution injected-secret set from the ContextVar
        established by the tool_execution middleware (`_CURRENT_INJECTED_SECRETS`
-       via record_task_secret), with the task-keyed store as fallback when
-       Hermes dispatches the hook on a different context/thread;
+       via record_task_secret), with the active-scope registry, the
+       correlation-keyed deferred store and the correlation-keyed task
+       store as fallbacks when Hermes dispatches the hook on a different
+       context/thread;
     3. performs exact, recursive plaintext replacement of every injected
        secret value with the literal ``[REDACTED]`` on str / dict / list
        results and objects exposing a writable ``.output`` attribute;
@@ -1296,11 +1436,16 @@ def make_result_redactor(auth: AuthManager,
 
     def vaultwarden_transform_tool_result(tool_name: str = "", result: Any = None,
                                           task_id: str = "", turn_id: str = "",
+                                          tool_call_id: str = "",
                                           **kwargs: Any) -> Any:
-        # Hermes may key the execution by task_id or turn_id depending on
-        # version/backend — accept both, prefer task_id.
-        exec_id = task_id or kwargs.get("task_id") or turn_id \
-            or kwargs.get("turn_id") or ""
+        # HVA-079-01: prefer the UNIQUE per-tool-call id — the exact same
+        # value the middleware used for scope creation, deferred stashing,
+        # the task store and the pending-error store (shared resolver, no
+        # duplicated chain). task_id is shared by every tool call of one
+        # task, so it can only be a fallback. Older hosts that pass no
+        # tool_call_id keep working: both sides derive the same key.
+        exec_id = resolve_correlation_id(tool_call_id, task_id, turn_id,
+                                         kwargs)
         # 1) per-execution injected secrets (SEC-01 handoff). ContextVar is
         #    the primary channel; the AUD-02 active-scope registry is the
         #    context-independent fallback while the owning execution is still
@@ -1319,10 +1464,20 @@ def make_result_redactor(auth: AuthManager,
                 # (hosts dispatching transform_tool_result AFTER the
                 # middleware frame returned). The one-shot deferred grace
                 # store still carries THIS execution's exact snapshot so
-                # SEC-01 result redaction is unchanged.
+                # SEC-01 result redaction is unchanged. HVA-079-01: the
+                # store is keyed by the per-tool-call correlation id, so
+                # concurrent calls of one task each get their OWN snapshot.
                 values = consume_deferred_injected(exec_id)
             if not values:
                 values = peek_task_secrets(exec_id)
+            if not values:
+                # HVA-079-01 last resort: no exact-keyed channel carried a
+                # snapshot for this exec id (host whose middleware/transform
+                # id domains disagree). Over-redact with the union of still-
+                # active scopes instead — scrubbing values that are still
+                # registered in the global refcounted filter can only hide
+                # text, never leak this execution's own secret.
+                values = union_active_scope_injected_secrets()
         # 2) exact plaintext replacement of every injected value with the
         #    literal [REDACTED] (shared building block; in-place for
         #    containers / writable .output objects, returned copy for plain
@@ -1372,6 +1527,7 @@ def make_post_cleanup_hook(auth: AuthManager,
 
     def vaultwarden_post_cleanup(tool_name: str = "", args: dict | None = None,
                                  result: Any = None, task_id: str = "",
+                                 turn_id: str = "", tool_call_id: str = "",
                                  **kwargs: Any) -> None:
         # SEC-01 (v0.5.4): redaction moved to transform_tool_result. This
         # hook is now observer-only for cleanup/metrics and must not mutate
@@ -1385,12 +1541,20 @@ def make_post_cleanup_hook(auth: AuthManager,
         if n:
             log.debug("post_tool_call cleaned %d used placeholder(s).", n)
         # Surface fail-closed resolution errors to the agent (secret-free).
-        # v0.2.2 (BUGFIX): pop only THIS task's errors — other in-flight
-        # tasks keep their pending errors until their own post_tool_call.
+        # v0.2.2 (BUGFIX): pop only THIS call's errors — other in-flight
+        # calls keep their pending errors until their own post_tool_call.
+        # HVA-079-01 follow-up: "this call" is the per-tool-call correlation
+        # id derived through the SAME shared resolver the middleware stashed
+        # under (tool_call_id -> task_id -> turn_id), so concurrent calls
+        # sharing one task_id never consume or misattribute each other's
+        # diagnostics.
         # NOTE: this is diagnostic telemetry, NOT a confidentiality boundary;
         # the error dicts never contain secret values by construction.
         with _PENDING_LOCK:
-            task_errors = _PENDING_ERRORS.pop(task_id or "", [])
+            task_errors = _PENDING_ERRORS.pop(
+                resolve_correlation_id(tool_call_id, task_id, turn_id,
+                                       kwargs),
+                [])
         if task_errors and isinstance(result, dict):
             result.setdefault("vaultwarden_placeholder_errors", []).extend(task_errors)
         log.debug("post_tool_call observer finished for %s (errors=%d).",

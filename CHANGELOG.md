@@ -5,6 +5,32 @@ Author: **thieneret**
 
 ---
 
+## v0.8.1 (2026-11-14)
+
+### Security (HVA-079-01 — concurrent secret correlation)
+- Fixed a critical concurrency defect in the execution-scoped redaction
+  handoff: deferred secrets were keyed by task_id, which is shared across
+  concurrent tool calls. The correlation key is now the unique per-tool-call
+  tool_call_id, propagated consistently through scope creation, active-scope
+  registration, deferred storage, result transformation, and cleanup. A
+  sanitized fallback to task_id is used when tool_call_id is unavailable.
+  This closes the window where a concurrent execution could receive the wrong
+  redaction snapshot and leak a vault secret into the model context.
+- Extended the tool_call_id correlation fix to `_PENDING_ERRORS` (pending
+  error telemetry). Concurrent tool calls sharing a task_id no longer
+  overwrite each other's pending-error entries; diagnostic attribution is
+  now per-tool-call. Diagnostic-integrity fix, not a confidentiality change.
+
+### Tests
+- Added concurrency regression tests: overlapping calls sharing one task_id
+  with different secrets, both completion orders, concurrent transformer
+  invocation, repeated result transformation, cleanup after both executions,
+  and the task_id fallback path.
+- Added pending-error correlation regression tests: overlapping calls each
+  stashing a different error, both completion orders isolated while one call
+  is in flight, per-call cleanup leaving no stale entries, and the task_id
+  fallback still surfacing sanitized diagnostics.
+
 ## v0.8.0 (2026-11-14)
 
 ### Security (generic unknown-parameter rejection)

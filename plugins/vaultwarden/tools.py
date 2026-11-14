@@ -262,7 +262,7 @@ def _resolve_secret_input(
 
     v0.4.9 (BREAKING CHANGE): the *_env channel (and with it the `env_key`
     and `config` parameters) was REMOVED from this resolver; since the
-    HAVWP1 cleanup the removed parameters are no longer special-cased.
+    v0.8.0 cleanup the removed parameters are no longer special-cased.
     """
     provided = [k for k in (direct_key, file_key) if args.get(k)]
     if len(provided) > 1:

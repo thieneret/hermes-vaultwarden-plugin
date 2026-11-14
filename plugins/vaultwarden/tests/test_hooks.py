@@ -534,7 +534,7 @@ def test_scope_close_stashes_deferred_snapshot_for_transform():
     """Hosts dispatching transform AFTER the frame still get the snapshot."""
     filt = _fresh_filter()
     scope = ExecutionSecretScope(filt)
-    scope._task_id = "exec-deferred-1"
+    scope._correlation_id = "exec-deferred-1"
     scope.retain("jjjj-deferred-secret")
     scope.close()
     got = consume_deferred_injected("exec-deferred-1")
