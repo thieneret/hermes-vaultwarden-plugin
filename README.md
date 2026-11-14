@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.8.1**
+**Current version: v0.8.2**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -195,6 +195,10 @@ plugins:
         placeholder_ttl_seconds: 300
         max_placeholders: 50
         bw_cli_path: "/usr/local/bin/bw"   # REQUIRED, absolute path
+        # ssh_binary_dir: "/usr/bin"       # REQUIRED only for the 4 SSH key tools
+        # ssh_add_path: ""                 # optional per-binary override
+        # ssh_keygen_path: ""              # optional per-binary override
+        # ssh_agent_path: ""               # optional per-binary override
         metadata_masking: false
         bw_max_retries: 3
         bw_backoff_base: 1.0
@@ -301,6 +305,10 @@ Behavior and guarantees:
 | `placeholder_ttl_seconds` | Placeholder token lifetime. Default: `300` (5min) |
 | `max_placeholders` | Maximum active placeholders. Default: `50` |
 | `bw_cli_path` | **REQUIRED** FULL absolute path to the `bw` binary (e.g. `/usr/local/bin/bw`). There is NO PATH lookup and NO environment-variable override — config.yaml is the single source of truth. The path is validated before use: absolute, regular file, no symlink anywhere in the chain, executable, not group/world-writable, owned by root or the current user. If missing or invalid the plugin fails closed (does not load; the agent continues without it). |
+| `ssh_binary_dir` | **REQUIRED for the four SSH key tools**: absolute path of the directory that contains the `ssh-add`, `ssh-keygen` and `ssh-agent` binaries (e.g. `/usr/bin`). Each binary resolves to `{ssh_binary_dir}/<name>` unless a per-binary override below is set. The directory is validated: absolute, a real directory (not a symlink), not group/world-writable, owned by root or the current user. There is NO PATH lookup. If it is missing or invalid the four SSH tools fail closed (not registered; a direct call still refuses) — every other tool remains fully available. |
+| `ssh_add_path` | OPTIONAL override: absolute path to the `ssh-add` binary, replacing `{ssh_binary_dir}/ssh-add`. Same validation rules as the directory; an invalid override fails the SSH tools closed. Default: empty (resolve from `ssh_binary_dir`). |
+| `ssh_keygen_path` | OPTIONAL override: absolute path to the `ssh-keygen` binary, replacing `{ssh_binary_dir}/ssh-keygen`. Same validation rules. Default: empty (resolve from `ssh_binary_dir`). |
+| `ssh_agent_path` | OPTIONAL override: absolute path to the `ssh-agent` binary, replacing `{ssh_binary_dir}/ssh-agent`. Same validation rules. Default: empty (resolve from `ssh_binary_dir`). |
 | `metadata_masking` | When `true`, `vaultwarden_list` and `vaultwarden_search` mask `username` and `uris` with `***`. `name` is never masked. Default: `false` |
 | `allow_startup_secret_injection` | Register the optional SecretSource adapter for startup-time secret injection. Default: `false` (disabled). See the Startup secret injection section. |
 | `allow_insecure_local_backend` | Explicit opt-in to run with a `local` (or unset) Hermes terminal backend, where the LLM executes as the SAME OS user that owns `secrets.yaml` and can read `client_secret` / `master_password` via `cat`. Default: `false` — the plugin REFUSES to load on a local/unset backend (fail-closed, CRITICAL log). Set to `true` only on trusted single-user machines; loading then logs a WARNING that the operator accepts the risk. Sandboxed backends (`docker` / `ssh` / `modal`) load regardless of this flag and remain the recommended posture. Read ONLY via the native Hermes config (`plugins.entries.vaultwarden.settings`) — no `.env` / environment-variable channel. |
@@ -465,7 +473,7 @@ The companion coding-agent skill `vaultwarden-usage` lives at
 pytest plugins/vaultwarden/tests/ -q
 ```
 
-Current suite: **887 tests** — including positive-control suites for:
+Current suite: **933 tests** — including positive-control suites for:
 
 - Placeholder lifecycle (single-use, expiry, replay rejection)
 - Fail-closed behaviour (missing hooks, broken config, refused loads)

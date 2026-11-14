@@ -111,6 +111,16 @@ _DEFAULTS: dict[str, Any] = {
     "placeholder_ttl_seconds": 300,
     "max_placeholders": 50,
     "bw_cli_path": "",
+    # HVA-079-03 (BREAKING; Option C schema): SSH binary pinning via ONE
+    # required ssh_binary_dir (the directory holding ssh-add / ssh-keygen /
+    # ssh-agent) plus OPTIONAL per-binary overrides below. Empty strings
+    # here mean "not configured" — the SSH tools then fail closed while
+    # every non-SSH tool stays available (SSH is optional functionality).
+    # There is NO PATH lookup and NO env override.
+    "ssh_binary_dir": "",
+    "ssh_add_path": "",
+    "ssh_keygen_path": "",
+    "ssh_agent_path": "",
     # VWP-10 (v0.3.8): retry / backoff for idempotent bw calls.
     "bw_max_retries": 3,
     "bw_backoff_base": 1.0,
@@ -335,6 +345,31 @@ class PluginConfig:
                         "bw_cli_path in config.yaml is the only source.")
         return str(self._raw("bw_cli_path") or "")
 
+    # HVA-079-03 (BREAKING; Option C schema): ssh_binary_dir is REQUIRED
+    # for SSH functionality (the directory holding ssh-add / ssh-keygen /
+    # ssh-agent); the three ssh_*_path keys below are OPTIONAL per-binary
+    # overrides. Resolution: {ssh_binary_dir}/{name} unless an override is
+    # set — then that exact path. Exec always uses the RESOLVED absolute
+    # path; there is NO PATH lookup and NO environment-variable override.
+    # Missing/invalid inputs fail ONLY the SSH tools closed (validation in
+    # tools.validate_ssh_binary_dir / validate_ssh_binary_path, mirroring
+    # the bw pinning model).
+    @property
+    def ssh_binary_dir(self) -> str:
+        return str(self._raw("ssh_binary_dir") or "")
+
+    @property
+    def ssh_add_path(self) -> str:
+        return str(self._raw("ssh_add_path") or "")
+
+    @property
+    def ssh_keygen_path(self) -> str:
+        return str(self._raw("ssh_keygen_path") or "")
+
+    @property
+    def ssh_agent_path(self) -> str:
+        return str(self._raw("ssh_agent_path") or "")
+
     # v0.2.2 (BUGFIX): configurable terminal tool names / command keys.
     # Empty list => hooks.py falls back to its built-in defaults.
     # VWP-10 (v0.3.8): retry / backoff accessors. NOTE: the minimum bw
@@ -399,6 +434,15 @@ class PluginConfig:
         components could leak sensitive material into logging or diagnostic
         output, so validation is fail-closed: any prohibited component
         present => ConfigError. The path component remains allowed.
+
+        HVA-079-02 (v0.8.2): additionally validates the port component —
+        fail-closed. A present port must be an integer in the range
+        1-65535; non-numeric or out-of-range ports raise ConfigError. An
+        absent or empty port is accepted (the default port applies). The
+        rejection message names only the config key and the accepted
+        range — never the raw URL or port value; the underlying
+        urlparse ValueError echoes the raw port, so its context is
+        suppressed with ``raise ... from None``.
         """
         from urllib.parse import urlparse
 
@@ -445,6 +489,27 @@ class PluginConfig:
                 "secrets.vaultwarden.server_url must not contain fragments. "
                 "Fragments are not transmitted but may indicate "
                 "misconfiguration."
+            )
+
+        # HVA-079-02 (v0.8.2): port validation — fail-closed on 1-65535.
+        # Runs AFTER the HVA-02 component gates so their rejection wording
+        # keeps precedence for hostile URLs that also carry a bad port.
+        # urlparse().port raises ValueError for non-numeric ports and for
+        # numeric ports outside 0-65535; port 0 passes urlparse but names
+        # no connectable service, hence the explicit 1-65535 gate. An
+        # absent or empty port yields None and remains accepted.
+        try:
+            port = parsed.port
+        except ValueError:
+            raise errors.ConfigError(
+                "secrets.vaultwarden.server_url has an invalid or "
+                "out-of-range port. The port must be a number between "
+                "1 and 65535."
+            ) from None
+        if port is not None and not (1 <= port <= 65535):
+            raise errors.ConfigError(
+                "secrets.vaultwarden.server_url has an out-of-range port. "
+                "The port must be a number between 1 and 65535."
             )
 
     def validate(self) -> None:

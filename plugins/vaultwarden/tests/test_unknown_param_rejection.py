@@ -17,7 +17,7 @@ import re
 
 from vaultwarden.placeholders import PlaceholderRegistry
 from vaultwarden.tests.conftest import _dict_tools as _conftest_dict_tools
-from vaultwarden.tests.conftest import make_config
+from vaultwarden.tests.conftest import make_config, write_fake_ssh_binaries
 
 # Built at runtime from parts so this module's own literals can never match
 # the forbidden token patterns (mirrors the version-coupling guard style).
@@ -47,12 +47,14 @@ class _StubAuth:
         return []
 
 
-def _tools():
-    return _conftest_dict_tools(_StubAuth(), make_config(),
-                                PlaceholderRegistry())
+def _tools(tmp_path):
+    # SSH pinning: pin valid stub binaries so the SSH tool group registers
+    # and all twelve handlers are present for the unknown-param probe.
+    cfg = make_config(section=write_fake_ssh_binaries(str(tmp_path / "ssh-bins")))
+    return _conftest_dict_tools(_StubAuth(), cfg, PlaceholderRegistry())
 
 
-def test_all_twelve_tools_covered():
+def test_all_twelve_tools_covered(tmp_path):
     assert len(_ALL_TOOLS) == 12
 
 
@@ -63,22 +65,24 @@ def _probe_rejection(tools, tool):
     return res["error"]
 
 
-def test_unknown_param_rejected_by_every_handler():
-    tools = _tools()
+def test_unknown_param_rejected_by_every_handler(tmp_path):
+    tools = _tools(tmp_path)
     for tool in _ALL_TOOLS:
         _probe_rejection(tools, tool)
 
 
-def test_error_message_free_of_version_and_audit_tokens():
-    tools = _tools()
+def test_error_message_free_of_version_and_audit_tokens(tmp_path):
+    tools = _tools(tmp_path)
     for tool in _ALL_TOOLS:
         msg = _probe_rejection(tools, tool)
         assert not _VERSION_PAT.search(msg), (tool, msg)
         assert not _AUDIT_PAT.search(msg), (tool, msg)
 
 
-def test_declared_params_still_accepted():
-    tools = _tools()
+def test_declared_params_still_accepted(tmp_path):
+    # list/status are non-SSH tools: they stay available even with stub
+    # binaries pinned.
+    tools = _tools(tmp_path)
     res = tools["vaultwarden_list"]({"type": "login", "limit": 5})
     assert "error_code" not in res, res
     assert res["items"] == []

@@ -302,11 +302,11 @@ def test_init_and_config_and_auth_delegate_to_compat():
 
 def test_register_tool_compat_used_by_register(fake_bw, appdata,
                                                hermes_home_with_secrets,
-                                               monkeypatch):
+                                               monkeypatch, tmp_path):
     """End-to-end: register() through compat still lands check_fn on the
     RecordingCtx (signature-introspection path) — behaviour unchanged by
     VWP-05/VWP-06."""
-    from vaultwarden.tests.conftest import RecordingCtx
+    from vaultwarden.tests.conftest import RecordingCtx, write_fake_ssh_binaries
 
     monkeypatch.setenv("BW_TEST_VERSION", "2026.9.1")
     ctx = RecordingCtx(settings={
@@ -314,6 +314,7 @@ def test_register_tool_compat_used_by_register(fake_bw, appdata,
         "server_url": "https://vault.example.com",
         "client_id": "user.11111111-2222-3333-4444-555555555555",
         "bw_cli_path": fake_bw,
+        **write_fake_ssh_binaries(str(tmp_path / "ssh-bins")),
     })
     import vaultwarden
     assert vaultwarden.register(ctx) is True
@@ -488,8 +489,11 @@ def _vw_register_ctx(tmp_path, fake_bw, monkeypatch, cls=None):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "docker")
     _install_fake_hermes_cli(monkeypatch, PRODUCTION_VALID_HOOKS)
+    from vaultwarden.tests.conftest import write_fake_ssh_binaries
     return (cls or RecordingCtx)({**_BASE, "enabled": True,
-                                  "bw_cli_path": fake_bw})
+                                  "bw_cli_path": fake_bw,
+                                  **write_fake_ssh_binaries(
+                                      str(tmp_path / "ssh-bins"))})
 
 
 class _NoLifecycleRegistryCtx(RecordingCtx):

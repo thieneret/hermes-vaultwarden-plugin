@@ -232,6 +232,87 @@ def test_http_override_still_rejects_user_info():
 
 
 # ---------------------------------------------------------------------------
+# HVA-079-02 (v0.8.2): port component validation — fail-closed on 1-65535.
+# Absent/empty port stays accepted (default port applies); any present
+# port must be an integer in 1-65535.
+# ---------------------------------------------------------------------------
+
+def test_url_without_port_accepted():
+    # Criterion 1: no port accepted. A trailing colon (empty port
+    # component) parses to None and is treated the same way.
+    for url in ("https://vault.example.com", "https://vault.example.com:"):
+        _cfg(server_url=url).validate()  # must not raise
+
+
+def test_url_with_valid_port_accepted():
+    # Criterion 2: :8443 accepted.
+    _cfg(server_url="https://vault.example.com:8443").validate()  # no raise
+
+
+def test_boundary_ports_accepted():
+    # Criterion 3: boundary ports :1 and :65535 accepted.
+    for port in (1, 65535):
+        _cfg(server_url=f"https://vault.example.com:{port}").validate()
+
+
+def test_port_zero_rejected():
+    # Criterion 4a: urlparse() accepts 0 as an "integer" port, but port 0
+    # names no connectable service — the validator must reject it.
+    cfg = _cfg(server_url="https://vault.example.com:0")
+    with pytest.raises(ConfigError, match="out-of-range port"):
+        cfg.validate()
+
+
+def test_out_of_range_ports_rejected():
+    # Criterion 4b: :65536 and :99999 rejected (urlparse ValueError path).
+    for port in (65536, 99999):
+        cfg = _cfg(server_url=f"https://vault.example.com:{port}")
+        with pytest.raises(ConfigError, match="invalid or out-of-range port"):
+            cfg.validate()
+
+
+def test_non_numeric_port_rejected():
+    # Criterion 5: non-numeric port rejected with a clear error.
+    cfg = _cfg(server_url="https://vault.example.com:abc")
+    with pytest.raises(ConfigError, match="invalid or out-of-range port"):
+        cfg.validate()
+
+
+def test_port_rejection_message_is_sanitized():
+    # Criterion 7: the ConfigError message names only the config key and
+    # the accepted range — never the raw port value. The underlying
+    # ValueError (whose text echoes the raw value) stays suppressed.
+    marker = "sup3rs3cr3tport"
+    cfg = _cfg(server_url=f"https://vault.example.com:{marker}")
+    with pytest.raises(ConfigError) as excinfo:
+        cfg.validate()
+    message = str(excinfo.value)
+    assert marker not in message
+    assert "1 and 65535" in message
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__ is True
+
+
+def test_port_gate_keeps_component_precedence():
+    # Criterion 6: the port check runs AFTER the scheme and HVA-02
+    # component gates, so the older rejection messages stay reachable for
+    # hostile URLs that also carry a bad port.
+    cfg = _cfg(server_url="https://user:***@host:99999")
+    with pytest.raises(ConfigError, match="must not contain user-info"):
+        cfg.validate()
+    cfg = _cfg(server_url="ftp://host:99999")
+    with pytest.raises(ConfigError, match="unsupported scheme"):
+        cfg.validate()
+
+
+def test_http_override_url_with_bad_port_rejected():
+    # The port gate applies regardless of the allow_insecure_http override.
+    cfg = _cfg(server_url="http://host:0", allow_insecure_http=True)
+    with pytest.raises(ConfigError, match="out-of-range port"):
+        cfg.validate()
+
+
+# ---------------------------------------------------------------------------
 # HVA-02 (v0.7.1): server_url_sanitized accessor — defence-in-depth on the
 # display/log path.  The canonical ``server_url`` stays verbatim (functional
 # consumers need the exact URL); ``server_url_sanitized`` is what status and
