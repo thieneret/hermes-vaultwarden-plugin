@@ -286,18 +286,17 @@ _SSH_STUB_NAMES = {
 def write_fake_ssh_binaries(bindir: str) -> dict:
     """Create the three executable SSH stubs under *bindir*.
 
-    Returns the settings mapping {config_key: absolute stub path} ready
-    to merge into a config section.
+    Returns the Option C settings section {ssh_binary_dir: abspath(bindir)}
+    — stub file names match the binary names, so all three resolve from the
+    directory with no overrides.
     """
     os.makedirs(bindir, exist_ok=True)
-    out: dict[str, str] = {}
-    for key, binary in _SSH_STUB_NAMES.items():
+    for binary in _SSH_STUB_NAMES.values():
         path = os.path.join(bindir, binary)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(_SSH_STUB_SCRIPT)
         os.chmod(path, 0o755)
-        out[key] = path
-    return out
+    return {"ssh_binary_dir": os.path.abspath(bindir)}
 
 
 @pytest.fixture()

@@ -22,7 +22,8 @@ from vaultwarden.tests.conftest import write_fake_ssh_binaries
 # enough for the probe branch; tests of the DISABLED path call
 # _cleanup_stale_sockets() with no pinned path (skip branch).
 _SSH_STUB_DIR = tempfile.mkdtemp(prefix="vw_sockclean_stub_bins_")
-_SSH_ADD = write_fake_ssh_binaries(_SSH_STUB_DIR)["ssh_add_path"]
+write_fake_ssh_binaries(_SSH_STUB_DIR)  # real on-disk layout (dir + stubs)
+_SSH_ADD = os.path.join(_SSH_STUB_DIR, "ssh-add")  # resolved default path
 
 #: Marker standing in for passphrase material — must never surface in logs.
 PASSPHRASE_MARKER = "hva04-PASSPHRASE-MUST-NEVER-APPEAR-b7d3"

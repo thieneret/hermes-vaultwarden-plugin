@@ -152,17 +152,19 @@ def _ssh_base_env(extra: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# HVA-079-03 (v0.8.2, BREAKING): SSH binary path pinning — Option B.
-# ssh-add / ssh-keygen / ssh-agent are executed ONLY from the REQUIRED
-# pinned absolute paths configured in settings (config.yaml). There is NO
-# PATH lookup and NO environment-variable override — a compromised PATH
-# or a same-named malicious binary must never run with the plugin's
-# privileges, since these binaries handle private keys and passphrases.
-# The validation rules deliberately mirror validate_bw_path() rule-for-
-# rule; the bw validation itself is UNCHANGED (separate function, shared
-# model). Missing or invalid paths fail ONLY the SSH tools closed — the
-# plugin itself and all non-SSH tools stay available (SSH is optional
-# functionality, unlike bw which is core).
+# HVA-079-03 (BREAKING at first landing; config schema revised to Option C):
+# SSH binary pinning via ONE required ssh_binary_dir (the directory holding
+# ssh-add / ssh-keygen / ssh-agent) plus OPTIONAL per-binary overrides
+# (ssh_add_path / ssh_keygen_path / ssh_agent_path). Each binary resolves to
+# {ssh_binary_dir}/{binary-name} unless its override is set. Security model
+# identical to Option B: mandatory pinning, fail-closed, NO PATH lookup and
+# NO environment-variable override — a compromised PATH or a same-named
+# malicious binary must never run with the plugin's privileges, since these
+# binaries handle private keys and passphrases. Validation rules mirror
+# validate_bw_path() rule-for-rule for BOTH the directory and every resolved
+# binary; the bw validation itself is UNCHANGED. Missing or invalid inputs
+# fail ONLY the SSH tools closed — the plugin itself and all non-SSH tools
+# stay available (SSH is optional functionality, unlike bw which is core).
 
 #: config key -> binary name (labels for validator messages).
 _SSH_BINARY_KEYS = {
@@ -241,19 +243,91 @@ def validate_ssh_binary_path(raw: str, config_key: str) -> str:
     return abs_path
 
 
+def validate_ssh_binary_dir(raw: str) -> str:
+    """Strictly validate the pinned ssh_binary_dir (same model as the
+    binary validator: absolute path, real directory — NOT a symlink, not
+    group/world-writable, owned by root or the current effective user).
+
+    A world-writable or foreign-owned directory would let an attacker
+    swap the binaries between validation and exec — the whole pinning
+    model rests on the directory being as trusted as the binaries.
+
+    Returns the validated (absolute) directory path; raises on any
+    failure (ConfigError for unset, BinaryError for invalid).
+    """
+    raw = str(raw or "").strip()
+    if not raw:
+        raise errors.ConfigError(
+            "ssh_binary_dir is required for the SSH tools.",
+            suggestion="Set plugins.entries.vaultwarden.settings."
+                       "ssh_binary_dir to the directory containing the "
+                       "ssh-add, ssh-keygen and ssh-agent binaries "
+                       "(e.g. /usr/bin); ssh_add_path / ssh_keygen_path "
+                       "/ ssh_agent_path may override individual "
+                       "binaries. There is no PATH lookup.")
+
+    if not os.path.isabs(raw):
+        raise errors.BinaryError(
+            f"ssh_binary_dir {raw!r} must be an absolute path.")
+
+    abs_path = os.path.abspath(raw)
+    real_path = os.path.realpath(abs_path)
+    if abs_path != real_path:
+        raise errors.BinaryError(
+            f"ssh_binary_dir {raw!r} resolves through a symlink "
+            f"(realpath: {real_path}); symlinks are not allowed.")
+
+    try:
+        st = os.stat(abs_path)
+    except OSError as exc:
+        raise errors.BinaryError(
+            f"ssh_binary_dir {raw!r} not found or not accessible: "
+            f"{type(exc).__name__}") from exc
+
+    if not stat.S_ISDIR(st.st_mode):
+        raise errors.BinaryError(
+            f"ssh_binary_dir {raw!r} is not a directory.")
+
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise errors.BinaryError(
+            f"ssh_binary_dir {raw!r} is group/world-writable; refusing "
+            "SSH binary resolution from a directory other users can "
+            "modify.")
+
+    if st.st_uid not in (0, os.geteuid()):
+        raise errors.BinaryError(
+            f"ssh_binary_dir {raw!r} has unexpected owner uid "
+            f"{st.st_uid}; it must be owned by root or the current "
+            "effective user.")
+
+    return abs_path
+
+
 def resolve_ssh_binaries(config: PluginConfig) -> tuple[dict, object]:
-    """Resolve and validate all three pinned SSH binary paths.
+    """Resolve all three pinned SSH binary paths (Option C).
+
+    Each binary uses its OPTIONAL override (ssh_add_path / ssh_keygen_path
+    / ssh_agent_path) when set, otherwise {ssh_binary_dir}/{binary-name}.
+    The REQUIRED ssh_binary_dir is validated first, then every resolved
+    path through the bw-model binary validator.
 
     Returns ({config_key: validated absolute path}, None) when ALL three
-    keys are configured and valid, or (None, error) describing the first
-    failure. QUIET by design: the caller owns the log/response wording
-    (registration warning line, handler error text).
+    resolve valid, or (None, error) describing the first failure. QUIET by
+    design: the caller owns the log/response wording (registration warning
+    line, handler error text). No PATH is ever consulted.
     """
+    try:
+        bdir = validate_ssh_binary_dir(
+            str(getattr(config, "ssh_binary_dir", "") or ""))
+    except errors.VaultwardenError as exc:
+        return None, exc
+
     bins: dict[str, str] = {}
-    for key in _SSH_BINARY_KEYS:
-        raw = str(getattr(config, key, "") or "")
+    for key, binary_name in _SSH_BINARY_KEYS.items():
+        override = str(getattr(config, key, "") or "").strip()
+        candidate = override or os.path.join(bdir, binary_name)
         try:
-            bins[key] = validate_ssh_binary_path(raw, key)
+            bins[key] = validate_ssh_binary_path(candidate, key)
         except errors.VaultwardenError as exc:
             return None, exc
     return bins, None
@@ -271,10 +345,11 @@ def _require_ssh_binaries(config: PluginConfig) -> dict:
         raise errors.ConfigError(
             f"SSH tools are fail-closed: {err.message}",
             suggestion=(err.suggestion or (
-                "Set ssh_add_path / ssh_keygen_path / ssh_agent_path in "
-                "plugins.entries.vaultwarden.settings to the FULL absolute "
-                "paths of the ssh-add, ssh-keygen and ssh-agent binaries; "
-                "there is no PATH lookup.")))
+                "Check plugins.entries.vaultwarden.settings.ssh_binary_dir "
+                "(the directory containing the ssh-add, ssh-keygen and "
+                "ssh-agent binaries) and any ssh_add_path / ssh_keygen_path "
+                "/ ssh_agent_path override — they must be real, executable, "
+                "non-world-writable paths; there is no PATH lookup.")))
     return bins
 
 
@@ -703,14 +778,14 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     the end of the list.
     v0.3.7 (VWP-12): 12 tools — vaultwarden_generate_password was removed;
     password generation is integrated into store/update via generate=true.
-    HVA-079-03 (v0.8.2, BREAKING): SSH binary pinning — the 4 SSH tools
-    are registered ONLY when all three pinned paths (ssh_add_path /
-    ssh_keygen_path / ssh_agent_path) are configured and valid; otherwise
-    they fail closed (not registered; a direct handler call still refuses
-    via _require_ssh_binaries). The 8 non-SSH tools are unaffected —
-    SSH is optional functionality. Pass *ssh_bins* pre-resolved (from
-    resolve_ssh_binaries; None means "confirmed invalid") to skip the
-    internal resolution and its warning log.
+    HVA-079-03 (BREAKING; Option C schema): SSH binary pinning — the 4 SSH
+    tools are registered ONLY when the required ssh_binary_dir plus its
+    resolved (or overridden) ssh_add_path / ssh_keygen_path / ssh_agent_path
+    binaries all validate; otherwise they fail closed (not registered; a
+    direct handler call still refuses via _require_ssh_binaries). The 8
+    non-SSH tools are unaffected — SSH is optional functionality. Pass
+    *ssh_bins* pre-resolved (from resolve_ssh_binaries; None means
+    "confirmed invalid") to skip the internal resolution and its warning log.
     """
     _tools: list[tuple[dict, Handler]] = []
 
@@ -1106,16 +1181,18 @@ def get_tools(auth: AuthManager, config: PluginConfig,
     # Helpers (_validate_ssh_key_file / _resolve_socket_path) are also
     # module-level only.
     #
-    # HVA-079-03 (v0.8.2, BREAKING): the SSH tools are registered ONLY
-    # with pinned, validated ssh_add_path / ssh_keygen_path /
-    # ssh_agent_path settings (no PATH lookup). Missing/invalid paths
-    # fail these four tools closed — the 8 non-SSH tools stay available.
+    # HVA-079-03 (BREAKING; Option C schema): the SSH tools are registered
+    # ONLY when ssh_binary_dir (plus optional ssh_add_path / ssh_keygen_path
+    # / ssh_agent_path overrides) resolves to validated pinned paths — no
+    # PATH lookup. Missing/invalid inputs fail these four tools closed —
+    # the 8 non-SSH tools stay available.
     if ssh_bins is _SSH_BINS_UNRESOLVED:
         ssh_bins, _ssh_err = resolve_ssh_binaries(config)
         if ssh_bins is None:
             log.warning("SSH key management tools NOT registered (fail-"
-                        "closed): ssh_add_path / ssh_keygen_path / "
-                        "ssh_agent_path missing or invalid; non-SSH tools "
+                        "closed): ssh_binary_dir missing or invalid, or a "
+                        "resolved/override ssh_add_path / ssh_keygen_path "
+                        "/ ssh_agent_path failed validation; non-SSH tools "
                         "unaffected.")
     if ssh_bins is not None:
         def _h_store_ssh_bound(args: dict, **kw: Any) -> str:
@@ -1667,8 +1744,8 @@ def h_use_ssh(args: dict, auth: AuthManager, config: PluginConfig,
 
     Security guarantees:
     - HVA-079-03 (v0.8.2 BREAKING): ssh-add / ssh-keygen / ssh-agent run
-      ONLY from the pinned, validated absolute paths supplied by the
-      three ssh_*_path settings — never PATH-resolved; the handler fails
+      ONLY from pinned, validated paths resolved from ssh_binary_dir (or
+      the ssh_*_path overrides) — never PATH-resolved; the handler fails
       closed when any path is missing or invalid.
     - Passphrase delivered via the SSH_ASKPASS mechanism: a dynamically
       generated shell script containing ONLY `echo "$VW_SSH_PASS"` runs

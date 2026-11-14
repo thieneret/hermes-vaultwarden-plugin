@@ -111,10 +111,13 @@ _DEFAULTS: dict[str, Any] = {
     "placeholder_ttl_seconds": 300,
     "max_placeholders": 50,
     "bw_cli_path": "",
-    # HVA-079-03 (v0.8.2, BREAKING): REQUIRED pinned absolute paths for
-    # the SSH binaries (no PATH lookup, no env override). Empty string
-    # here means "not configured" — the SSH tools then fail closed while
+    # HVA-079-03 (BREAKING; Option C schema): SSH binary pinning via ONE
+    # required ssh_binary_dir (the directory holding ssh-add / ssh-keygen /
+    # ssh-agent) plus OPTIONAL per-binary overrides below. Empty strings
+    # here mean "not configured" — the SSH tools then fail closed while
     # every non-SSH tool stays available (SSH is optional functionality).
+    # There is NO PATH lookup and NO env override.
+    "ssh_binary_dir": "",
     "ssh_add_path": "",
     "ssh_keygen_path": "",
     "ssh_agent_path": "",
@@ -342,13 +345,19 @@ class PluginConfig:
                         "bw_cli_path in config.yaml is the only source.")
         return str(self._raw("bw_cli_path") or "")
 
-    # HVA-079-03 (v0.8.2, BREAKING): SSH binary path pinning. The SSH
-    # binaries are executed ONLY from these REQUIRED absolute paths —
-    # there is NO PATH lookup and NO environment-variable override.
-    # The keys are optional at plugin LOAD time (SSH is optional
-    # functionality): a missing or invalid path fails the SSH tools
-    # closed while every non-SSH tool stays available. Validation rules
-    # mirror the bw pinning model (see tools.validate_ssh_binary_path).
+    # HVA-079-03 (BREAKING; Option C schema): ssh_binary_dir is REQUIRED
+    # for SSH functionality (the directory holding ssh-add / ssh-keygen /
+    # ssh-agent); the three ssh_*_path keys below are OPTIONAL per-binary
+    # overrides. Resolution: {ssh_binary_dir}/{name} unless an override is
+    # set — then that exact path. Exec always uses the RESOLVED absolute
+    # path; there is NO PATH lookup and NO environment-variable override.
+    # Missing/invalid inputs fail ONLY the SSH tools closed (validation in
+    # tools.validate_ssh_binary_dir / validate_ssh_binary_path, mirroring
+    # the bw pinning model).
+    @property
+    def ssh_binary_dir(self) -> str:
+        return str(self._raw("ssh_binary_dir") or "")
+
     @property
     def ssh_add_path(self) -> str:
         return str(self._raw("ssh_add_path") or "")

@@ -140,11 +140,12 @@ def register(ctx: Any) -> bool:
     ssh_bins, ssh_err = resolve_ssh_binaries(config)
     if ssh_err is not None:
         log.warning("SSH key management tools DISABLED (fail-closed): %s "
-                    "Set plugins.entries.vaultwarden.settings.ssh_add_path "
-                    "/ ssh_keygen_path / ssh_agent_path to the FULL "
-                    "absolute paths of the ssh-add / ssh-keygen / ssh-agent "
-                    "binaries. Non-SSH tools remain available; PATH lookup "
-                    "is never performed for SSH binaries.", ssh_err.message)
+                    "Set plugins.entries.vaultwarden.settings.ssh_binary_dir "
+                    "to the directory containing the ssh-add / ssh-keygen / "
+                    "ssh-agent binaries (ssh_add_path / ssh_keygen_path / "
+                    "ssh_agent_path may override individual binaries). "
+                    "Non-SSH tools remain available; PATH lookup is never "
+                    "performed for SSH binaries.", ssh_err.message)
     else:
         log.info("SSH binaries pinned and validated: ssh-add=%s "
                  "ssh-keygen=%s ssh-agent=%s",

@@ -108,31 +108,42 @@ config:
   # pinning rules (absolute regular file, no symlink in the chain,
   # executable, not group/world-writable, owned by root or the current
   # user). These keys are NOT marked required: true in the manifest on
-  # purpose — SSH is optional functionality: a missing or invalid path
-  # fails ONLY the four SSH tools closed (they are not registered and
-  # reject any direct call); the plugin itself and every non-SSH tool
-  # stay fully available.
+  # purpose — SSH is optional functionality: a missing or invalid
+  # ssh_binary_dir fails ONLY the four SSH tools closed (they are not
+  # registered and reject any direct call); the plugin itself and every
+  # non-SSH tool stay fully available.
+  ssh_binary_dir:
+    type: string
+    default: ""
+    description: >-
+      REQUIRED for the SSH tools: absolute path of the directory that
+      contains the ssh-add, ssh-keygen and ssh-agent binaries (e.g.
+      /usr/bin). Each binary is resolved to {ssh_binary_dir}/{name}
+      unless an ssh_*_path override below is set. Validated directory
+      (no symlink, not group/world-writable, owned by root or the current
+      user); no PATH lookup; the SSH tools fail closed if this is missing
+      or fails validation.
   ssh_add_path:
     type: string
     default: ""
     description: >-
-      REQUIRED for the SSH tools: FULL absolute path to the ssh-add
-      binary (e.g. /usr/bin/ssh-add). No PATH lookup; the SSH tools fail
-      closed if this is missing or fails validation.
+      OPTIONAL override: absolute path to the ssh-add binary, replacing
+      {ssh_binary_dir}/ssh-add. Same validation rules as the directory;
+      an invalid override fails the SSH tools closed.
   ssh_keygen_path:
     type: string
     default: ""
     description: >-
-      REQUIRED for the SSH tools: FULL absolute path to the ssh-keygen
-      binary (e.g. /usr/bin/ssh-keygen). No PATH lookup; the SSH tools
-      fail closed if this is missing or fails validation.
+      OPTIONAL override: absolute path to the ssh-keygen binary,
+      replacing {ssh_binary_dir}/ssh-keygen. Same validation rules as
+      the directory; an invalid override fails the SSH tools closed.
   ssh_agent_path:
     type: string
     default: ""
     description: >-
-      REQUIRED for the SSH tools: FULL absolute path to the ssh-agent
-      binary (e.g. /usr/bin/ssh-agent). No PATH lookup; the SSH tools
-      fail closed if this is missing or fails validation.
+      OPTIONAL override: absolute path to the ssh-agent binary,
+      replacing {ssh_binary_dir}/ssh-agent. Same validation rules as
+      the directory; an invalid override fails the SSH tools closed.
   # v0.3.8 (VWP-10): retry / backoff for idempotent bw calls. NOTE: the
   # minimum supported bw version is deliberately NOT configurable (VWP-11:
   # fail-closed, no override).

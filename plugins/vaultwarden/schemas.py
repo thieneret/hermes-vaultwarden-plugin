@@ -162,13 +162,15 @@ _PASS_FILE_DESC = (
     "(chmod 600); mutually exclusive with pass. Forbidden when "
     "generate=true."
 )
-#: Note shared by all four SSH tools: binaries run ONLY from pinned
-#: absolute paths (no PATH lookup); fail-closed when unset/invalid.
+#: Note shared by all four SSH tools: binaries run ONLY from paths resolved
+#: from the required ssh_binary_dir (optional ssh_*_path overrides); no PATH
+#: lookup; fail-closed when unset/invalid.
 _SSH_PINNED_BINARIES_NOTE = (
-    " SSH key tools execute the OpenSSH binaries ONLY from the pinned "
-    "ssh_add_path / ssh_keygen_path / ssh_agent_path settings (absolute, "
-    "validated paths — no PATH lookup); they fail closed when those "
-    "settings are missing or invalid."
+    " SSH key tools execute the OpenSSH binaries ONLY from paths resolved"
+    " from the required ssh_binary_dir setting (per-binary ssh_add_path /"
+    " ssh_keygen_path / ssh_agent_path overrides are optional; absolute,"
+    " validated paths — no PATH lookup); they fail closed when those"
+    " settings are missing or invalid."
 )
 _SSH_GENERATE_PROPERTIES = {
     "generate": {

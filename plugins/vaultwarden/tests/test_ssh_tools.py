@@ -260,7 +260,8 @@ def test_use_ssh_env_keyset_and_cleanup(monkeypatch, tmp_path):
     res = _json.loads(res_json) if isinstance(res_json, str) else res_json
     assert res["loaded"] is True
 
-    add_call = next(c for c in calls if c[0][0] == _SSH_BINS["ssh_add_path"])
+    add_call = next(c for c in calls
+                   if c[0][0] == os.path.join(_SSH_STUB_DIR, "ssh-add"))
     env = add_call[1]["env"]
     assert set(env) == {"PATH", "HOME", "LC_ALL", "SSH_AUTH_SOCK",
                         "SSH_ASKPASS_REQUIRE", "SSH_ASKPASS", "VW_SSH_PASS"}

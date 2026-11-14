@@ -43,6 +43,7 @@ UPLOAD_PASS = "upload-passphrase-lifecycle-abcdef"
 _SSH_STUB_DIR = tempfile.mkdtemp(prefix="vw_ssh_lifecyc_stub_bins_")
 _SSH_BINS = write_fake_ssh_binaries(_SSH_STUB_DIR)
 _USE_SSH_CFG = make_config(section=dict(_SSH_BINS))
+_SSH_ADD_RESOLVED = os.path.join(_SSH_STUB_DIR, "ssh-add")
 
 
 # ------------------------------------------------------------- fixtures
@@ -227,7 +228,7 @@ def test_use_ssh_success_releases_baseline(isolated_filter, monkeypatch):
     seen: list[int] = []
 
     def run_and_probe(cmd, **kw):
-        if cmd and cmd[0] == _SSH_BINS["ssh_add_path"]:
+        if cmd and cmd[0] == _SSH_ADD_RESOLVED:
             seen.append(int(isolated_filter.has_secret(SENTINEL_PASS)))
         return _run_proc_ok(cmd, **kw)
 
@@ -397,7 +398,7 @@ def test_scope_managed_release_no_unknown_warning(isolated_filter):
         probe: dict[str, int] = {}
 
         def run_probe(cmd, **kw):
-            if cmd and cmd[0] == _SSH_BINS["ssh_add_path"]:
+            if cmd and cmd[0] == _SSH_ADD_RESOLVED:
                 # DURING the execution the passphrase is registered via
                 # the scope (retain_in_execution_scope path).
                 probe["during"] = int(redactor.has_secret(SENTINEL_PASS))
@@ -474,7 +475,7 @@ def test_askpass_delivery_unchanged(isolated_filter, monkeypatch):
                                  auth=auth, config=_USE_SSH_CFG))
     assert res["loaded"] is True
     add_call = next(c for c in calls
-                   if c[0][0] == _SSH_BINS["ssh_add_path"])
+                   if c[0][0] == _SSH_ADD_RESOLVED)
     env = add_call[1]["env"]
     assert set(env) == {"PATH", "HOME", "LC_ALL", "SSH_AUTH_SOCK",
                         "SSH_ASKPASS_REQUIRE", "SSH_ASKPASS", "VW_SSH_PASS"}
