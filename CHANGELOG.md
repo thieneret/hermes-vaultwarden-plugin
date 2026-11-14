@@ -5,6 +5,32 @@ Author: **thieneret**
 
 ---
 
+## v0.8.2 (2026-11-14)
+
+### Security (HVA-079-02 — server_url port validation)
+- `server_url` validation now rejects out-of-range (0, >65535) and non-numeric
+  ports. No-port URLs remain accepted (default port applies).
+
+### Security — BREAKING (HVA-079-03 — mandatory SSH binary path pinning)
+- SSH binaries (`ssh-add`, `ssh-keygen`, `ssh-agent`) are now resolved via a
+  single REQUIRED `ssh_binary_dir` config key, with optional per-binary
+  overrides (`ssh_add_path` / `ssh_keygen_path` / `ssh_agent_path`). Each
+  binary resolves to `{ssh_binary_dir}/{name}` unless overridden, and is
+  validated like the `bw` binary (absolute path, regular file, no symlink in
+  the chain, executable, not group/world-writable, owned by root or the
+  current user). The directory itself is validated with the same model.
+  There is NO PATH fallback; missing or invalid paths fail closed for the
+  four SSH tools while every non-SSH tool remains unaffected.
+
+  BREAKING CHANGE: PATH-based SSH binary discovery is removed. SSH users must
+  configure `ssh_binary_dir` (and optionally per-binary overrides).
+
+### Tests
+- Added port-validation tests and SSH path-pinning fail-closed tests
+  (directory rules, `{dir}/{name}` default resolution, override precedence,
+  invalid-override and missing-binary fail-closed, no-PATH-lookup gate,
+  registration surface and stale-socket cleanup skip).
+
 ## v0.8.1 (2026-11-14)
 
 ### Security (HVA-079-01 — concurrent secret correlation)
