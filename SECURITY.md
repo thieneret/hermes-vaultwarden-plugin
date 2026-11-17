@@ -273,6 +273,45 @@ code lives, improving maintainability and security auditability. No other
 module contains `try/except` blocks for API detection or version-specific
 branching.
 
+## Deployment Architecture Constraints
+
+Architectural constraints of the placeholder-injection mechanism — facts
+an operator must plan around; they are not mitigated by the controls above.
+
+### Terminal-backend support limitation
+
+Placeholder injection works ONLY when the executing terminal shares the
+gateway's secret temp files through a Docker volume (`docker` backend).
+The `ssh` backend executes on a different host filesystem and the `modal`
+backend runs in an isolated container with no filesystem mount available —
+neither can reach the gateway's `$XDG_RUNTIME_DIR/vw-secrets` files, so
+injection is unavailable there (unresolved references expand to empty
+strings — fail-safe, never a leak). The `local` backend shares the
+filesystem but the plugin's fail-closed privilege-separation default
+refuses to load there unless the operator explicitly accepts the
+same-user exposure risk (`allow_insecure_local_backend: true`).
+
+### XDG_RUNTIME_DIR is a hard requirement
+
+There is NO fallback for the secrets-directory location. The resolver
+requires `XDG_RUNTIME_DIR` to be set to an existing, writable directory
+and returns `$XDG_RUNTIME_DIR/vw-secrets`; an unset/empty value, a
+non-directory, or a non-writable directory raises `FilesystemSecurityError`
+— fail closed at BOTH plugin load (register() refuses to activate) and
+injection time (sanitized error, placeholders left unresolved). The
+former `<tempdir>/vw-secrets-<uid>` fallback was removed: it could put
+secret temp files on disk (violating the tmpfs-only guarantee) and its
+path could silently diverge from the sandbox mount target.
+
+### Root agents in the backend container
+
+An agent executing as ROOT inside the terminal backend container can read
+the chmod 600 secret temp files directly — the executing shell MUST be
+able to read the file for injection to work, so this is inherent to the
+mechanism, not a plugin defect. Mitigation is operational: run the
+backend agent as a non-root user (pin the identity with `HERMES_UID` /
+`HERMES_GID` and the tmpfs volume's `uid=`/`gid=` options).
+
 ## Defense-in-Depth: Log Redaction
 
 As of v0.3.7 (VWP-14), the `allow_direct_secret_retrieval` escape hatch has been
