@@ -370,11 +370,13 @@ class TestConfiguredRoutesThroughFullFsm:
 
     def test_register_deferred_startup_preserved(self, fake_bw, appdata,
                                                  hermes_home_with_secrets,
-                                                 monkeypatch):
+                                                 monkeypatch, tmp_path):
         """register() still performs ZERO bw subprocesses (v0.1.9 pin)."""
         import vaultwarden
         from vaultwarden.tests.conftest import RecordingCtx
+        from vaultwarden.tests.test_integration import _isolate_xdg
 
+        _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: pass the resolver gate
         spawn_calls: list[list] = []
         real_popen = __import__("subprocess").Popen
 

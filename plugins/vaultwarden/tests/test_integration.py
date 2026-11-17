@@ -42,6 +42,19 @@ def _write_secrets_yaml(home, client_secret="cs-secret", master_password="mp-sec
     return f
 
 
+def _isolate_xdg(monkeypatch, tmp_path):
+    """Pin XDG_RUNTIME_DIR to an isolated 0700 runtime dir under tmp_path.
+
+    v0.8.3: XDG_RUNTIME_DIR is a HARD requirement for the secrets-dir
+    resolver (fail-closed, no fallback). register() gates on it BEFORE the
+    bw/secrets.yaml/SEC-03 checks, so every test that wants to reach those
+    later stages must provide a usable XDG_RUNTIME_DIR instead of relying
+    on the host runtime environment (which is unset on CI runners)."""
+    xdg = tmp_path / "xdg-runtime"
+    xdg.mkdir(mode=0o700, exist_ok=True)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+
+
 def _register_ok(monkeypatch, tmp_path, fake_bw, section_extra=None, env_extra=None):
     # v0.5.0: no VW_* env vars any more — write secrets.yaml instead.
     _write_secrets_yaml(tmp_path)
@@ -50,6 +63,7 @@ def _register_ok(monkeypatch, tmp_path, fake_bw, section_extra=None, env_extra=N
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "docker")  # sandboxed backend -> INFO
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: pass the resolver gate
     # SSH pinning (HVA-079-03 BREAKING): the SSH tool group registers only
     # with pinned valid ssh_*_path settings — pin executable stubs so the
     # default registration surface stays at 12 tools.
@@ -107,6 +121,7 @@ def test_graceful_degradation_missing_bw(monkeypatch, tmp_path):
     planted.chmod(0o755)
     monkeypatch.setenv("BW_CLI_PATH", str(planted))
     monkeypatch.setenv("PATH", str(tmp_path))
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: reach the bw check
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True})
     assert vaultwarden.register(ctx) is False
     assert ctx.tools == []
@@ -117,6 +132,7 @@ def test_register_fails_closed_invalid_bw_cli_path(monkeypatch, tmp_path):
     _write_secrets_yaml(tmp_path)
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: reach the bw check
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                         "bw_cli_path": str(tmp_path / "no-such-bw")})
     assert vaultwarden.register(ctx) is False
@@ -147,6 +163,7 @@ def test_graceful_degradation_missing_secrets_yaml(monkeypatch, tmp_path, fake_b
     monkeypatch.delenv("VW_CLIENT_SECRET", raising=False)
     monkeypatch.delenv("VW_MASTER_PASSWORD", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: reach the secrets.yaml check
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                            "bw_cli_path": fake_bw})
     assert vaultwarden.register(ctx) is False   # logged, not raised
@@ -535,6 +552,7 @@ def test_register_raises_when_middleware_registration_fails(monkeypatch, tmp_pat
 
     _write_secrets_yaml(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: reach middleware registration
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                            "bw_cli_path": fake_bw})
     ctx.register_middleware = _boom
@@ -549,6 +567,7 @@ def test_register_raises_when_middleware_registration_returns_false(monkeypatch,
     # SEC-03 (v0.5.5): pin a sandboxed backend so the local-backend policy
     # cannot short-circuit register() before the middleware path is reached.
     monkeypatch.setenv("TERMINAL_ENV", "docker")
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: reach middleware registration
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                            "bw_cli_path": fake_bw})
     ctx.register_middleware = lambda kind, fn: False

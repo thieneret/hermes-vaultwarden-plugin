@@ -307,8 +307,10 @@ def test_register_tool_compat_used_by_register(fake_bw, appdata,
     RecordingCtx (signature-introspection path) — behaviour unchanged by
     VWP-05/VWP-06."""
     from vaultwarden.tests.conftest import RecordingCtx, write_fake_ssh_binaries
+    from vaultwarden.tests.test_integration import _isolate_xdg
 
     monkeypatch.setenv("BW_TEST_VERSION", "2026.9.1")
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: pass the resolver gate
     ctx = RecordingCtx(settings={
         "enabled": True,
         "server_url": "https://vault.example.com",
@@ -431,13 +433,17 @@ def test_vwp18_register_loads_on_bare_valid_hooks_host(monkeypatch, tmp_path,
     hook-capability signal is the VALID_HOOKS registry (production shape)."""
     import vaultwarden
     from vaultwarden.tests.conftest import BASE_SECTION
-    from vaultwarden.tests.test_integration import _write_secrets_yaml
+    from vaultwarden.tests.test_integration import (
+        _isolate_xdg,
+        _write_secrets_yaml,
+    )
 
     _write_secrets_yaml(tmp_path)
     _install_fake_hermes_cli(monkeypatch, PRODUCTION_VALID_HOOKS)
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "docker")
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: pass the resolver gate
 
     class BareRecordingCtx(_BareCtx):
         def __init__(self, settings):
@@ -482,12 +488,16 @@ def _vw_register_ctx(tmp_path, fake_bw, monkeypatch, cls=None):
     need a *reduced* registry overwrite it afterwards.
     """
     from vaultwarden.tests.conftest import BASE_SECTION as _BASE
-    from vaultwarden.tests.test_integration import _write_secrets_yaml
+    from vaultwarden.tests.test_integration import (
+        _isolate_xdg,
+        _write_secrets_yaml,
+    )
 
     _write_secrets_yaml(tmp_path)
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "docker")
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: pass the resolver gate
     _install_fake_hermes_cli(monkeypatch, PRODUCTION_VALID_HOOKS)
     from vaultwarden.tests.conftest import write_fake_ssh_binaries
     return (cls or RecordingCtx)({**_BASE, "enabled": True,
@@ -828,3 +838,22 @@ def test_aud06_transform_tool_result_fail_closed_unchanged(tmp_path,
     # Refused before ANY middleware/hook registration was attempted.
     assert events == []
     assert ctx.tools == []
+
+
+# -- register(): XDG_RUNTIME_DIR hard requirement (fail-closed resolver) --
+
+def test_register_refuses_load_when_xdg_runtime_dir_unset(tmp_path, fake_bw,
+                                                          monkeypatch, caplog):
+    """v0.8.3: XDG_RUNTIME_DIR is a HARD requirement — with it unset at
+    plugin load the resolver raises INSIDE the AUD-03 gate and register()
+    REFUSES to activate: graceful False (not raised), NOTHING registered,
+    sanitized reason logged (variable name + reason only, never secrets)."""
+    ctx = _vw_register_ctx(tmp_path, fake_bw, monkeypatch)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    with caplog.at_level(logging.WARNING):
+        assert vaultwarden.register(ctx) is False
+    assert ctx.tools == []
+    assert ctx.middleware == []
+    assert ctx.hooks == []
+    assert "XDG_RUNTIME_DIR" in caplog.text
+    assert "unset or empty" in caplog.text

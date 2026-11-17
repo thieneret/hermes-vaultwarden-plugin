@@ -551,9 +551,16 @@ def test_no_cross_contamination_between_two_profiles(fake_bw, tmp_path):
     assert cb.status()["status"] == "unauthenticated"  # b never saw a's login
 
 
-def test_middleware_chain_safety_other_plugin_last_word(fake_bw, tmp_path, registry):
+def test_middleware_chain_safety_other_plugin_last_word(fake_bw, tmp_path,
+                                                         registry, monkeypatch):
     """Simulated Hermes middleware chain: our resolver must not hijack calls
     that contain no placeholders — other plugins' rewrites survive byte-exact."""
+    # v0.8.3: the injection leg uses the REAL _secrets_dir(); pin its hard
+    # requirement (XDG_RUNTIME_DIR, fail-closed resolver) to an isolated dir.
+    xdg = tmp_path / "xdg-runtime"
+    xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+
     from vaultwarden.auth import AuthManager
     from vaultwarden.bw_cli import BwCli
     from vaultwarden.hooks import make_placeholder_resolver
@@ -616,6 +623,9 @@ def test_register_loads_secrets_without_touching_env(monkeypatch, tmp_path, fake
     monkeypatch.setenv("VW_MASTER_PASSWORD", "unused-legacy-value")
 
     from vaultwarden.tests.conftest import BASE_SECTION, RecordingCtx
+    from vaultwarden.tests.test_integration import _isolate_xdg
+
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: pass the resolver gate
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                            "bw_cli_path": fake_bw})
     ok = vaultwarden.register(ctx)
@@ -707,6 +717,8 @@ def test_register_fail_closed_without_transform_hook(monkeypatch, tmp_path,
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "docker")
+    from vaultwarden.tests.test_integration import _isolate_xdg
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: reach the hook check
     ctx = RecordingCtx({**BASE_SECTION, "enabled": True,
                            "bw_cli_path": fake_bw})
     # simulate an OLDER Hermes build: no declared capability, no attribute

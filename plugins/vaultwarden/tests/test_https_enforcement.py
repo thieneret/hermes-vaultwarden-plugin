@@ -413,6 +413,8 @@ def test_log_sanitization_strips_credentials(tmp_path, monkeypatch,
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "docker")  # sandboxed backend
+    from vaultwarden.tests.test_integration import _isolate_xdg
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: pass the resolver gate
 
     settings = {
         "enabled": True,
