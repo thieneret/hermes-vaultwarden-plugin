@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.8.2**
+**Current version: v0.8.3**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -115,15 +115,8 @@ OWN private `/run/user/<UID>` tmpfs, so the secret file must be shared.
 
 ### Option A: Gateway in Docker — shared tmpfs volume
 
-Create a shared tmpfs-backed Docker volume (one-time):
-
-    docker volume create vw-secrets \
-      --driver local \
-      --opt type=tmpfs \
-      --opt device=tmpfs \
-      --opt o=size=100m,uid=1000,gid=1000,mode=0700
-
-Mount it into the Hermes gateway container (docker-compose.yml):
+Define the shared tmpfs-backed volume and mount it into the Hermes gateway
+container, all in one docker-compose.yml:
 
     services:
       hermes:
@@ -135,7 +128,12 @@ Mount it into the Hermes gateway container (docker-compose.yml):
           - vw-secrets:/run/user/1000/vw-secrets
     volumes:
       vw-secrets:
-        external: true
+        name: vw-secrets
+        driver: local
+        driver_opts:
+          type: tmpfs
+          device: tmpfs
+          o: "size=100m,uid=1000,gid=1000,mode=0700"
 
 **Why these environment variables are required:**
 
