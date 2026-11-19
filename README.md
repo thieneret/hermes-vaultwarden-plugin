@@ -1,6 +1,6 @@
 # Vaultwarden Plugin for Hermes Agent
 
-**Current version: v0.8.2**
+**Current version: v0.8.3**
 
 > ⚠️ **WARNING: This entire plugin was developed through AI-assisted coding sessions without**
 > **traditional manual code review of every line. Use at your own**
@@ -26,6 +26,20 @@ key storage and ssh-agent integration.
 - **Session isolation** — the Bitwarden session key lives only in plugin memory, never on disk
 - **Write protection** — mutating operations are gated behind an explicit `allow_write` flag
 - **Log redaction** — every secret that passes through the plugin is registered with a redacting filter
+
+## Supported Backends
+
+The placeholder injection mechanism **only works with the `docker` terminal
+backend**, where the gateway and sandbox share a filesystem via Docker volumes.
+
+| Backend | Supported | Reason |
+| --- | --- | --- |
+| `docker` | ✅ Yes | Shared tmpfs via Docker volume (see Docker Backend Setup) |
+| `ssh` | ❌ No | Remote shell runs on a different filesystem; cannot access the gateway's temp files |
+| `modal` | ❌ No | Isolated Modal container; no filesystem mount available |
+| `local` | ⚠️ Partial | Technically shares the filesystem, but the plugin's fail-closed default refuses to load unless `allow_insecure_local_backend: true` is explicitly set (same-user secret exposure risk) |
+
+**Recommendation:** Use the `docker` backend for full placeholder functionality.
 
 ## Requirements
 
@@ -83,7 +97,8 @@ production Hermes runtime.
 ## Docker Backend Setup (placeholder injection)
 
 The plugin's placeholder injection writes secret temp files to
-`$XDG_RUNTIME_DIR/vw-secrets` (tmpfs, never on disk). Whether extra
+`$XDG_RUNTIME_DIR/vw-secrets` (tmpfs, never on disk). `$XDG_RUNTIME_DIR`
+is **REQUIRED** — the plugin fails closed if it is unset. Whether extra
 setup is needed depends on your terminal backend and where the Hermes
 gateway runs:
 
@@ -94,48 +109,85 @@ gateway runs:
 | Host (bare metal) | `local` | ❌ None |
 | Host (bare metal) | `docker` | ✅ Bind mount host tmpfs into sandbox |
 
-With the `local` backend the gateway and the command share one filesystem,
-so the secret file is visible to both. With the `docker` backend the
-sandbox runs in a separate container with its OWN private
-`/run/user/1000` tmpfs, so the secret file must be shared explicitly.
+With the `local` backend the gateway and the command share one filesystem.
+With the `docker` backend the sandbox runs in a separate container with its
+OWN private `/run/user/<UID>` tmpfs, so the secret file must be shared.
 
 ### Option A: Gateway in Docker — shared tmpfs volume
 
-Create a shared tmpfs-backed Docker volume (one-time):
-
-    docker volume create vw-secrets \
-      --driver local \
-      --opt type=tmpfs \
-      --opt device=tmpfs \
-      --opt o=size=100m,uid=1000,gid=1000,mode=0700
-
-Mount it into the Hermes gateway container (docker-compose.yml):
+Define the shared tmpfs-backed volume and mount it into the Hermes gateway
+container, all in one docker-compose.yml:
 
     services:
       hermes:
+        environment:
+          - HERMES_UID=1000
+          - HERMES_GID=1000
+          - XDG_RUNTIME_DIR=/run/user/1000
         volumes:
           - vw-secrets:/run/user/1000/vw-secrets
     volumes:
       vw-secrets:
-        external: true
+        name: vw-secrets
+        driver: local
+        driver_opts:
+          type: tmpfs
+          device: tmpfs
+          o: "size=100m,uid=1000,gid=1000,mode=0700"
 
-And into the sandbox via the Hermes Agent config (see config.yaml
-example below). Both containers then see the SAME tmpfs at the SAME
-path.
+**Why these environment variables are required:**
+
+- `HERMES_UID` / `HERMES_GID` — the gateway container has no systemd-logind
+  session, so it does not automatically run as UID 1000 or get a
+  `/run/user/1000` runtime dir. These pin the effective UID/GID so the
+  plugin's path resolution matches the tmpfs volume ownership above.
+- `XDG_RUNTIME_DIR` — the plugin resolves the secrets directory via
+  `$XDG_RUNTIME_DIR/vw-secrets` and **FAILS CLOSED if it is unset**.
+  Containers have no systemd, so the variable is NOT set by default; you
+  must pass it.
+
+> If you use a UID other than 1000, change `HERMES_UID`, `HERMES_GID`,
+> `XDG_RUNTIME_DIR`, the tmpfs volume `uid=`/`gid=` options, AND the volume
+> mount path consistently to that UID.
+
+And into the sandbox via the Hermes Agent config (see config.yaml example
+below). Both containers then see the SAME tmpfs at the SAME path.
 
 ### Option B: Gateway on host — bind mount host tmpfs
 
-The host's `/run/user/1000` is already a tmpfs created by systemd-logind.
+The gateway runs directly on the host as the host's login user. The per-user
+runtime directory `/run/user/<UID>` is a tmpfs created by systemd-logind,
+where `<UID>` is the numeric UID of the user running the gateway (check
+with `id -u`).
+
 Bind mount ONLY the `vw-secrets` subdirectory into the sandbox via the
-Hermes Agent config (see config.yaml example below). The directory must
-exist and be owned by the gateway user before the sandbox starts:
+Hermes Agent config. The plugin creates the `vw-secrets` directory
+automatically at gateway startup with the correct ownership and
+permissions. Since the sandbox container is only created on the first
+tool call — well after the gateway has loaded the plugin — the directory
+is guaranteed to exist by the time Docker performs the bind mount.
+**No manual setup is needed** beyond the bind-mount configuration.
 
-    mkdir -p /run/user/1000/vw-secrets
-    chmod 700 /run/user/1000/vw-secrets
+Determine your gateway user's UID and use the matching path:
 
-Note: `/run/user/1000` is recreated empty on every boot. To make the
-subdirectory persistent across reboots, add a systemd user service or a
-tmpfiles.d entry (see your OS documentation).
+    id -u          # e.g. 1000, 1001, 501, ...
+
+In your Hermes Agent config, bind-mount that exact path:
+
+    terminal:
+      backend: docker
+      docker_run_as_host_user: true
+      docker_volumes:
+        - /run/user/<UID>/vw-secrets:/run/user/<UID>/vw-secrets
+
+Replace `<UID>` with the actual numeric UID. Use the SAME path on both sides.
+
+> Do NOT use `/run/user/1000` if your gateway user's UID is not 1000 — use
+> the real UID. The path is derived from `XDG_RUNTIME_DIR`, which systemd
+> sets to `/run/user/<UID>` for the logged-in user.
+
+Note: `/run/user/<UID>` is recreated empty on every boot. If the gateway
+restarts, the plugin re-creates the `vw-secrets` subdirectory at load time.
 
 ### Minimum config.yaml for the docker backend
 
@@ -146,29 +198,46 @@ Hermes Agent docs, see "Configuration → Docker Backend" and
 
     terminal:
       backend: docker
-      docker_run_as_host_user: true        # sandbox runs as the gateway's UID
+      docker_run_as_host_user: true
       docker_volumes:
-        - vw-secrets:/run/user/1000/vw-secrets          # Option A (gateway in Docker)
-        # - /run/user/1000/vw-secrets:/run/user/1000/vw-secrets  # Option B (gateway on host)
+        - vw-secrets:/run/user/1000/vw-secrets          # Option A
+        # - /run/user/<UID>/vw-secrets:/run/user/<UID>/vw-secrets  # Option B
 
-- `docker_run_as_host_user: true` makes the sandbox run with the same
-  UID/GID as the gateway, so the sandbox can read the chmod 600 secret
-  file written by the gateway.
-- `docker_volumes` shares the tmpfs between the gateway and the sandbox.
-  Use the Docker volume name (Option A) or the host path (Option B).
+- `docker_run_as_host_user: true` makes the sandbox run with the same UID/GID
+  as the gateway, so it can read the chmod 600 secret file.
+- `docker_volumes` shares the tmpfs between gateway and sandbox. Use the
+  Docker volume name (Option A) or the host path (Option B).
 
 ### Security notes
 
-- The secret temp files live on **tmpfs (RAM)** by design — they are
-  never written to disk and disappear on reboot. Do NOT replace the
-  tmpfs with a disk-backed directory.
+- Secret temp files live on **tmpfs (RAM)** by design — never on disk,
+  gone on reboot. Do NOT replace the tmpfs with a disk-backed directory.
 - Share ONLY the `vw-secrets` subdirectory. NEVER bind mount the whole
-  `/run/user/1000` into the sandbox — it contains the user's full
-  session infrastructure (D-Bus socket, keyring, GPG, PipeWire, etc.),
-  and exposing it to the sandbox is a privilege-escalation risk.
-- The UID of the gateway, the sandbox, and the tmpfs owner must match
-  (typically 1000), otherwise the sandbox gets EACCES reading the
-  chmod 600 secret file.
+  `/run/user/<UID>` into the sandbox — it contains the user's full
+  session infrastructure (D-Bus socket, keyring, GPG, PipeWire, etc.) and
+  exposing it to the sandbox is a privilege-escalation risk.
+- The UID of the gateway, the sandbox, and the tmpfs owner must match,
+  otherwise the sandbox gets EACCES reading the chmod 600 secret file.
+
+### Troubleshooting
+
+**Placeholder injection silently fails (command runs but secret not injected):**
+the plugin and the sandbox mount disagree on the secrets path.
+
+- Option A: confirm `HERMES_UID`/`HERMES_GID`/`XDG_RUNTIME_DIR` are set in
+  the gateway container, and the volume mount path matches
+  `XDG_RUNTIME_DIR` + `/vw-secrets`.
+- Option B: confirm the bind-mount path uses the ACTUAL gateway UID
+  (`id -u`), not a hardcoded `/run/user/1000`.
+
+Verification (inside the gateway container or on the host):
+
+    echo "UID=$(id -u) XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+    ls -ld "$XDG_RUNTIME_DIR/vw-secrets"      # expect drwx------ owned by that UID
+
+Then run any vaultwarden terminal tool with a placeholder and check:
+
+    ls -la "$XDG_RUNTIME_DIR/vw-secrets"/vw_*   # transient 0600 files
 
 ## Configuration
 

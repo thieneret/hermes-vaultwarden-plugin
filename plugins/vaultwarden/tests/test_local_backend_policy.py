@@ -33,7 +33,10 @@ from vaultwarden.tests.conftest import (
     RecordingCtx,
     write_fake_ssh_binaries,
 )
-from vaultwarden.tests.test_integration import _write_secrets_yaml
+from vaultwarden.tests.test_integration import (
+    _isolate_xdg,
+    _write_secrets_yaml,
+)
 
 
 def _setup_env(monkeypatch, tmp_path, backend):
@@ -49,6 +52,10 @@ def _setup_env(monkeypatch, tmp_path, backend):
         monkeypatch.delenv("TERMINAL_ENV", raising=False)
     else:
         monkeypatch.setenv("TERMINAL_ENV", backend)
+    # v0.8.3: provide a usable XDG_RUNTIME_DIR so register() reaches the
+    # SEC-03 backend policy under test instead of failing closed on the
+    # secrets-dir resolver gate that runs BEFORE it.
+    _isolate_xdg(monkeypatch, tmp_path)
 
 
 # ── config model: allow_insecure_local_backend ──────────────────────────────

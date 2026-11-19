@@ -247,12 +247,16 @@ def test_plugin_fails_closed_on_missing_transform_hook(monkeypatch: pytest.Monke
     handler ends up registered, so there is no silent fallback to the
     insecure observer-only redaction model.
     """
-    from vaultwarden.tests.test_integration import _write_secrets_yaml
+    from vaultwarden.tests.test_integration import (
+        _isolate_xdg,
+        _write_secrets_yaml,
+    )
 
     _write_secrets_yaml(tmp_path)
     monkeypatch.delenv("BW_CLI_PATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("TERMINAL_ENV", "docker")
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: pass the resolver gate
 
     # --- A. capability absent: older Hermes without the hook --------------
     ctx_a = RecordingCtx({**BASE_SECTION, "enabled": True, "bw_cli_path": fake_bw})

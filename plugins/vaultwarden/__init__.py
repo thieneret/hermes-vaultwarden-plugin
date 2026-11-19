@@ -74,19 +74,22 @@ def register(ctx: Any) -> bool:
         return False
 
     # AUD-03 (v0.6.2, FAIL-CLOSED): validate the secret-injection directory
-    # BEFORE any tool or hook registration. The shared hardening validator
+    # BEFORE any tool or hook registration. Since v0.8.3 the path
+    # RESOLUTION itself is part of the gate: resolve_secrets_dir_path()
+    # raises when XDG_RUNTIME_DIR is unset, not a directory, or not
+    # writable — there is no fallback path. The shared hardening validator
     # (secure_fs.ensure_hardened_directory) requires an absolute, real
     # (non-symlink) directory owned by the current effective UID with mode
-    # EXACTLY 0700; a missing directory is created hardened. An insecure
-    # directory aborts plugin activation — no partial state, no tools, no
+    # EXACTLY 0700; a missing directory is created hardened. Any of these
+    # failures aborts plugin activation — no partial state, no tools, no
     # hooks. The error is never silently swallowed; the log line contains
     # the path + reason only, NEVER secret values.
-    secrets_dir = resolve_secrets_dir_path()
     try:
+        secrets_dir = resolve_secrets_dir_path()
         ensure_hardened_directory(secrets_dir, create_if_missing=True)
     except FilesystemSecurityError as exc:
-        log.warning("Vaultwarden plugin load FAILED: insecure secrets "
-                    "directory: %s", exc)
+        log.warning("Vaultwarden plugin load FAILED: secrets directory "
+                    "unusable (fail-closed): %s", exc)
         return False
 
     # VWP-20 (v0.4.5): cleanup stale temp files from previous crashed runs

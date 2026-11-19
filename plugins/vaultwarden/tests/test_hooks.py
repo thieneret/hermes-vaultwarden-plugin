@@ -21,14 +21,24 @@ from vaultwarden.hooks import (
     make_placeholder_resolver,
     make_post_cleanup_hook,
     make_session_end_hook,
+    resolve_secrets_dir_path,
 )
+from vaultwarden.secure_fs import FilesystemSecurityError
 from vaultwarden.security import quote_injected_path
 
 BASH = shutil.which("bash")
 
 
 @pytest.fixture()
-def mw(auth_manager, registry):
+def mw(auth_manager, registry, tmp_path, monkeypatch):
+    # v0.8.3: XDG_RUNTIME_DIR is a hard requirement for the secrets-dir
+    # resolver (fail-closed, no fallback) — pin it to an isolated 0700
+    # runtime dir so injection tests never depend on the host runtime
+    # environment. Tests exercising the fail-closed path override or unset
+    # it themselves later (same monkeypatch instance -> theirs wins).
+    xdg = tmp_path / "xdg-runtime"
+    xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     return make_placeholder_resolver(auth_manager, registry)
 
 
@@ -243,19 +253,84 @@ def test_secrets_dir_prefers_xdg_runtime(tmp_path, monkeypatch):
     assert os.stat(d).st_mode & 0o777 == 0o700
 
 
-def test_secrets_dir_falls_back_to_tmp(monkeypatch, tmp_path):
+def test_resolve_secrets_dir_path_valid_no_creation(tmp_path, monkeypatch):
+    """Valid XDG_RUNTIME_DIR: the resolver returns <XDG>/vw-secrets and
+    CREATES nothing — creation + hardening stay _secrets_dir()'s job."""
+    xdg = tmp_path / "xdg"
+    xdg.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    d = resolve_secrets_dir_path()
+    assert str(d) == os.path.join(str(xdg), "vw-secrets")
+    assert not (xdg / "vw-secrets").exists()
+
+
+def test_secrets_dir_raises_when_xdg_unset(monkeypatch):
+    """XDG_RUNTIME_DIR unset OR empty -> fail closed: the resolver either
+    returns <XDG>/vw-secrets or raises; no fallback path is ever returned."""
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
-    d = _secrets_dir()
-    assert d == os.path.join(str(tmp_path), f"vw-secrets-{os.getuid()}")
-    assert os.stat(d).st_mode & 0o777 == 0o700
+    with pytest.raises(FilesystemSecurityError) as ei:
+        resolve_secrets_dir_path()
+    assert "unset or empty" in str(ei.value)
+    with pytest.raises(FilesystemSecurityError):
+        _secrets_dir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "")
+    with pytest.raises(FilesystemSecurityError):
+        resolve_secrets_dir_path()
 
 
-def test_secrets_dir_falls_back_when_xdg_missing(monkeypatch, tmp_path):
+def test_secrets_dir_raises_when_xdg_not_dir(tmp_path, monkeypatch):
+    """XDG_RUNTIME_DIR pointing at a MISSING path or a regular FILE ->
+    raise, never relocate."""
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "nonexistent"))
-    d = _secrets_dir()
-    assert d.endswith(f"vw-secrets-{os.getuid()}")
-    assert os.path.isdir(d)
+    with pytest.raises(FilesystemSecurityError) as ei:
+        resolve_secrets_dir_path()
+    assert "is not a directory" in str(ei.value)
+    with pytest.raises(FilesystemSecurityError):
+        _secrets_dir()
+    regular = tmp_path / "regular-file"
+    regular.write_text("not a dir")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(regular))
+    with pytest.raises(FilesystemSecurityError) as ei:
+        resolve_secrets_dir_path()
+    assert "is not a directory" in str(ei.value)
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root ignores the permission write bits; "
+                           "W_OK is true regardless of the mode")
+def test_secrets_dir_raises_when_xdg_not_writable(tmp_path, monkeypatch):
+    """XDG_RUNTIME_DIR exists but the current user cannot write it ->
+    raise (no silent relocation of the secrets dir)."""
+    xdg = tmp_path / "read-only-xdg"
+    xdg.mkdir(mode=0o555)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
+    with pytest.raises(FilesystemSecurityError) as ei:
+        resolve_secrets_dir_path()
+    assert "is not writable" in str(ei.value)
+    with pytest.raises(FilesystemSecurityError):
+        _secrets_dir()
+
+
+def test_mw_fail_closed_xdg_unset_sanitized_error(mw, registry, monkeypatch):
+    """AUD-03 injection gate meets the fail-closed resolver (v0.8.3): an
+    unset XDG_RUNTIME_DIR surfaces as a SANITIZED PlaceholderError; the
+    command keeps the token VERBATIM (fail-safe empty expansion) and the
+    agent-facing error carries no token material."""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    t = token_for(registry)
+    task = "xdg-unset-fail-closed"
+    res, seen = run_mw(mw, "terminal", {"command": f'run --q "{t}"'},
+                       task_id=task)
+    assert res == {"output": "ran"}
+    assert seen is not None
+    assert t in seen["command"]          # left verbatim — not injected
+    pending = _PENDING_ERRORS.pop(task, [])
+    pe = [e for e in pending
+          if e.get("error_code") == "PLACEHOLDER_ERROR"]
+    assert len(pe) == 1
+    blob = " ".join(str(v) for e in pe for v in e.values())
+    assert "fail-closed" in blob
+    assert t.lstrip("$") not in blob     # no token material in the error
 
 
 # ------------------------------------------------------------- post hook

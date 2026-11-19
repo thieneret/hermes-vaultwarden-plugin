@@ -34,10 +34,14 @@ def _injected_paths(command: str) -> list[str]:
 
 
 @pytest.fixture()
-def mw(auth_manager, registry):
+def mw(auth_manager, registry, tmp_path, monkeypatch):
     """The VWP-04 file-injection tool_execution middleware (same fixture
     shape as tests/test_hooks.py — defined locally so this module is
-    self-contained)."""
+    self-contained). v0.8.3 pins XDG_RUNTIME_DIR to an isolated 0700
+    runtime dir (fail-closed resolver, no fallback)."""
+    xdg = tmp_path / "xdg-runtime"
+    xdg.mkdir(mode=0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
     return make_placeholder_resolver(auth_manager, registry)
 
 
@@ -163,8 +167,14 @@ class TestCrashRecovery:
 
         assert subdir.is_dir(), "stale directory must be left alone (is_file gate)"
 
-    def test_real_secrets_dir_is_cleaned(self, monkeypatch):
-        """Cleanup against the REAL _secrets_dir() honors its 700 permissions."""
+    def test_real_secrets_dir_is_cleaned(self, monkeypatch, tmp_path):
+        """Cleanup against the REAL _secrets_dir() honors its 700 permissions.
+
+        v0.8.3: XDG_RUNTIME_DIR is a hard requirement — pin it to an
+        isolated 0700 dir; the resolver + validator stay the real ones."""
+        xdg = tmp_path / "xdg-runtime"
+        xdg.mkdir(mode=0o700)
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(xdg))
         d = _secrets_dir()
         assert os.path.isdir(d)
         assert os.stat(d).st_mode & 0o777 == 0o700

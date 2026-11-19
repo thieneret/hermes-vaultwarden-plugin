@@ -32,6 +32,7 @@ from vaultwarden.bw_cli import BwCli
 from vaultwarden.config import VALID_PROCESS_ROLES, detect_process_role
 from vaultwarden.secure_fs import FilesystemSecurityError
 from vaultwarden.tests.conftest import RecordingCtx
+from vaultwarden.tests.test_integration import _isolate_xdg
 
 # ── Deliberately FAKE test values (conftest fake bw fixtures accept them) ──
 FAKE_CLIENT_SECRET = "cs-secret"
@@ -193,6 +194,7 @@ def registered_plugin(fake_bw, tmp_path, hermes_home_with_secrets,
 
     base = tmp_path / ".bw-data"
     monkeypatch.setenv("VW_APPDATA_DIR", str(base))
+    _isolate_xdg(monkeypatch, tmp_path)  # v0.8.3: pass the resolver gate
     monkeypatch.setattr(sys, "argv",
                         ["hermes", "dashboard", "--host", "0.0.0.0"])
     ctx = RecordingCtx(settings={

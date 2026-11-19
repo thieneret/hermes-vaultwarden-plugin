@@ -19,8 +19,9 @@ string. The middleware intercepts the terminal call via Hermes's
 cleanup in a `finally` block), resolves every `$__VW_SECRET_x__` reference
 through the single-use registry, writes the real secret to a mkstemp file
 (chmod 600, atomic, symlink-protected) inside a dedicated chmod 700 directory
-under `$XDG_RUNTIME_DIR` (tmpfs/RAM-backed in typical setups; falls back to
-`/tmp/vw-secrets-<uid>`), and rewrites the command so the reference becomes
+under `$XDG_RUNTIME_DIR` (tmpfs/RAM-backed; `XDG_RUNTIME_DIR` is a hard
+requirement — the resolver fails closed when it is unset, not a directory,
+or not writable), and rewrites the command so the reference becomes
 `$(< path)` — the shell reads the secret at execution time. After the call
 returns (or raises) the temp files are deleted in a `finally` block.
 
@@ -580,17 +581,39 @@ def retain_in_execution_scope(value: str, redactor: Any) -> None:
 def resolve_secrets_dir_path() -> Path:
     """Resolve (WITHOUT creating or validating) the secrets directory path.
 
-    Prefers ``$XDG_RUNTIME_DIR/vw-secrets`` (typically tmpfs/RAM-backed);
-    falls back to ``<tempdir>/vw-secrets-<uid>`` when XDG_RUNTIME_DIR is
-    unusable. This is the single source of truth for WHERE the runtime
-    placeholder temp files live — both the injection middleware
-    (:func:`_secrets_dir`) and plugin load (AUD-03, ``register()``) derive
-    the path from here so they can never disagree.
+    Returns ``$XDG_RUNTIME_DIR/vw-secrets`` (tmpfs/RAM-backed runtime
+    directory). ``XDG_RUNTIME_DIR`` is a HARD requirement: raises
+    :class:`FilesystemSecurityError` (FAIL-CLOSED, NO fallback path) when
+    it is unset/empty, not an existing directory, or not writable. Any
+    other location could put secret temp files on DISK (violating the
+    tmpfs-only guarantee) and would silently break the docker backend —
+    the sandbox mount targets ``$XDG_RUNTIME_DIR/vw-secrets``, so a path
+    that diverges from it never reaches the executing command. This is
+    the single source of truth for WHERE the runtime placeholder temp
+    files live — both the injection middleware (:func:`_secrets_dir`) and
+    plugin load (AUD-03, ``register()``) derive the path from here so
+    they can never disagree.
+
+    Raises:
+        FilesystemSecurityError: XDG_RUNTIME_DIR unset/empty, not a
+            directory, or not writable. The message is sanitized: the
+            variable name + the path label only, never secret values.
     """
     xdg = os.environ.get("XDG_RUNTIME_DIR", "")
-    if xdg and os.path.isdir(xdg) and os.access(xdg, os.W_OK):
-        return Path(os.path.join(xdg, "vw-secrets"))
-    return Path(tempfile.gettempdir()) / f"vw-secrets-{os.getuid()}"
+    if not xdg:
+        raise FilesystemSecurityError(
+            "XDG_RUNTIME_DIR is unset or empty: cannot resolve the "
+            "secrets directory (fail-closed; XDG_RUNTIME_DIR is a hard "
+            "requirement, no fallback path)")
+    if not os.path.isdir(xdg):
+        raise FilesystemSecurityError(
+            f"XDG_RUNTIME_DIR {xdg!r} is not a directory: cannot resolve "
+            "the secrets directory (fail-closed; no fallback path)")
+    if not os.access(xdg, os.W_OK):
+        raise FilesystemSecurityError(
+            f"XDG_RUNTIME_DIR {xdg!r} is not writable: cannot resolve the "
+            "secrets directory (fail-closed; no fallback path)")
+    return Path(os.path.join(xdg, "vw-secrets"))
 
 
 def _secrets_dir() -> str:

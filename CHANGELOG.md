@@ -5,6 +5,44 @@ Author: **thieneret**
 
 ---
 
+## v0.8.3 — 2026-11-19
+
+### Security — BREAKING (XDG_RUNTIME_DIR hard requirement)
+- Removed the `<tempdir>/vw-secrets-<uid>` fallback path. The plugin now
+  **fails closed** if `$XDG_RUNTIME_DIR` is unset, not a directory, or not
+  writable. The fallback could write secret temp files to disk (violating
+  the tmpfs-only guarantee) and silently break the docker backend (plugin
+  writes to `/tmp` while sandbox mount targets `/run/user/<UID>/vw-secrets`,
+  so placeholders are never injected).
+
+  BREAKING CHANGE: `$XDG_RUNTIME_DIR` is now a hard requirement. Deployments
+  that relied on the fallback will fail to load the plugin until the variable
+  is set. Docker deployments must pass `XDG_RUNTIME_DIR=/run/user/<UID>` in
+  the gateway container's environment.
+
+### Documentation
+- **README**: Added "Supported Backends" section near the top with a backend
+  support matrix — placeholder injection only works on `docker` backend;
+  `ssh`, `modal`, and `local` (without explicit opt-in) are not supported.
+- **README**: Reworked "Docker Backend Setup" section — `$XDG_RUNTIME_DIR`
+  now documented as required; Option A (gateway in Docker) uses a declarative
+  compose.yml tmpfs volume definition (no separate `docker volume create`
+  CLI step); Option B (gateway on host) is UID-agnostic with `<UID>`
+  placeholders and `id -u` lookup; added Troubleshooting subsection with
+  verification commands.
+- **SECURITY.md**: Added "Deployment Architecture Constraints" section
+  documenting the backend support limitation, `$XDG_RUNTIME_DIR` hard
+  requirement (fail-closed, no fallback), and root-agent note (agent running
+  as root in the backend container can read chmod 600 temp files directly —
+  this is inherent to the mechanism, not a plugin defect).
+
+### Skill
+- **vaultwarden-usage**: Added round-trip masking lesson — do NOT copy
+  high-entropy values from tool output into subsequent tool call arguments,
+  as the display-masking layer can silently corrupt the value (empirically
+  observed). Use `*_file` channels or `generate=true`, which never round-trip
+  the secret through the LLM context.
+
 ## v0.8.2 (2026-11-14)
 
 ### Security (HVA-079-02 — server_url port validation)

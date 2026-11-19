@@ -108,6 +108,12 @@ than one is a `ConfigError`:
 > `.env` — the `client_secret_env` / `master_password_env` config keys were
 > removed.
 
+> **Round-trip masking lesson:** Do NOT copy high-entropy values from tool
+> output into subsequent tool call arguments — the display-masking layer can
+> silently corrupt the value (empirically observed: a masked `prefix…suffix`
+> form was copied back and stored verbatim). Use `*_file` channels or
+> `generate=true`, which never round-trip the secret through the LLM context.
+
 ## Standard Workflow (3 Steps)
 
 1. `vaultwarden_search(query="github")` → metadata (id, name, username), NOT the password
