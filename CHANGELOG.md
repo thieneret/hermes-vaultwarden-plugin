@@ -5,7 +5,7 @@ Author: **thieneret**
 
 ---
 
-## v0.8.3 — 2026-11-19
+## v0.8.3 (2026-11-19)
 
 ### Security — BREAKING (XDG_RUNTIME_DIR hard requirement)
 - Removed the `<tempdir>/vw-secrets-<uid>` fallback path. The plugin now
